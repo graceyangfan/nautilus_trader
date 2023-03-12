@@ -14,13 +14,11 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import time
 from decimal import Decimal
 
 import pandas as pd
 
-from nautilus_trader.backtest.data.providers import TestDataProvider
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
-from nautilus_trader.backtest.data.wranglers import TradeTickDataWrangler
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.engine import BacktestEngineConfig
 from nautilus_trader.examples.strategies.ema_cross_trailing_stop import EMACrossTrailingStop
@@ -31,6 +29,9 @@ from nautilus_trader.model.enums import AccountType
 from nautilus_trader.model.enums import OmsType
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Money
+from nautilus_trader.persistence.wranglers import TradeTickDataWrangler
+from nautilus_trader.test_kit.providers import TestDataProvider
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
 
 if __name__ == "__main__":
@@ -76,6 +77,7 @@ if __name__ == "__main__":
     strategy = EMACrossTrailingStop(config=config)
     engine.add_strategy(strategy=strategy)
 
+    time.sleep(0.1)
     input("Press Enter to continue...")  # noqa (always Python 3)
 
     # Run the engine (from start to end of data)

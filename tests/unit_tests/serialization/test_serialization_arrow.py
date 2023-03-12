@@ -20,7 +20,6 @@ from typing import Any
 import pytest
 from fsspec.implementations.memory import MemoryFileSystem
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.common.clock import TestClock
 from nautilus_trader.common.events.risk import TradingStateChanged
 from nautilus_trader.common.events.system import ComponentStateChanged
@@ -41,6 +40,7 @@ from nautilus_trader.model.position import Position
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.external.core import write_objects
 from nautilus_trader.serialization.arrow.serializer import ParquetSerializer
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.execution import TestExecStubs
@@ -173,9 +173,9 @@ class TestParquetSerializer:
                 OrderBookDelta.from_dict(
                     {
                         "action": "ADD",
-                        "order_side": "BUY",
-                        "order_price": 8.0,
-                        "order_size": 30.0,
+                        "side": "BUY",
+                        "price": 8.0,
+                        "size": 30.0,
                         "order_id": "e0364f94-8fcb-0262-cbb3-075c51ee4917",
                         **kw,
                     },
@@ -183,9 +183,9 @@ class TestParquetSerializer:
                 OrderBookDelta.from_dict(
                     {
                         "action": "ADD",
-                        "order_side": "SELL",
-                        "order_price": 15.0,
-                        "order_size": 10.0,
+                        "side": "SELL",
+                        "price": 15.0,
+                        "size": 10.0,
                         "order_id": "cabec174-acc6-9204-9ebf-809da3896daf",
                         **kw,
                     },
@@ -212,30 +212,30 @@ class TestParquetSerializer:
         deltas = [
             {
                 "action": "ADD",
-                "order_side": "SELL",
-                "order_price": 0.9901,
-                "order_size": 327.25,
+                "side": "SELL",
+                "price": 0.9901,
+                "size": 327.25,
                 "order_id": "1",
             },
             {
                 "action": "CLEAR",
-                "order_side": None,
-                "order_price": None,
-                "order_size": None,
+                "side": None,
+                "price": None,
+                "size": None,
                 "order_id": None,
             },
             {
                 "action": "ADD",
-                "order_side": "SELL",
-                "order_price": 0.98039,
-                "order_size": 27.91,
+                "side": "SELL",
+                "price": 0.98039,
+                "size": 27.91,
                 "order_id": "2",
             },
             {
                 "action": "ADD",
-                "order_side": "SELL",
-                "order_price": 0.97087,
-                "order_size": 14.43,
+                "side": "SELL",
+                "price": 0.97087,
+                "size": 14.43,
                 "order_id": "3",
             },
         ]

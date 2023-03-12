@@ -23,7 +23,6 @@ from nautilus_trader.adapters.binance.common.constants import BINANCE_VENUE
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.adapters.binance.spot.data import BinanceSpotDataClient
 from nautilus_trader.adapters.binance.spot.providers import BinanceSpotInstrumentProvider
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.common.clock import LiveClock
 from nautilus_trader.common.logging import Logger
 from nautilus_trader.config import InstrumentProviderConfig
@@ -37,6 +36,7 @@ from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.msgbus.bus import MessageBus
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
@@ -77,6 +77,7 @@ class TestBinanceSpotDataClient:
         self.provider = BinanceSpotInstrumentProvider(
             client=self.http_client,
             logger=self.logger,
+            clock=self.clock,
             config=InstrumentProviderConfig(load_all=True),
         )
 
@@ -321,5 +322,39 @@ class TestBinanceSpotDataClient:
             aggressor_side=AggressorSide.SELLER,
             trade_id=TradeId("705291099"),
             ts_event=1639351062243000064,
+            ts_init=handler[0].ts_init,
+        )
+
+    @pytest.mark.asyncio
+    async def test_subscribe_agg_trade_ticks(self, monkeypatch):
+        handler = []
+        self.msgbus.subscribe(
+            topic="data.trades.BINANCE.ETHUSDT",
+            handler=handler.append,
+        )
+
+        # Act
+        self.data_client._use_agg_trade_ticks = True
+        self.data_client.subscribe_trade_ticks(ETHUSDT_BINANCE.id)
+        self.data_client._use_agg_trade_ticks = False
+
+        raw_trade = pkgutil.get_data(
+            package="tests.integration_tests.adapters.binance.resources.ws_messages",
+            resource="ws_spot_agg_trade.json",
+        )
+
+        # Assert
+        self.data_client._handle_ws_message(raw_trade)
+        await asyncio.sleep(1)
+
+        assert self.data_engine.data_count == 1
+        assert len(handler) == 1  # <-- handler received tick
+        assert handler[0] == TradeTick(
+            instrument_id=ETHUSDT_BINANCE.id,
+            price=Price.from_str("1632.46000000"),
+            size=Quantity.from_str("0.34305000"),
+            aggressor_side=AggressorSide.BUYER,
+            trade_id=TradeId("226532"),
+            ts_event=1675759520847,
             ts_init=handler[0].ts_init,
         )

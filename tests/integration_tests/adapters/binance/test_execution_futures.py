@@ -23,7 +23,6 @@ from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.futures.execution import BinanceFuturesExecutionClient
 from nautilus_trader.adapters.binance.futures.providers import BinanceFuturesInstrumentProvider
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.common.clock import LiveClock
 from nautilus_trader.common.logging import Logger
 from nautilus_trader.config import InstrumentProviderConfig
@@ -40,6 +39,7 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.msgbus.bus import MessageBus
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 from nautilus_trader.trading.strategy import Strategy
@@ -80,6 +80,7 @@ class TestBinanceFuturesExecutionClient:
         self.provider = BinanceFuturesInstrumentProvider(
             client=self.http_client,
             logger=self.logger,
+            clock=self.clock,
             config=InstrumentProviderConfig(load_all=True),
         )
 
@@ -249,7 +250,6 @@ class TestBinanceFuturesExecutionClient:
         assert request[2]["type"] == "LIMIT"
         assert request[2]["timeInForce"] == "GTX"
         assert request[2]["quantity"] == "10"
-        assert request[2]["reduceOnly"] == "false"
         assert request[2]["price"] == "10050.80"
         assert request[2]["newClientOrderId"] is not None
         assert request[2]["recvWindow"] == "5000"
@@ -293,7 +293,7 @@ class TestBinanceFuturesExecutionClient:
         assert request[2]["type"] == "STOP_MARKET"
         assert request[2]["timeInForce"] == "GTC"
         assert request[2]["quantity"] == "10"
-        assert request[2]["reduceOnly"] == "true"
+        assert request[2]["reduceOnly"] == "True"
         assert request[2]["newClientOrderId"] is not None
         assert request[2]["stopPrice"] == "10099.00"
         assert request[2]["workingType"] == "CONTRACT_PRICE"
@@ -426,7 +426,6 @@ class TestBinanceFuturesExecutionClient:
         assert request[2]["type"] == "TAKE_PROFIT"
         assert request[2]["timeInForce"] == "GTC"
         assert request[2]["quantity"] == "10"
-        assert request[2]["reduceOnly"] == "false"
         assert request[2]["price"] == "10050.80"
         assert request[2]["newClientOrderId"] is not None
         assert request[2]["stopPrice"] == "10099.00"
@@ -475,7 +474,7 @@ class TestBinanceFuturesExecutionClient:
         assert request[2]["type"] == "TRAILING_STOP_MARKET"
         assert request[2]["timeInForce"] == "GTC"
         assert request[2]["quantity"] == "10"
-        assert request[2]["reduceOnly"] == "true"
+        assert request[2]["reduceOnly"] == "True"
         assert request[2]["newClientOrderId"] is not None
         assert request[2]["activationPrice"] == "10000.00"
         assert request[2]["callbackRate"] == "1"

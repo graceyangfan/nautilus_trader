@@ -17,7 +17,6 @@ from decimal import Decimal
 
 import pytest
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.model.currencies import AUD
 from nautilus_trader.model.currencies import JPY
 from nautilus_trader.model.currencies import USD
@@ -31,6 +30,7 @@ from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.orderbook.book import L2OrderBook
 from nautilus_trader.model.orderbook.data import OrderBookSnapshot
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 
@@ -476,6 +476,24 @@ class TestCache:
         # Assert
         assert self.cache.bar_count(bar_type) == 2
         assert result == bar2
+
+    def test_get_general_object_when_nothing_in_cache_returns_none(self):
+        # Arrange, Act
+        result = self.cache.get("something")
+
+        # Assert
+        assert result is None
+
+    def test_add_general_object_adds_to_cache(self):
+        # Arrange
+        key = "value_a"
+        obj = b"some string value"
+
+        # Act
+        self.cache.add(key, obj)
+
+        # Assert
+        assert self.cache.get(key) == obj
 
     def test_get_xrate_returns_correct_rate(self):
         # Arrange

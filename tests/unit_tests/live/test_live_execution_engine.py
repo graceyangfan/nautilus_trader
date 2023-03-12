@@ -18,7 +18,6 @@ from decimal import Decimal
 
 import pytest
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.common.clock import LiveClock
 from nautilus_trader.common.enums import LogLevel
 from nautilus_trader.common.factories import OrderFactory
@@ -62,6 +61,7 @@ from nautilus_trader.model.objects import Quantity
 from nautilus_trader.msgbus.bus import MessageBus
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.test_kit.mocks.exec_clients import MockLiveExecutionClient
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
@@ -83,6 +83,7 @@ class TestLiveExecutionEngine:
         self.logger = Logger(
             clock=self.clock,
             level_stdout=LogLevel.DEBUG,
+            bypass=True,
         )
 
         self.trader_id = TestIdStubs.trader_id()
@@ -268,7 +269,7 @@ class TestLiveExecutionEngine:
         await asyncio.sleep(0.1)
 
         # Assert
-        assert self.exec_engine.qsize() == 1
+        assert self.exec_engine.cmd_qsize() == 1
         assert self.exec_engine.command_count == 0
 
     @pytest.mark.asyncio
@@ -334,7 +335,7 @@ class TestLiveExecutionEngine:
         await asyncio.sleep(0.1)
 
         # Assert
-        assert self.exec_engine.qsize() == 1
+        assert self.exec_engine.cmd_qsize() == 1
         assert self.exec_engine.command_count == 0
 
     @pytest.mark.asyncio
@@ -365,7 +366,8 @@ class TestLiveExecutionEngine:
         self.exec_engine.kill()
 
         # Assert
-        assert self.exec_engine.qsize() == 0
+        assert self.exec_engine.cmd_qsize() == 0
+        assert self.exec_engine.evt_qsize() == 0
 
     @pytest.mark.asyncio
     async def test_execute_command_places_command_on_queue(self):
@@ -402,7 +404,7 @@ class TestLiveExecutionEngine:
         await asyncio.sleep(0.1)
 
         # Assert
-        assert self.exec_engine.qsize() == 0
+        assert self.exec_engine.evt_qsize() == 0
         assert self.exec_engine.command_count == 1
 
         # Tear Down
@@ -527,4 +529,4 @@ class TestLiveExecutionEngine:
         await self.exec_engine._check_inflight_orders()
 
         # Assert
-        assert self.exec_engine.command_count == 2
+        assert self.exec_engine.command_count == 3

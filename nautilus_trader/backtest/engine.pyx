@@ -93,7 +93,7 @@ cdef class BacktestEngine:
         If `config` is not of type `BacktestEngineConfig`.
     """
 
-    def __init__(self, config: Optional[BacktestEngineConfig] = None):
+    def __init__(self, config: Optional[BacktestEngineConfig] = None) -> None:
         if config is None:
             config = BacktestEngineConfig()
         Condition.type(config, BacktestEngineConfig, "config")
@@ -134,7 +134,12 @@ cdef class BacktestEngine:
             streaming_config=config.streaming,
             actor_configs=config.actors,
             strategy_configs=config.strategies,
+            load_state=config.load_state,
+            save_state=config.save_state,
             log_level=log_level_from_str(config.log_level.upper()),
+            log_level_file=log_level_from_str(config.log_level_file.upper()),
+            log_file_path=config.log_file_path,
+            log_rate_limit=config.log_rate_limit,
             bypass_logging=config.bypass_logging,
         )
 
@@ -337,7 +342,7 @@ cdef class BacktestEngine:
         """
         return self._kernel.portfolio
 
-    def list_venues(self):
+    def list_venues(self) -> list[Venue]:
         """
         Return the venues contained within the engine.
 
@@ -510,7 +515,7 @@ cdef class BacktestEngine:
         if instrument.id.venue not in self._venues:
             raise InvalidConfiguration(
                 "Cannot add an `Instrument` object without first adding its associated venue. "
-                f"Please add the {instrument.id.venue} venue using the `add_venue` method."
+                f"Add the {instrument.id.venue} venue using the `add_venue` method."
             )
 
         # TODO(cs): validate the instrument is correct for the venue
@@ -563,7 +568,7 @@ cdef class BacktestEngine:
             Condition.true(
                 first.instrument_id in self.kernel.cache.instrument_ids(),
                 f"`Instrument` {first.instrument_id} for the given data not found in the cache. "
-                "Please add the instrument through `add_instrument()` prior to adding related data.",
+                "Add the instrument through `add_instrument()` prior to adding related data.",
             )
             # Check client has been registered
             self._add_market_data_client_if_not_exists(first.instrument_id.venue)
@@ -572,7 +577,7 @@ cdef class BacktestEngine:
             Condition.true(
                 first.bar_type.instrument_id in self.kernel.cache.instrument_ids(),
                 f"`Instrument` {first.bar_type.instrument_id} for the given data not found in the cache. "
-                "Please add the instrument through `add_instrument()` prior to adding related data.",
+                "Add the instrument through `add_instrument()` prior to adding related data.",
             )
             Condition.equal(
                 first.bar_type.aggregation_source,
@@ -684,28 +689,6 @@ cdef class BacktestEngine:
         # Checked inside trader
         self.kernel.trader.add_strategies(strategies)
 
-    cpdef list list_actors(self):
-        """
-        Return the actors for the backtest.
-
-        Returns
-        ----------
-        list[Actors]
-
-        """
-        return self.trader.actors()
-
-    cpdef list list_strategies(self):
-        """
-        Return the strategies for the backtest.
-
-        Returns
-        ----------
-        list[Strategy]
-
-        """
-        return self.trader.strategies()
-
     def reset(self) -> None:
         """
         Reset the backtest engine.
@@ -716,7 +699,7 @@ cdef class BacktestEngine:
 
         if self.kernel.trader.is_running:
             # End current backtest run
-            self._end()
+            self.end()
 
         # Change logger clock back to live clock for consistent time stamping
         self.kernel.logger.change_clock(self._clock)
@@ -757,7 +740,7 @@ cdef class BacktestEngine:
 
         self._log.info("Reset.")
 
-    def clear_data(self):
+    def clear_data(self) -> None:
         """
         Clear the engines internal data stream.
 
@@ -784,12 +767,22 @@ cdef class BacktestEngine:
         start: Optional[Union[datetime, str, int]] = None,
         end: Optional[Union[datetime, str, int]] = None,
         run_config_id: Optional[str] = None,
+        streaming: bool = False,
     ) -> None:
         """
         Run a backtest.
 
         At the end of the run the trader and strategies will be stopped, then
         post-run analysis performed.
+
+        If more data than can fit in memory is to be run through the backtest
+        engine, then `streaming` mode can be utilized. The expected sequence is as
+        follows:
+         - Add initial data batch and strategies.
+         - Call `run(streaming=True)`.
+         - Call `clear_data()`.
+         - Add next batch of data stream.
+         - Call either `run(streaming=False)` or `end()`. When there is no more data to run on.
 
         Parameters
         ----------
@@ -801,6 +794,9 @@ cdef class BacktestEngine:
             to the end of the data.
         run_config_id : str, optional
             The tokenized `BacktestRunConfig` ID.
+        streaming : bool, default False
+            If running in streaming mode. If False then will end the backtest
+            following the run iterations.
 
         Raises
         ------
@@ -811,59 +807,37 @@ cdef class BacktestEngine:
 
         """
         self._run(start, end, run_config_id)
-        self._end()
+        if not streaming:
+            self.end()
 
-    def run_streaming(
-        self,
-        start: Optional[Union[datetime, str, int]] = None,
-        end: Optional[Union[datetime, str, int]] = None,
-        run_config_id: Optional[str] = None,
-    ):
+    def end(self):
         """
-        Run a backtest in streaming mode.
+        Manually end the backtest.
 
-        If more data than can fit in memory is to be run through the backtest
-        engine, then streaming mode can be utilized. The expected sequence is as
-        follows:
-         - Add initial data batch and strategies.
-         - Call `run_streaming()`.
-         - Call `clear_data()`.
-         - Add next batch of data stream.
-         - Call `run_streaming()`.
-         - Call `end_streaming()` when there is no more data to run on.
-
-        Parameters
-        ----------
-        start : Union[datetime, str, int], optional
-            The start datetime (UTC) for the current batch of data. If ``None``
-            engine runs from the start of the data.
-        end : Union[datetime, str, int], optional
-            The end datetime (UTC) for the current batch of data. If ``None`` engine runs
-            to the end of the data.
-        run_config_id : str, optional
-            The tokenized backtest run configuration ID.
-
-        Raises
-        ------
-        ValueError
-            If no data has been added to the engine.
-        ValueError
-            If the `start` is >= the `end` datetime.
+        Notes
+        -----
+        Only required if you have previously been running with streaming.
 
         """
-        self._run(start, end, run_config_id)
+        if self.kernel.trader.is_running:
+            self.kernel.trader.stop()
+        if self.kernel.data_engine.is_running:
+            self.kernel.data_engine.stop()
+        if self.kernel.risk_engine.is_running:
+            self.kernel.risk_engine.stop()
+        if self.kernel.exec_engine.is_running:
+            self.kernel.exec_engine.stop()
+        if self.kernel.emulator.is_running:
+            self.kernel.emulator.stop()
 
-    def end_streaming(self):
-        """
-        End the backtest streaming run.
+        # Process remaining messages
+        for exchange in self._venues.values():
+            exchange.process(self.kernel.clock.timestamp_ns())
 
-        The following sequence of events will occur:
-         - The trader will be stopped which in turn stops the strategies.
-         - The exchanges will process all pending messages.
-         - Post-run analysis is performed.
+        self._run_finished = self._clock.utc_now()
+        self._backtest_end = self.kernel.clock.utc_now()
 
-        """
-        self._end()
+        self._log_post_run()
 
     def get_result(self):
         """
@@ -913,14 +887,14 @@ cdef class BacktestEngine:
             start = unix_nanos_to_dt(start_ns)
         else:
             start = pd.to_datetime(start, utc=True)
-            start_ns = int(start.to_datetime64())
+            start_ns = start.value
         if end is None:
             # Set `end` to end of data
             end_ns = self._data[-1].ts_init
             end = unix_nanos_to_dt(end_ns)
         else:
             end = pd.to_datetime(end, utc=True)
-            end_ns = int(end.to_datetime64())
+            end_ns = end.value
         Condition.true(start_ns < end_ns, "start was >= end")
         Condition.not_empty(self._data, "data")
 
@@ -1018,27 +992,6 @@ cdef class BacktestEngine:
         for event_handler in now_events:
             event_handler.handle()
 
-    def _end(self):
-        if self.kernel.trader.is_running:
-            self.kernel.trader.stop()
-        if self.kernel.data_engine.is_running:
-            self.kernel.data_engine.stop()
-        if self.kernel.risk_engine.is_running:
-            self.kernel.risk_engine.stop()
-        if self.kernel.exec_engine.is_running:
-            self.kernel.exec_engine.stop()
-        if self.kernel.emulator.is_running:
-            self.kernel.emulator.stop()
-
-        # Process remaining messages
-        for exchange in self._venues.values():
-            exchange.process(self.kernel.clock.timestamp_ns())
-
-        self._run_finished = self._clock.utc_now()
-        self._backtest_end = self.kernel.clock.utc_now()
-
-        self._log_post_run()
-
     cdef Data _next(self):
         cdef uint64_t cursor = self._index
         self._index += 1
@@ -1133,14 +1086,18 @@ cdef class BacktestEngine:
         if not self._config.run_analysis:
             return
 
-        for exchange in self._venues.values():
-            account = exchange.exec_client.get_account()
+        cdef:
+            list venue_positions
+            set venue_currencies
+        for venue in self._venues.values():
+            account = venue.exec_client.get_account()
             self._log.info("\033[36m=================================================================")
-            self._log.info(f"\033[36m SimulatedVenue {exchange.id}")
+            self._log.info(f"\033[36m SimulatedVenue {venue.id}")
             self._log.info("\033[36m=================================================================")
             self._log.info(f"{repr(account)}")
             self._log.info("\033[36m-----------------------------------------------------------------")
-            if exchange.is_frozen_account:
+            unrealized_pnls: Optional[dict[Currency, Money]] = None
+            if venue.is_frozen_account:
                 self._log.warning(f"ACCOUNT FROZEN")
             else:
                 if account is None:
@@ -1157,36 +1114,41 @@ cdef class BacktestEngine:
                 for c in account.commissions().values():
                     self._log.info(Money(-c.as_double(), c.currency).to_str())  # Display commission as negative
                 self._log.info("\033[36m-----------------------------------------------------------------")
-                self._log.info(f"Unrealized PnLs:")
-                unrealized_pnls = self.portfolio.unrealized_pnls(Venue(exchange.id.value)).values()
+                self._log.info(f"Unrealized PnLs (included in totals):")
+                unrealized_pnls = self.portfolio.unrealized_pnls(Venue(venue.id.value))
                 if not unrealized_pnls:
                     self._log.info("None")
                 else:
-                    for b in self.portfolio.unrealized_pnls(Venue(exchange.id.value)).values():
+                    for b in unrealized_pnls.values():
                         self._log.info(b.to_str())
 
             # Log output diagnostics for all simulation modules
-            for module in exchange.modules:
+            for module in venue.modules:
                 module.log_diagnostics(self._log)
 
             self._log.info("\033[36m=================================================================")
             self._log.info("\033[36m PORTFOLIO PERFORMANCE")
             self._log.info("\033[36m=================================================================")
 
-            # Find all positions for venue
-            exchange_positions = []
+            # Collect all positions and currencies for venue
+            venue_positions = []
+            venue_currencies = set()
             for position in positions:
-                if position.instrument_id.venue == exchange.id:
-                    exchange_positions.append(position)
+                if position.instrument_id.venue == venue.id:
+                    venue_positions.append(position)
+                    venue_currencies.add(position.quote_currency)
+                    if position.base_currency is not None:
+                        venue_currencies.add(position.base_currency)
 
             # Calculate statistics
-            self._kernel.portfolio.analyzer.calculate_statistics(account, exchange_positions)
+            self._kernel.portfolio.analyzer.calculate_statistics(account, venue_positions)
 
             # Present PnL performance stats per asset
-            for currency in account.currencies():
+            for currency in sorted(list(venue_currencies), key=lambda x: x.code):
                 self._log.info(f" PnL Statistics ({str(currency)})")
                 self._log.info("\033[36m-----------------------------------------------------------------")
-                for stat in self._kernel.portfolio.analyzer.get_stats_pnls_formatted(currency):
+                unrealized_pnl = unrealized_pnls.get(currency) if unrealized_pnls else None
+                for stat in self._kernel.portfolio.analyzer.get_stats_pnls_formatted(currency, unrealized_pnl):
                     self._log.info(stat)
                 self._log.info("\033[36m-----------------------------------------------------------------")
 

@@ -27,11 +27,11 @@ from nautilus_trader.model.data.tick import QuoteTick
 from nautilus_trader.model.identifiers import Venue
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
-from nautilus_trader.persistence.base import clear_singleton_instances
 from nautilus_trader.persistence.catalog.parquet import ParquetDataCatalog
 from nautilus_trader.persistence.external.core import process_files
 from nautilus_trader.persistence.external.readers import CSVReader
 from nautilus_trader.persistence.external.readers import Reader
+from nautilus_trader.persistence.external.util import clear_singleton_instances
 from nautilus_trader.trading.filters import NewsEvent
 
 
@@ -68,7 +68,7 @@ def data_catalog_setup(protocol, path=tempfile.mktemp()) -> ParquetDataCatalog:
 
 
 def aud_usd_data_loader(catalog: ParquetDataCatalog):
-    from nautilus_trader.backtest.data.providers import TestInstrumentProvider
+    from nautilus_trader.test_kit.providers import TestInstrumentProvider
     from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
     from tests.unit_tests.backtest.test_backtest_config import TEST_DATA_DIR
 

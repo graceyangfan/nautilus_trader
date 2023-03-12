@@ -18,7 +18,6 @@ from decimal import Decimal
 
 import pytest
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.backtest.exchange import SimulatedExchange
 from nautilus_trader.backtest.execution_client import BacktestExecClient
 from nautilus_trader.backtest.models import FillModel
@@ -60,6 +59,7 @@ from nautilus_trader.msgbus.bus import MessageBus
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.test_kit.mocks.strategies import MockStrategy
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs import UNIX_EPOCH
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
@@ -77,6 +77,7 @@ class TestSimulatedExchange:
         self.logger = Logger(
             clock=self.clock,
             level_stdout=LogLevel.DEBUG,
+            bypass=True,
         )
 
         self.trader_id = TestIdStubs.trader_id()
@@ -185,6 +186,22 @@ class TestSimulatedExchange:
 
         # Assert
         assert self.exchange.fill_model == fill_model
+
+    def test_get_matching_engines_when_engine_returns_expected_dict(self):
+        # Arrange, Act
+        matching_engines = self.exchange.get_matching_engines()
+
+        # Assert
+        assert isinstance(matching_engines, dict)
+        assert len(matching_engines) == 1
+        assert list(matching_engines.keys()) == [USDJPY_SIM.id]
+
+    def test_get_matching_engine_when_no_engine_for_instrument_returns_none(self):
+        # Arrange, Act
+        matching_engine = self.exchange.get_matching_engine(USDJPY_SIM.id)
+
+        # Assert
+        assert matching_engine.instrument == USDJPY_SIM
 
     def test_get_books_with_one_instrument_returns_one_book(self):
         # Arrange, Act

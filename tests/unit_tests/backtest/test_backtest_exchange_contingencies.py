@@ -15,7 +15,6 @@
 
 from decimal import Decimal
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.backtest.exchange import SimulatedExchange
 from nautilus_trader.backtest.execution_client import BacktestExecClient
 from nautilus_trader.backtest.models import FillModel
@@ -40,6 +39,7 @@ from nautilus_trader.msgbus.bus import MessageBus
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.test_kit.mocks.strategies import MockStrategy
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
@@ -56,6 +56,7 @@ class TestSimulatedExchangeContingencyAdvancedOrders:
         self.logger = Logger(
             clock=self.clock,
             level_stdout=LogLevel.INFO,
+            bypass=True,
         )
 
         self.trader_id = TestIdStubs.trader_id()
@@ -374,7 +375,7 @@ class TestSimulatedExchangeContingencyAdvancedOrders:
             entry_price=ETHUSDT_PERP_BINANCE.make_price(3050.0),  # <-- in the market
             sl_trigger_price=ETHUSDT_PERP_BINANCE.make_price(3150.0),
             tp_price=ETHUSDT_PERP_BINANCE.make_price(3000.0),
-            post_only_entry=True,  # <-- will reject placed into the market
+            entry_post_only=True,  # <-- will reject placed into the market
             entry_order_type=OrderType.LIMIT,
         )
 

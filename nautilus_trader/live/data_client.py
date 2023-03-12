@@ -231,27 +231,27 @@ class LiveDataClient(DataClient):
     ############################################################################
     async def _connect(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_connect` coroutine",  # pragma: no cover
+            "implement the `_connect` coroutine",  # pragma: no cover
         )
 
     async def _disconnect(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_disconnect` coroutine",  # pragma: no cover
+            "implement the `_disconnect` coroutine",  # pragma: no cover
         )
 
     async def _subscribe(self, data_type: DataType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe` coroutine",  # pragma: no cover
+            "implement the `_subscribe` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe(self, data_type: DataType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe` coroutine",  # pragma: no cover
         )
 
     async def _request(self, data_type: DataType, correlation_id: UUID4) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request` coroutine",  # pragma: no cover
+            "implement the `_request` coroutine",  # pragma: no cover
         )
 
 
@@ -430,12 +430,13 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_ids = list(self._instrument_provider.get_all().keys())
         self.create_task(
             self._subscribe_instruments(),
+            log_msg=f"subscribe: instruments {self.venue}",
             actions=lambda: [self._add_subscription_instrument(i) for i in instrument_ids],
         )
 
     def subscribe_instrument(self, instrument_id: InstrumentId) -> None:
         self.create_task(
-            self._subscribe_instruments(),
+            self._subscribe_instrument(instrument_id),
             log_msg=f"subscribe: instrument {instrument_id}",
             actions=lambda: self._add_subscription_instrument(instrument_id),
         )
@@ -445,7 +446,7 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         book_type: BookType,
         depth: Optional[int] = None,
-        kwargs: dict[str, Any] = None,
+        kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         self.create_task(
             self._subscribe_order_book_deltas(
@@ -463,7 +464,7 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         book_type: BookType,
         depth: Optional[int] = None,
-        kwargs: dict = None,
+        kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         self.create_task(
             self._subscribe_order_book_snapshots(
@@ -622,8 +623,8 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         self._log.debug(f"Request quote ticks {instrument_id}.")
         self.create_task(
@@ -631,8 +632,8 @@ class LiveMarketDataClient(MarketDataClient):
                 instrument_id=instrument_id,
                 limit=limit,
                 correlation_id=correlation_id,
-                from_datetime=from_datetime,
-                to_datetime=to_datetime,
+                start=start,
+                end=end,
             ),
         )
 
@@ -641,8 +642,8 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         self._log.debug(f"Request trade ticks {instrument_id}.")
         self.create_task(
@@ -650,8 +651,8 @@ class LiveMarketDataClient(MarketDataClient):
                 instrument_id=instrument_id,
                 limit=limit,
                 correlation_id=correlation_id,
-                from_datetime=from_datetime,
-                to_datetime=to_datetime,
+                start=start,
+                end=end,
             ),
         )
 
@@ -660,8 +661,8 @@ class LiveMarketDataClient(MarketDataClient):
         bar_type: BarType,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         self._log.debug(f"Request bars {bar_type}.")
         self.create_task(
@@ -669,8 +670,8 @@ class LiveMarketDataClient(MarketDataClient):
                 bar_type=bar_type,
                 limit=limit,
                 correlation_id=correlation_id,
-                from_datetime=from_datetime,
-                to_datetime=to_datetime,
+                start=start,
+                end=end,
             ),
         )
 
@@ -679,27 +680,27 @@ class LiveMarketDataClient(MarketDataClient):
     ############################################################################
     async def _connect(self):
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_connect` coroutine",  # pragma: no cover
+            "implement the `_connect` coroutine",  # pragma: no cover
         )
 
     async def _disconnect(self):
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_disconnect` coroutine",  # pragma: no cover
+            "implement the `_disconnect` coroutine",  # pragma: no cover
         )
 
     async def _subscribe(self, data_type: DataType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe` coroutine",  # pragma: no cover
+            "implement the `_subscribe` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_instruments(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_instruments` coroutine",  # pragma: no cover
+            "implement the `_subscribe_instruments` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_instrument(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_instrument` coroutine",  # pragma: no cover
+            "implement the `_subscribe_instrument` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_order_book_deltas(
@@ -707,10 +708,10 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         book_type: BookType,
         depth: Optional[int] = None,
-        kwargs: dict[str, Any] = None,
+        kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_order_book_deltas` coroutine",  # pragma: no cover
+            "implement the `_subscribe_order_book_deltas` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_order_book_snapshots(
@@ -718,110 +719,110 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         book_type: BookType,
         depth: Optional[int] = None,
-        kwargs: dict[str, Any] = None,
+        kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_order_book_snapshots` coroutine",  # pragma: no cover
+            "implement the `_subscribe_order_book_snapshots` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_ticker(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_ticker` coroutine",  # pragma: no cover
+            "implement the `_subscribe_ticker` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_quote_ticks(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_quote_ticks` coroutine",  # pragma: no cover
+            "implement the `_subscribe_quote_ticks` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_trade_ticks(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_trade_ticks` coroutine",  # pragma: no cover
+            "implement the `_subscribe_trade_ticks` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_bars(self, bar_type: BarType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_bars` coroutine",  # pragma: no cover
+            "implement the `_subscribe_bars` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_instrument_status_updates(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_instrument_status_updates` coroutine",  # pragma: no cover
+            "implement the `_subscribe_instrument_status_updates` coroutine",  # pragma: no cover
         )
 
     async def _subscribe_instrument_close(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_subscribe_instrument_close` coroutine",  # pragma: no cover
+            "implement the `_subscribe_instrument_close` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe(self, data_type: DataType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_instruments(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_instruments` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_instruments` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_instrument(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_instrument` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_instrument` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_order_book_deltas(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_order_book_deltas` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_order_book_deltas` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_order_book_snapshots(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_order_book_snapshots` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_order_book_snapshots` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_ticker(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_ticker` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_ticker` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_quote_ticks(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_quote_ticks` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_quote_ticks` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_trade_ticks(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_trade_ticks` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_trade_ticks` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_bars(self, bar_type: BarType) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_bars` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_bars` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_instrument_status_updates(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_instrument_status_updates` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_instrument_status_updates` coroutine",  # pragma: no cover
         )
 
     async def _unsubscribe_instrument_close(self, instrument_id: InstrumentId) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_unsubscribe_instrument_close` coroutine",  # pragma: no cover
+            "implement the `_unsubscribe_instrument_close` coroutine",  # pragma: no cover
         )
 
     async def _request(self, data_type: DataType, correlation_id: UUID4) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request` coroutine",  # pragma: no cover
+            "implement the `_request` coroutine",  # pragma: no cover
         )
 
     async def _request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4):
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request_instrument` coroutine",  # pragma: no cover
+            "implement the `_request_instrument` coroutine",  # pragma: no cover
         )
 
     async def _request_instruments(self, venue: Venue, correlation_id: UUID4):
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request_instruments` coroutine",  # pragma: no cover
+            "implement the `_request_instruments` coroutine",  # pragma: no cover
         )
 
     async def _request_quote_ticks(
@@ -829,11 +830,11 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request_quote_ticks` coroutine",  # pragma: no cover
+            "implement the `_request_quote_ticks` coroutine",  # pragma: no cover
         )
 
     async def _request_trade_ticks(
@@ -841,11 +842,11 @@ class LiveMarketDataClient(MarketDataClient):
         instrument_id: InstrumentId,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request_trade_ticks` coroutine",  # pragma: no cover
+            "implement the `_request_trade_ticks` coroutine",  # pragma: no cover
         )
 
     async def _request_bars(
@@ -853,9 +854,9 @@ class LiveMarketDataClient(MarketDataClient):
         bar_type: BarType,
         limit: int,
         correlation_id: UUID4,
-        from_datetime: Optional[pd.Timestamp] = None,
-        to_datetime: Optional[pd.Timestamp] = None,
+        start: Optional[pd.Timestamp] = None,
+        end: Optional[pd.Timestamp] = None,
     ) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_request_bars` coroutine",  # pragma: no cover
+            "implement the `_request_bars` coroutine",  # pragma: no cover
         )

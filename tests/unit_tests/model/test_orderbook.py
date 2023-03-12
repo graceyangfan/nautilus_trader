@@ -17,7 +17,6 @@ import msgspec
 import pandas as pd
 import pytest
 
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
 from nautilus_trader.model.enums import BookAction
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import OrderSide
@@ -33,6 +32,7 @@ from nautilus_trader.model.orderbook.data import OrderBookDeltas
 from nautilus_trader.model.orderbook.data import OrderBookSnapshot
 from nautilus_trader.model.orderbook.ladder import Ladder
 from nautilus_trader.model.orderbook.level import Level
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
@@ -277,7 +277,7 @@ class TestOrderBook:
         assert self.empty_l2_book.best_bid_price() == 1580.0
         assert self.empty_l2_book.best_ask_price() == 1552.15
         assert self.empty_l2_book.count == 4
-        assert self.empty_l2_book.last_update_id == 4
+        assert self.empty_l2_book.sequence == 4
 
     def test_orderbook_operation_update(self):
         delta = OrderBookDelta(
@@ -296,7 +296,7 @@ class TestOrderBook:
         self.empty_l2_book.apply_delta(delta)
         assert self.empty_l2_book.best_ask_price() == 0.5814
         assert self.empty_l2_book.count == 1
-        assert self.empty_l2_book.last_update_id == 1
+        assert self.empty_l2_book.sequence == 1
 
     def test_orderbook_operation_add(self):
         delta = OrderBookDelta(
@@ -315,7 +315,7 @@ class TestOrderBook:
         self.empty_l2_book.apply_delta(delta)
         assert self.empty_l2_book.best_ask_price() == 0.59
         assert self.empty_l2_book.count == 1
-        assert self.empty_l2_book.last_update_id == 1
+        assert self.empty_l2_book.sequence == 1
 
     def test_orderbook_operations(self):
         delta = OrderBookDelta(
@@ -503,17 +503,17 @@ class TestOrderBook:
                             "instrument_id": self.instrument_id.value,
                             "book_type": "L2_MBP",
                             "action": "UPDATE",
-                            "order_price": 0.990099,
-                            "order_size": 2.0,
-                            "order_side": "BUY",
+                            "price": 0.990099,
+                            "size": 2.0,
+                            "side": "BUY",
                             "order_id": "ef93694d-64c7-4b26-b03b-48c0bc2afea7",
-                            "update_id": 0,
+                            "sequence": 0,
                             "ts_event": 1667288437852999936,
                             "ts_init": 1667288437852999936,
                         },
                     ],
                 ),
-                "update_id": 0,
+                "sequence": 0,
                 "ts_event": 1667288437852999936,
                 "ts_init": 1667288437852999936,
             },

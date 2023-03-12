@@ -50,21 +50,6 @@ class SubscriptionStatus(Enum):
     RUNNING = 2
 
 
-class InstrumentSearch(Data):
-    """
-    Represents a `Betfair` instrument search.
-    """
-
-    def __init__(
-        self,
-        instruments,
-        ts_event,
-        ts_init,
-    ):
-        super().__init__(ts_event, ts_init)
-        self.instruments = instruments
-
-
 class BSPOrderBookDeltas(OrderBookDeltas):
     """
     Represents a batch of Betfair BSP order book delta.
@@ -83,10 +68,10 @@ class BSPOrderBookDelta(OrderBookDelta):
         order: BookOrder = (
             BookOrder.from_dict(
                 {
-                    "price": values["order_price"],
-                    "size": values["order_size"],
-                    "side": values["order_side"],
-                    "id": values["order_id"],
+                    "price": values["price"],
+                    "size": values["size"],
+                    "side": values["side"],
+                    "order_id": values["order_id"],
                 },
             )
             if values["action"] != "CLEAR"

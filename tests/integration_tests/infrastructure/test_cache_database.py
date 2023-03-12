@@ -13,14 +13,12 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+import sys
 from decimal import Decimal
 
 import pytest
 import redis
 
-from nautilus_trader.backtest.data.providers import TestDataProvider
-from nautilus_trader.backtest.data.providers import TestInstrumentProvider
-from nautilus_trader.backtest.data.wranglers import QuoteTickDataWrangler
 from nautilus_trader.backtest.engine import BacktestEngine
 from nautilus_trader.backtest.engine import BacktestEngineConfig
 from nautilus_trader.common.clock import TestClock
@@ -57,10 +55,14 @@ from nautilus_trader.model.orders.limit import LimitOrder
 from nautilus_trader.model.orders.market import MarketOrder
 from nautilus_trader.model.position import Position
 from nautilus_trader.msgbus.bus import MessageBus
+from nautilus_trader.persistence.wranglers import QuoteTickDataWrangler
 from nautilus_trader.portfolio.portfolio import Portfolio
 from nautilus_trader.risk.engine import RiskEngine
 from nautilus_trader.serialization.msgpack.serializer import MsgPackSerializer
+from nautilus_trader.test_kit.mocks.actors import MockActor
 from nautilus_trader.test_kit.mocks.strategies import MockStrategy
+from nautilus_trader.test_kit.providers import TestDataProvider
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from nautilus_trader.test_kit.stubs.component import TestComponentStubs
 from nautilus_trader.test_kit.stubs.data import TestDataStubs
 from nautilus_trader.test_kit.stubs.events import TestEventStubs
@@ -73,7 +75,11 @@ AUDUSD_SIM = TestInstrumentProvider.default_fx_ccy("AUD/USD")
 
 # Requirements:
 # - A Redis instance listening on the default port 6379
-pytestmark = pytest.mark.redis
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="not longer testing with Memurai database",
+)
 
 
 class TestRedisCacheDatabase:
@@ -83,6 +89,7 @@ class TestRedisCacheDatabase:
         self.logger = Logger(
             clock=self.clock,
             level_stdout=LogLevel.DEBUG,
+            bypass=True,
         )
 
         self.trader_id = TestIdStubs.trader_id()
@@ -145,6 +152,24 @@ class TestRedisCacheDatabase:
     def teardown(self):
         # Tests will start failing if redis is not flushed on tear down
         self.test_redis.flushall()  # Comment this line out to preserve data between tests
+
+    def test_load_general_objects_when_nothing_in_cache_returns_empty_dict(self):
+        # Arrange, Act
+        result = self.database.load()
+
+        # Assert
+        assert result == {}
+
+    def test_add_general_object_adds_to_cache(self):
+        # Arrange
+        bar = TestDataStubs.bar_5decimal()
+        key = str(bar.bar_type) + "-" + str(bar.ts_event)
+
+        # Act
+        self.database.add(key, str(bar).encode())
+
+        # Assert
+        assert self.database.load() == {key: str(bar).encode()}
 
     def test_add_currency(self):
         # Arrange
@@ -414,6 +439,23 @@ class TestRedisCacheDatabase:
 
         # Assert
         assert True  # No exception raised
+
+    def test_update_actor(self):
+        # Arrange
+        actor = MockActor()
+        actor.register_base(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            logger=self.logger,
+        )
+
+        # Act
+        self.database.update_actor(actor)
+        result = self.database.load_actor(actor.id)
+
+        # Assert
+        assert result == {"A": b"1"}
 
     def test_update_strategy(self):
         # Arrange
@@ -784,8 +826,40 @@ class TestRedisCacheDatabase:
         # Assert
         assert result == {position.id: position}
 
+    def test_delete_actor(self):
+        # Arrange, Act
+        actor = MockActor()
+        actor.register_base(
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            logger=self.logger,
+        )
+
+        self.database.update_actor(actor)
+
+        # Act
+        self.database.delete_actor(actor.id)
+        result = self.database.load_actor(actor.id)
+
+        # Assert
+        assert result == {}
+
     def test_delete_strategy(self):
         # Arrange, Act
+        strategy = MockStrategy(TestDataStubs.bartype_btcusdt_binance_100tick_last())
+        strategy.register(
+            trader_id=self.trader_id,
+            portfolio=self.portfolio,
+            msgbus=self.msgbus,
+            cache=self.cache,
+            clock=self.clock,
+            logger=self.logger,
+        )
+
+        self.database.update_strategy(strategy)
+
+        # Act
         self.database.delete_strategy(self.strategy.id)
         result = self.database.load_strategy(self.strategy.id)
 
@@ -924,7 +998,7 @@ class TestRedisCacheDatabaseIntegrity:
     def setup(self):
         # Fixture Setup
         config = BacktestEngineConfig(
-            bypass_logging=False,
+            bypass_logging=True,
             run_analysis=False,
             cache_database=CacheDatabaseConfig(),  # default redis
         )

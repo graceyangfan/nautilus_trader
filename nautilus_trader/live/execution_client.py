@@ -278,7 +278,7 @@ class LiveExecutionClient(ExecutionClient):
         venue_order_id: Optional[VenueOrderId] = None,
     ) -> Optional[OrderStatusReport]:
         """
-        Generate an order status report for the given order identifier parameter(s).
+        Generate an `OrderStatusReport` for the given order identifier parameter(s).
 
         If the order is not found, or an error occurs, then logs and returns ``None``.
 
@@ -311,7 +311,7 @@ class LiveExecutionClient(ExecutionClient):
         open_only: bool = False,
     ) -> list[OrderStatusReport]:
         """
-        Generate a list of order status reports with optional query filters.
+        Generate a list of `OrderStatusReport`s with optional query filters.
 
         The returned list may be empty if no orders match the given parameters.
 
@@ -341,7 +341,7 @@ class LiveExecutionClient(ExecutionClient):
         end: Optional[pd.Timestamp] = None,
     ) -> list[TradeReport]:
         """
-        Generate a list of trade reports with optional query filters.
+        Generate a list of `TradeReport`s with optional query filters.
 
         The returned list may be empty if no trades match the given parameters.
 
@@ -370,7 +370,7 @@ class LiveExecutionClient(ExecutionClient):
         end: Optional[pd.Timestamp] = None,
     ) -> list[PositionStatusReport]:
         """
-        Generate a list of position status reports with optional query filters.
+        Generate a list of `PositionStatusReport`s with optional query filters.
 
         The returned list may be empty if no positions match the given parameters.
 
@@ -395,7 +395,7 @@ class LiveExecutionClient(ExecutionClient):
         lookback_mins: Optional[int] = None,
     ) -> ExecutionMassStatus:
         """
-        Generate an execution mass status report.
+        Generate an `ExecutionMassStatus` report.
 
         Parameters
         ----------
@@ -419,7 +419,7 @@ class LiveExecutionClient(ExecutionClient):
             ts_init=self._clock.timestamp_ns(),
         )
 
-        since = None
+        since: Optional[pd.Timestamp] = None
         if lookback_mins is not None:
             since = self._clock.utc_now() - timedelta(minutes=lookback_mins)
 
@@ -460,35 +460,35 @@ class LiveExecutionClient(ExecutionClient):
     ############################################################################
     async def _connect(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_connect` coroutine",  # pragma: no cover
+            "implement the `_connect` coroutine",  # pragma: no cover
         )
 
     async def _disconnect(self) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_disconnect` coroutine",  # pragma: no cover
+            "implement the `_disconnect` coroutine",  # pragma: no cover
         )
 
     async def _submit_order(self, command: SubmitOrder) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_submit_order` coroutine",  # pragma: no cover
+            "implement the `_submit_order` coroutine",  # pragma: no cover
         )
 
     async def _submit_order_list(self, command: SubmitOrderList) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_submit_order_list` coroutine",  # pragma: no cover
+            "implement the `_submit_order_list` coroutine",  # pragma: no cover
         )
 
     async def _modify_order(self, command: ModifyOrder) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_modify_order` coroutine",  # pragma: no cover
+            "implement the `_modify_order` coroutine",  # pragma: no cover
         )
 
     async def _cancel_order(self, command: CancelOrder) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_cancel_order` coroutine",  # pragma: no cover
+            "implement the `_cancel_order` coroutine",  # pragma: no cover
         )
 
     async def _cancel_all_orders(self, command: CancelAllOrders) -> None:
         raise NotImplementedError(  # pragma: no cover
-            "please implement the `_cancel_all_orders` coroutine",  # pragma: no cover
+            "implement the `_cancel_all_orders` coroutine",  # pragma: no cover
         )

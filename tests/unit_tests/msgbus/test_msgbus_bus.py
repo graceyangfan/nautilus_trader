@@ -29,7 +29,7 @@ class TestMessageBus:
     def setup(self):
         # Fixture Setup
         self.clock = TestClock()
-        self.logger = Logger(self.clock)
+        self.logger = Logger(self.clock, bypass=True)
 
         self.trader_id = TestIdStubs.trader_id()
 
@@ -427,6 +427,21 @@ class TestMessageBus:
         # Assert
         assert handler1 == ["message1"]
         assert handler2 == ["message1", "message2", "message3"]
+
+    def test_msgbus_for_system_events_using_component_id(self):
+        # Arrange
+        subscriber = []
+        self.msgbus.subscribe(topic="events.system.*", handler=subscriber.append)
+
+        topic = f"events.system.{str(TestIdStubs.trader_id())}"
+
+        # Act
+        self.msgbus.publish("events.system.DUMMY", "DUMMY EVENT")
+        self.msgbus.publish(topic, "TRADER EVENT")
+
+        # Assert
+        assert self.msgbus.pub_count == 2
+        assert len(subscriber) == 2
 
 
 @pytest.mark.parametrize(
