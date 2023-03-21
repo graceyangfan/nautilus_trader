@@ -1099,6 +1099,7 @@ class Twist:
         b_l = [_b.low for _b in fx_bars]
         line.high = np.array(b_h).max()
         line.low = np.array(b_l).min()
+        line.vwap = np.sum([_b.close * _b.volume for _b in fx_bars]) / np.sum([_b.volume for _b in fx_bars])
         return True 
 
     def query_macd_power(self, start_fx: FX, end_fx: FX):
@@ -1538,6 +1539,18 @@ class Twist:
             return True
         else:
             return False
+
+    def get_anchored_vwap(
+        self,
+        run_type: LineType = LineType.BI,
+    ):
+        if run_type == LineType.BI:
+            line = self.bis[-1]
+        else:
+            line = self.xds[-1]
+        start = line.end.middle_twist_bar.b_index+1
+        fx_bars = self.newbars[start:]
+        return np.sum([bar.close*bar.volume for bar in fx_bars])/np.sum([bar.volume for bar in fx_bars])
 
     def on_reset(self):
         """

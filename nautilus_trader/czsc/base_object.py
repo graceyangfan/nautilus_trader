@@ -194,6 +194,7 @@ class LINE:
         self.ts_closed = self.end.ts_closed if self.end else self.ts_opened
         self.high = 0 
         self.low = 0 
+        self.vwap = 0 
 
 
     def top_high(self):
