@@ -15,9 +15,7 @@
 
 from collections import deque
 
-import pandas as pd
-
-from cpython.datetime cimport datetime
+from libc.stdint cimport uint64_t
 
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.indicators.base.indicator cimport Indicator
@@ -66,6 +64,10 @@ cdef class Zigzag(Indicator):
         self.sum_value = 0 
         self.anchored_vwap  = 0 
         self.anchored_bars  = 0 
+        self.last_sum_volume  = 0 
+        self.last_sum_value = 0 
+        self.last_anchored_vwap  = 0 
+        self.last_anchored_bars  = 0 
 
     cpdef void handle_bar(self, Bar bar) except *:
         """
@@ -85,7 +87,7 @@ cdef class Zigzag(Indicator):
                 bar.close.as_double(),
                 bar.close.as_double(),
                 bar.volume.as_double(),
-                pd.Timestamp(bar.ts_init, tz="UTC")
+                bar.ts_event,
             )
         else:
             self.update_raw(
@@ -94,7 +96,7 @@ cdef class Zigzag(Indicator):
                 bar.low.as_double(),
                 bar.close.as_double(),
                 bar.volume.as_double(),
-                pd.Timestamp(bar.ts_init, tz="UTC")
+                bar.ts_event,
             )
 
     cpdef void update_raw(
@@ -104,7 +106,7 @@ cdef class Zigzag(Indicator):
         double low,
         double close,
         double volume,
-        datetime timestamp,
+        uint64_t timestamp,
     ) except *:
         """
         Update the indicator with the given raw values.
@@ -131,7 +133,7 @@ cdef class Zigzag(Indicator):
 
         if not self.initialized:
             self._set_has_inputs(True)
-            if  self.length > 0 :
+            if len(self.zigzags_values) >=3:
                 self._set_initialized(True)
             ##init the zigzags
             if  not self.zigzags_values:
@@ -174,6 +176,10 @@ cdef class Zigzag(Indicator):
                 self.zigzags_values.append(high)
                 self.zigzags_Type.append("Peak")
                 self.zigzags_datetime.append(timestamp)
+                self.last_sum_volume  = self.sum_volume
+                self.last_sum_value = self.sum_value
+                self.last_anchored_vwap  = self.anchored_vwap
+                self.last_anchored_bars  = self.anchored_bars
                 self.sum_volume  = 0 
                 self.sum_value = 0 
                 self.anchored_bars  = 0 
@@ -189,23 +195,26 @@ cdef class Zigzag(Indicator):
                 self.zigzags_values.append(low)
                 self.zigzags_Type.append("Trough")
                 self.zigzags_datetime.append(timestamp)
+                self.last_sum_volume  = self.sum_volume
+                self.last_sum_value = self.sum_value
+                self.last_anchored_vwap  = self.anchored_vwap
+                self.last_anchored_bars  = self.anchored_bars
                 self.sum_volume  = 0 
                 self.sum_value = 0 
                 self.anchored_bars  = 0 
 
-        ## compute previous pivot
-        if self.zigzags_datetime[-1] != timestamp:
-            if self.zigzags_Type[-1] == "Trough":
-                self.low_price = self.zigzags_values[-1]
+        if len(self.zigzags_values) == 2:
+            self.length = abs(self.zigzags_values[-1] - self.zigzags_values[-2])
+        else:
+            if self.zigzags_values[-2] > self.zigzags_values[-3]:
                 self.high_price = self.zigzags_values[-2]
-                self.zigzag_direction = -1
+                self.low_price = self.zigzags_values[-3]
+                self.zigzag_direction = 1 
             else:
+                self.high_price = self.zigzags_values[-3]
                 self.low_price = self.zigzags_values[-2]
-                self.high_price = self.zigzags_values[-1]
-                self.zigzag_direction = 1
-
-        self.length  = self.high_price - self.low_price
-
+                self.zigzag_direction = -1
+            self.length = self.high_price - self.low_price 
 
     cpdef double calc_change_since_pivot(self,double current_value) except *:
         last_pivot = self.zigzags_values[-1]
@@ -222,6 +231,10 @@ cdef class Zigzag(Indicator):
         self.sum_value = 0 
         self.anchored_vwap  = 0 
         self.anchored_bars  = 0 
+        self.last_sum_volume  = 0 
+        self.last_sum_value = 0 
+        self.last_anchored_vwap  = 0 
+        self.last_anchored_bars  = 0 
         self.threshold = 0
         self.high_price = 0
         self.low_price = 0

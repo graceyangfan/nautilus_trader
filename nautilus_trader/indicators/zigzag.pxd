@@ -13,24 +13,32 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-from cpython.datetime cimport datetime
+from libc.stdint cimport uint64_t
 
 from nautilus_trader.indicators.base.indicator cimport Indicator
 from nautilus_trader.model.data.bar cimport Bar
 
 
 cdef class Zigzag(Indicator):
-    cdef object zigzags_values
+    cdef readonly object zigzags_values
     cdef object zigzags_Type
-    cdef object zigzags_datetime
+    cdef readonly object zigzags_datetime
 
     cdef readonly double sum_volume 
-    """The sum volume of bars in last zigzag_line.\n\n:returns: `double`"""
+    """The sum volume of bars in current zigzag_line.\n\n:returns: `double`"""
     cdef readonly double sum_value
-    """The sum value of bars in last zigzag_line.\n\n:returns: `double`"""
+    """The sum value of bars in current zigzag_line.\n\n:returns: `double`"""
     cdef readonly double anchored_vwap  
-    """The anchored vwap in last zigzag_line.\n\n:returns: `double`"""
+    """The anchored vwap in current zigzag_line.\n\n:returns: `double`"""
     cdef readonly int anchored_bars 
+    """The number of bars in current zigzag_line.\n\n:returns: `int`"""
+    cdef readonly double last_sum_volume 
+    """The sum volume of bars in last zigzag_line.\n\n:returns: `double`"""
+    cdef readonly double last_sum_value
+    """The sum value of bars in last zigzag_line.\n\n:returns: `double`"""
+    cdef readonly double last_anchored_vwap  
+    """The anchored vwap in last zigzag_line.\n\n:returns: `double`"""
+    cdef readonly int last_anchored_bars 
     """The number of bars in last zigzag_line.\n\n:returns: `int`"""
 
     cdef readonly double change_percent
@@ -50,5 +58,6 @@ cdef class Zigzag(Indicator):
 
 
     cpdef void handle_bar(self, Bar bar) except *
-    cpdef void update_raw(self,double open, double high, double low, double close, double volume, datetime timestamp) except *
+    cpdef void update_raw(self,double open, double high, double low, double close, double volume, uint64_t timestamp) except *
     cpdef double calc_change_since_pivot(self,double current_value) except *
+
