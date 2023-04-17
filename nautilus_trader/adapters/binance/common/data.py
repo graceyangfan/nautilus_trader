@@ -48,6 +48,7 @@ from nautilus_trader.model.data.bar import BarType
 from nautilus_trader.model.data.base import DataType
 from nautilus_trader.model.data.tick import QuoteTick
 from nautilus_trader.model.data.tick import TradeTick
+from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.enums import BookType
 from nautilus_trader.model.enums import PriceType
 from nautilus_trader.model.identifiers import ClientId
@@ -550,17 +551,30 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         if end is not None:
             end_time_ms = secs_to_millis(end.timestamp())
 
-        bars = await self._http_market.request_binance_bars(
-            bar_type=bar_type,
-            interval=interval,
-            start_time=start_time_ms,
-            end_time=end_time_ms,
-            limit=limit,
-            ts_init=self._clock.timestamp_ns(),
-        )
+        base_ms = 0
+        if bar_type.spec.aggregation == BarAggregation.MINUTE:
+            base_ms = 60000
+        elif bar_type.spec.aggregation == BarAggregation.HOUR:
+            base_ms = 3600000
+        elif bar_type.spec.aggregation == BarAggregation.DAY:
+            base_ms = 86400000
 
-        partial: BinanceBar = bars.pop()
-        self._handle_bars(bar_type, bars, partial, correlation_id)
+        total_bars = [] 
+        while start_time_ms < end_time_ms:
+            bars = await self._http_market.request_binance_bars(
+                bar_type=bar_type,
+                interval=interval,
+                start_time=start_time_ms,
+                end_time=end_time_ms,
+                limit=limit,
+                ts_init=self._clock.timestamp_ns(),
+            )
+            total_bars.extend(bars)
+            start_time_ms = bars[-1].ts_event + base_ms * bar_type.spec.step
+            end_time_ms = secs_to_millis(pd.Timestamp.utcnow().timestamp())
+
+        partial: BinanceBar = total_bars.pop()
+        self._handle_bars(bar_type, total_bars, partial, correlation_id)
 
     def _send_all_instruments_to_data_engine(self) -> None:
         for instrument in self._instrument_provider.get_all().values():
