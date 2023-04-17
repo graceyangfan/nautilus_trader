@@ -52,10 +52,10 @@ cdef class Zigzag(Indicator):
         self.full_close = full_close
         self.threshold = 0
 
-        self.high_price = 0
-        self.low_price = 0
-        self.length = 0
-        self.zigzag_direction = 0
+        self.virtual_high = 0
+        self.virtual_low = 0
+        self.virtual_length = 0
+        self.virtual_direction = 0
 
         self.zigzags_values = deque(maxlen = 3)
         self.zigzags_Type = deque(maxlen = 3)
@@ -203,18 +203,18 @@ cdef class Zigzag(Indicator):
                 self.sum_value = 0 
                 self.anchored_bars  = 0 
 
-        if len(self.zigzags_values) == 2:
-            self.length = abs(self.zigzags_values[-1] - self.zigzags_values[-2])
-        else:
-            if self.zigzags_values[-2] > self.zigzags_values[-3]:
-                self.high_price = self.zigzags_values[-2]
-                self.low_price = self.zigzags_values[-3]
-                self.zigzag_direction = 1 
+        ## compute previous pivot
+        if self.zigzags_datetime[-1] != timestamp:
+            if self.zigzags_Type[-1] == "Trough":
+                self.virtual_low = self.zigzags_values[-1]
+                self.virtual_high = self.zigzags_values[-2]
+                self.virtual_direction = -1
             else:
-                self.high_price = self.zigzags_values[-3]
-                self.low_price = self.zigzags_values[-2]
-                self.zigzag_direction = -1
-            self.length = self.high_price - self.low_price 
+                self.virtual_low = self.zigzags_values[-2]
+                self.virtual_high = self.zigzags_values[-1]
+                self.virtual_direction = 1
+
+        self.virtual_length  = self.virtual_high - self.virtual_low
 
     cpdef double calc_change_since_pivot(self,double current_value) except *:
         last_pivot = self.zigzags_values[-1]
@@ -236,7 +236,7 @@ cdef class Zigzag(Indicator):
         self.last_anchored_vwap  = 0 
         self.last_anchored_bars  = 0 
         self.threshold = 0
-        self.high_price = 0
-        self.low_price = 0
-        self.length = 0
-        self.zigzag_direction = 0
+        self.virtual_high = 0
+        self.virtual_low = 0
+        self.virtual_length = 0
+        self.virtual_direction = 0

@@ -47,14 +47,14 @@ cdef class Zigzag(Indicator):
     """The zigzag full_close param.\n\n:returns: `double`"""
     cdef readonly double threshold
     """The zigzag threshold .\n\n:returns: `double`"""
-    cdef readonly double high_price
-    """The last zigzag high price.\n\n:returns: `double`"""
-    cdef readonly double low_price
-    """The last zigzag low price.\n\n:returns: `double`"""
-    cdef readonly double length
-    """The length of the current zigzag.\n\n:returns: `double`"""
-    cdef readonly int zigzag_direction
-    """The current zigzag direction.\n\n:returns: `int`"""
+    cdef readonly double virtual_high
+    """The virtual zigzag high price.\n\n:returns: `double`"""
+    cdef readonly double virtual_low
+    """The virtual zigzag low price.\n\n:returns: `double`"""
+    cdef readonly double virtual_length 
+    """The length of the virtual zigzag.\n\n:returns: `double`"""
+    cdef readonly int virtual_direction 
+    """The current virtual zigzag direction.\n\n:returns: `int`"""
 
 
     cpdef void handle_bar(self, Bar bar) except *
