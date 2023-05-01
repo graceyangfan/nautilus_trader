@@ -561,17 +561,17 @@ class BinanceCommonDataClient(LiveMarketDataClient):
 
         total_bars = [] 
         while start_time_ms < end_time_ms:
+            end_time = start_time_ms + base_ms * bar_type.spec.step * limit 
             bars = await self._http_market.request_binance_bars(
                 bar_type=bar_type,
                 interval=interval,
                 start_time=start_time_ms,
-                end_time=end_time_ms,
+                end_time=end_time,
                 limit=limit,
                 ts_init=self._clock.timestamp_ns(),
             )
             total_bars.extend(bars)
-            start_time_ms = bars[-1].ts_event + base_ms * bar_type.spec.step
-            end_time_ms = secs_to_millis(pd.Timestamp.utcnow().timestamp())
+            start_time_ms = bars[-1].ts_event//1e6 + base_ms * bar_type.spec.step
 
         partial: BinanceBar = total_bars.pop()
         self._handle_bars(bar_type, total_bars, partial, correlation_id)
