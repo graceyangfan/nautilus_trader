@@ -83,7 +83,7 @@ class LiveDataClient(DataClient):
         clock: LiveClock,
         logger: Logger,
         config: Optional[dict[str, Any]] = None,
-    ):
+    ) -> None:
         super().__init__(
             client_id=client_id,
             venue=venue,
@@ -296,7 +296,7 @@ class LiveMarketDataClient(MarketDataClient):
         clock: LiveClock,
         logger: Logger,
         config: Optional[dict[str, Any]] = None,
-    ):
+    ) -> None:
         PyCondition.type(instrument_provider, InstrumentProvider, "instrument_provider")
 
         super().__init__(
@@ -606,13 +606,13 @@ class LiveMarketDataClient(MarketDataClient):
             log_msg=f"request: {data_type}",
         )
 
-    def request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4):
+    def request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4) -> None:
         self.create_task(
             self._request_instrument(instrument_id, correlation_id),
             log_msg=f"request: instrument {instrument_id}",
         )
 
-    def request_instruments(self, venue: Venue, correlation_id: UUID4):
+    def request_instruments(self, venue: Venue, correlation_id: UUID4) -> None:
         self._log.debug(f"Request instruments for {venue} {correlation_id}.")
         self.create_task(
             self._request_instruments(venue, correlation_id),
@@ -815,12 +815,12 @@ class LiveMarketDataClient(MarketDataClient):
             "implement the `_request` coroutine",  # pragma: no cover
         )
 
-    async def _request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4):
+    async def _request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_request_instrument` coroutine",  # pragma: no cover
         )
 
-    async def _request_instruments(self, venue: Venue, correlation_id: UUID4):
+    async def _request_instruments(self, venue: Venue, correlation_id: UUID4) -> None:
         raise NotImplementedError(  # pragma: no cover
             "implement the `_request_instruments` coroutine",  # pragma: no cover
         )

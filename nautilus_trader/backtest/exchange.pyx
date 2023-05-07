@@ -95,6 +95,8 @@ cdef class SimulatedExchange:
         The order book type for the exchange.
     frozen_account : bool, default False
         If the account for this exchange is frozen (balances will not change).
+    bar_execution : bool, default True
+        If bars should be processed by the matching engine(s) (and move the market).
     reject_stop_orders : bool, default True
         If stop orders are rejected on submission if in the market.
     support_gtd_orders : bool, default True
@@ -135,6 +137,7 @@ cdef class SimulatedExchange:
         LatencyModel latency_model = None,
         BookType book_type = BookType.L1_TBBO,
         bint frozen_account = False,
+        bint bar_execution = True,
         bint reject_stop_orders = True,
         bint support_gtd_orders = True,
     ):
@@ -171,6 +174,7 @@ cdef class SimulatedExchange:
         self.is_frozen_account = frozen_account
 
         # Execution
+        self.bar_execution = bar_execution
         self.reject_stop_orders = reject_stop_orders
         self.support_gtd_orders = support_gtd_orders
         self.fill_model = fill_model
@@ -317,6 +321,7 @@ cdef class SimulatedExchange:
             cache=self.cache,
             clock=self._clock,
             logger=self._log.get_logger(),
+            bar_execution=self.bar_execution,
             reject_stop_orders=self.reject_stop_orders,
             support_gtd_orders=self.support_gtd_orders,
         )
@@ -725,7 +730,7 @@ cdef class SimulatedExchange:
 
         matching_engine.process_status(update.status)
 
-    cpdef void process(self, uint64_t now_ns):
+    cpdef void process(self, uint64_t ts_now):
         """
         Process the exchange to the gives time.
 
@@ -733,18 +738,18 @@ cdef class SimulatedExchange:
 
         Parameters
         ----------
-        now_ns : uint64_t
-            The UNIX timestamp (nanoseconds) now.
+        ts_now : uint64_t
+            The current UNIX timestamp (nanoseconds).
 
         """
-        self._clock.set_time(now_ns)
+        self._clock.set_time(ts_now)
 
         cdef:
             uint64_t ts
         while self._inflight_queue:
             # Peek at timestamp of next in-flight message
             ts = self._inflight_queue[0][0][0]
-            if ts <= now_ns:
+            if ts <= ts_now:
                 # Place message on queue to be processed
                 self._message_queue.put_nowait(self._inflight_queue.pop(0)[1])
                 self._inflight_counter.pop(ts, None)
@@ -772,7 +777,7 @@ cdef class SimulatedExchange:
         # Iterate over modules
         cdef SimulationModule module
         for module in self.modules:
-            module.process(now_ns)
+            module.process(ts_now)
 
     cpdef void reset(self):
         """

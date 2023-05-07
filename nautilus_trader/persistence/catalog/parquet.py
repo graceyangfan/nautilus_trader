@@ -12,6 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+
 import heapq
 import itertools
 import os
@@ -83,7 +84,7 @@ class ParquetDataCatalog(BaseDataCatalog):
             self.fs_protocol, **self.fs_storage_options
         )
 
-        path = make_path_posix(path)
+        path = make_path_posix(str(path))
 
         if (
             isinstance(self.fs, MemoryFileSystem)

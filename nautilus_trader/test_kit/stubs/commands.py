@@ -23,13 +23,13 @@ from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import VenueOrderId
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
-from nautilus_trader.model.orders.base import Order
+from nautilus_trader.model.orders import Order
 from nautilus_trader.test_kit.stubs.identifiers import TestIdStubs
 
 
 class TestCommandStubs:
     @staticmethod
-    def submit_order_command(order: Order):
+    def submit_order_command(order: Order) -> SubmitOrder:
         return SubmitOrder(
             trader_id=TestIdStubs.trader_id(),
             strategy_id=TestIdStubs.strategy_id(),
@@ -47,7 +47,7 @@ class TestCommandStubs:
         client_order_id: Optional[ClientOrderId] = None,
         venue_order_id: Optional[VenueOrderId] = None,
         order: Optional[Order] = None,
-    ):
+    ) -> ModifyOrder:
         assert price or quantity
         if order is not None:
             return ModifyOrder(
@@ -82,7 +82,7 @@ class TestCommandStubs:
         client_order_id: Optional[ClientOrderId] = None,
         venue_order_id: Optional[VenueOrderId] = None,
         order: Optional[Order] = None,
-    ):
+    ) -> CancelOrder:
         if order is not None:
             return CancelOrder(
                 trader_id=order.trader_id,

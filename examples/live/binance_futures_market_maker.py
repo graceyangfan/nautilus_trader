@@ -22,8 +22,9 @@ from nautilus_trader.adapters.binance.config import BinanceExecClientConfig
 from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory
 from nautilus_trader.adapters.binance.factories import BinanceLiveExecClientFactory
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.config import LiveExecEngineConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
-from nautilus_trader.config.live import LiveExecEngineConfig
 from nautilus_trader.examples.strategies.volatility_market_maker import VolatilityMarketMaker
 from nautilus_trader.examples.strategies.volatility_market_maker import VolatilityMarketMakerConfig
 from nautilus_trader.infrastructure.cache import CacheDatabaseConfig
@@ -39,7 +40,7 @@ from nautilus_trader.live.node import TradingNode
 # Configure the trading node
 config_node = TradingNodeConfig(
     trader_id="TESTER-001",
-    log_level="INFO",
+    logging=LoggingConfig(log_level="INFO"),
     exec_engine=LiveExecEngineConfig(
         reconciliation=True,
         reconciliation_lookback_mins=1440,
@@ -65,7 +66,7 @@ config_node = TradingNodeConfig(
     timeout_reconciliation=10.0,
     timeout_portfolio=10.0,
     timeout_disconnection=10.0,
-    timeout_post_stop=2.0,
+    timeout_post_stop=5.0,
 )
 # Instantiate the node with a configuration
 node = TradingNode(config=config_node)
@@ -73,6 +74,7 @@ node = TradingNode(config=config_node)
 # Configure your strategy
 strat_config = VolatilityMarketMakerConfig(
     instrument_id="ETHUSDT-PERP.BINANCE",
+    external_order_claims=["ETHUSDT-PERP.BINANCE"],
     bar_type="ETHUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL",
     atr_period=20,
     atr_multiple=6.0,

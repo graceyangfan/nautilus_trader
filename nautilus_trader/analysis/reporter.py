@@ -20,7 +20,7 @@ from nautilus_trader.accounting.accounts.base import Account
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.model.enums import OrderStatus
 from nautilus_trader.model.events.account import AccountState
-from nautilus_trader.model.orders.base import Order
+from nautilus_trader.model.orders import Order
 from nautilus_trader.model.position import Position
 
 
@@ -97,13 +97,13 @@ class ReportProvider:
         if not positions:
             return pd.DataFrame()
 
-        positions = [p.to_dict() for p in positions if p.is_closed]
+        positions = [p.to_dict() for p in positions]
         if not positions:
             return pd.DataFrame()
 
         sort = ["ts_opened", "ts_closed", "position_id"]
         report = pd.DataFrame(data=positions).set_index("position_id").sort_values(sort)
-        del report["net_qty"]
+        del report["signed_qty"]
         del report["quantity"]
         del report["quote_currency"]
         del report["base_currency"]

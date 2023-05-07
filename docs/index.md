@@ -101,7 +101,6 @@ does not need to have Rust installed to run NautilusTrader. In the future as mor
 
 ![Architecture](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/_images/architecture-overview.png?raw=true "architecture")
 
-
 ```{eval-rst}
 .. toctree::
    :maxdepth: 1
@@ -110,7 +109,8 @@ does not need to have Rust installed to run NautilusTrader. In the future as mor
    :hidden:
 
    getting_started/index.md
-   user_guide/index.md
+   concepts/index.md
+   guides/index.md
    integrations/index.md
    api_reference/index.md
    developer_guide/index.md

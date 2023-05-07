@@ -37,7 +37,7 @@ from nautilus_trader.common.logging cimport Logger
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.rust.common cimport LogColor
 from nautilus_trader.core.rust.common cimport LogLevel
-from nautilus_trader.core.rust.common cimport logger_free
+from nautilus_trader.core.rust.common cimport logger_drop
 from nautilus_trader.core.rust.common cimport logger_get_instance_id
 from nautilus_trader.core.rust.common cimport logger_get_machine_id_cstr
 from nautilus_trader.core.rust.common cimport logger_get_trader_id_cstr
@@ -45,6 +45,7 @@ from nautilus_trader.core.rust.common cimport logger_is_bypassed
 from nautilus_trader.core.rust.common cimport logger_log
 from nautilus_trader.core.rust.common cimport logger_new
 from nautilus_trader.core.string cimport cstr_to_pystr
+from nautilus_trader.core.string cimport pybytes_to_cstr
 from nautilus_trader.core.string cimport pystr_to_cstr
 from nautilus_trader.core.uuid cimport UUID4
 from nautilus_trader.model.identifiers cimport TraderId
@@ -78,10 +79,20 @@ cdef class Logger:
         The minimum log level to write to stdout.
     level_file : LogLevel, default ``DEBUG``
         The minimum log level to write to a file.
-    file_path : str, optional
-        The optional log file path. If ``None`` will not log to a file.
-    rate_limit : int, default 100_000
-        The maximum messages per second which can be flushed to stdout or stderr.
+    file_logging : bool, default False
+        If logging to a file is enabled.
+    directory : str, optional
+        The path to the log file directory.
+        If ``None`` then will write to the current working directory.
+    file_name : str, optional
+        The custom log file name (will use a '.log' suffix for plain text or '.json' for JSON).
+        If ``None`` will not log to a file (unless `file_auto` is True).
+    file_format : str { 'JSON' }, optional
+        The log file format. If ``None`` (default) then will log in plain text.
+        If set to 'JSON' then logs will be in JSON format.
+    component_levels : dict[ComponentId, LogLevel]
+        The additional per component log level filters, where keys are component
+        IDs (e.g. actor/strategy IDs) and values are log levels.
     bypass : bool
         If the log output is bypassed.
     """
@@ -94,8 +105,11 @@ cdef class Logger:
         UUID4 instance_id = None,
         LogLevel level_stdout = LogLevel.INFO,
         LogLevel level_file = LogLevel.DEBUG,
-        str file_path = None,
-        int rate_limit = 100_000,
+        bint file_logging = False,
+        str directory = None,
+        str file_name = None,
+        str file_format = None,
+        dict component_levels: dict[ComponentId, LogLevel] = None,
         bint bypass = False,
     ):
         if trader_id is None:
@@ -115,15 +129,17 @@ cdef class Logger:
             pystr_to_cstr(instance_id_str),
             level_stdout,
             level_file,
-            pystr_to_cstr(file_path) if file_path else NULL,
-            rate_limit,
+            file_logging,
+            pystr_to_cstr(directory) if directory else NULL,
+            pystr_to_cstr(file_name) if file_name else NULL,
+            pystr_to_cstr(file_format) if file_format else NULL,
+            pybytes_to_cstr(msgspec.json.encode(component_levels)) if component_levels is not None else NULL,
             bypass,
         )
-        self._file_path = file_path
 
     def __del__(self) -> None:
         if self._mem._0 != NULL:
-            logger_free(self._mem)  # `self._mem` moved to Rust (then dropped)
+            logger_drop(self._mem)  # `self._mem` moved to Rust (then dropped)
 
     @property
     def trader_id(self) -> TraderId:
@@ -160,18 +176,6 @@ cdef class Logger:
 
         """
         return UUID4.from_mem_c(logger_get_instance_id(&self._mem))
-
-    @property
-    def file_path(self) -> Optional[str]:
-        """
-        Return the optional file path for logging.
-
-        Returns
-        -------
-        str or ``None``
-
-        """
-        return self._file_path
 
     @property
     def is_bypassed(self) -> bool:

@@ -48,12 +48,22 @@ from nautilus_trader.common.enums_c cimport log_level_from_str
 from nautilus_trader.common.logging cimport Logger
 from nautilus_trader.common.logging cimport LoggerAdapter
 from nautilus_trader.common.logging cimport log_memory
+from nautilus_trader.common.timer cimport TimeEvent
 from nautilus_trader.common.timer cimport TimeEventHandler
 from nautilus_trader.core.correctness cimport Condition
 from nautilus_trader.core.data cimport Data
 from nautilus_trader.core.datetime cimport maybe_dt_to_unix_nanos
 from nautilus_trader.core.datetime cimport unix_nanos_to_dt
+from nautilus_trader.core.rust.backtest cimport TimeEventAccumulatorAPI
+from nautilus_trader.core.rust.backtest cimport time_event_accumulator_advance_clock
+from nautilus_trader.core.rust.backtest cimport time_event_accumulator_drain
+from nautilus_trader.core.rust.backtest cimport time_event_accumulator_drop
+from nautilus_trader.core.rust.backtest cimport time_event_accumulator_new
+from nautilus_trader.core.rust.common cimport TimeEventHandler_t
+from nautilus_trader.core.rust.common cimport vec_time_event_handlers_drop
+from nautilus_trader.core.rust.core cimport CVec
 from nautilus_trader.core.uuid cimport UUID4
+from nautilus_trader.execution.algorithm cimport ExecAlgorithm
 from nautilus_trader.model.data.bar cimport Bar
 from nautilus_trader.model.data.base cimport GenericData
 from nautilus_trader.model.data.tick cimport QuoteTick
@@ -69,6 +79,7 @@ from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport TraderId
 from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
+from nautilus_trader.model.instruments.currency_pair cimport CurrencyPair
 from nautilus_trader.model.objects cimport Currency
 from nautilus_trader.model.objects cimport Money
 from nautilus_trader.model.orderbook.data cimport OrderBookData
@@ -102,6 +113,7 @@ cdef class BacktestEngine:
 
         # Setup components
         self._clock: Clock = LiveClock()  # Real-time for the engine
+        self._accumulator = <TimeEventAccumulatorAPI>time_event_accumulator_new()
 
         # Run IDs
         self._run_config_id: Optional[str] = None
@@ -121,44 +133,19 @@ cdef class BacktestEngine:
         self._backtest_end: Optional[datetime] = None
 
         # Build core system kernel
-        self._kernel = NautilusKernel(
-            environment=Environment.BACKTEST,
-            name=type(self).__name__,
-            trader_id=TraderId(config.trader_id),
-            instance_id=config.instance_id,
-            cache_config=config.cache or CacheConfig(),
-            cache_database_config=config.cache_database or CacheDatabaseConfig(),
-            data_config=config.data_engine or DataEngineConfig(),
-            risk_config=config.risk_engine or RiskEngineConfig(),
-            exec_config=config.exec_engine or ExecEngineConfig(),
-            streaming_config=config.streaming,
-            actor_configs=config.actors,
-            strategy_configs=config.strategies,
-            load_state=config.load_state,
-            save_state=config.save_state,
-            log_level=log_level_from_str(config.log_level.upper()),
-            log_level_file=log_level_from_str(config.log_level_file.upper()),
-            log_file_path=config.log_file_path,
-            log_rate_limit=config.log_rate_limit,
-            bypass_logging=config.bypass_logging,
-        )
+        self._kernel = NautilusKernel(name=type(self).__name__, config=config)
 
-        cdef Trader trader = self._kernel.trader
         self._data_engine: DataEngine = self._kernel.data_engine
 
         # Setup engine logging
-        self._logger = Logger(
-            clock=LiveClock(),
-            trader_id=self.kernel.trader_id,
-            machine_id=self.kernel.machine_id,
-            instance_id=self.kernel.instance_id,
-            bypass=config.bypass_logging,
-        )
-
         self._log = LoggerAdapter(
             component_name=type(self).__name__,
-            logger=self._logger,
+            logger=self._kernel.logger,
         )
+
+    def __del__(self) -> None:
+        if self._accumulator._0 != NULL:
+            time_event_accumulator_drop(self._accumulator)
 
     @property
     def trader_id(self) -> TraderId:
@@ -368,6 +355,7 @@ cdef class BacktestEngine:
         book_type: BookType = BookType.L1_TBBO,
         routing: bool = False,
         frozen_account: bool = False,
+        bar_execution: bool = True,
         reject_stop_orders: bool = True,
         support_gtd_orders: bool = True,
     ) -> None:
@@ -403,6 +391,8 @@ cdef class BacktestEngine:
             If multi-venue routing should be enabled for the execution client.
         frozen_account : bool, default False
             If the account for this exchange is frozen (balances will not change).
+        bar_execution : bool, default True
+            If bars should be processed by the matching engine(s) (and move the market).
         reject_stop_orders : bool, default True
             If stop orders are rejected on submission if trigger price is in the market.
         support_gtd_orders : bool, default True
@@ -449,6 +439,7 @@ cdef class BacktestEngine:
             clock=self.kernel.clock,
             logger=self.kernel.logger,
             frozen_account=frozen_account,
+            bar_execution=bar_execution,
             reject_stop_orders=reject_stop_orders,
             support_gtd_orders=support_gtd_orders,
         )
@@ -518,8 +509,18 @@ cdef class BacktestEngine:
                 f"Add the {instrument.id.venue} venue using the `add_venue` method."
             )
 
-        # TODO(cs): validate the instrument is correct for the venue
-        account_type: AccountType = self._venues[instrument.id.venue].account_type
+        # Validate instrument is correct for the venue
+        cdef SimulatedExchange venue = self._venues[instrument.id.venue]
+
+        if (
+            isinstance(instrument, CurrencyPair)
+            and venue.account_type == AccountType.CASH
+            and venue.base_currency is not None  # Single-currency account
+        ):
+            raise InvalidConfiguration(
+                f"Cannot add `CurrencyPair` instrument {instrument} "
+                "for a venue with a single-currency CASH account.",
+            )
 
         # Check client has been registered
         self._add_market_data_client_if_not_exists(instrument.id.venue)
@@ -689,6 +690,32 @@ cdef class BacktestEngine:
         # Checked inside trader
         self.kernel.trader.add_strategies(strategies)
 
+    def add_exec_algorithm(self, exec_algorithm: ExecAlgorithm) -> None:
+        """
+        Add the given execution algorithm to the backtest engine.
+
+        Parameters
+        ----------
+        exec_algorithm : ExecAlgorithm
+            The execution algorithm to add.
+
+        """
+        # Checked inside trader
+        self.kernel.trader.add_exec_algorithm(exec_algorithm)
+
+    def add_exec_algorithms(self, exec_algorithms: list[ExecAlgorithm]) -> None:
+        """
+        Add the given list of execution algorithms to the backtest engine.
+
+        Parameters
+        ----------
+        exec_algorithms : list[ExecAlgorithm]
+            The execution algorithms to add.
+
+        """
+        # Checked inside trader
+        self.kernel.trader.add_exec_algorithms(exec_algorithms)
+
     def reset(self) -> None:
         """
         Reset the backtest engine.
@@ -836,6 +863,7 @@ cdef class BacktestEngine:
 
         self._run_finished = self._clock.utc_now()
         self._backtest_end = self.kernel.clock.utc_now()
+        self._kernel.logger.change_clock(self._clock)
 
         self._log_post_run()
 
@@ -901,7 +929,7 @@ cdef class BacktestEngine:
         # Gather clocks
         cdef list clocks = [self.kernel.clock]
         cdef Actor actor
-        for actor in self._kernel.trader.actors() + self._kernel.trader.strategies():
+        for actor in self._kernel.trader.actors() + self._kernel.trader.strategies() + self._kernel.trader.exec_algorithms():
             clocks.append(actor.clock)
 
         # Set clocks
@@ -940,17 +968,18 @@ cdef class BacktestEngine:
                 break
 
         # -- MAIN BACKTEST LOOP -----------------------------------------------#
-        cdef TimeEventHandler event_handler
         cdef uint64_t last_ns = 0
-        cdef list now_events = []
+        cdef uint64_t raw_handlers_count = 0
         cdef Data data = self._next()
+        cdef CVec raw_handlers
         while data is not None:
             if data.ts_init > end_ns:
                 # End of backtest
                 break
             if data.ts_init > last_ns:
                 # Advance clocks to the next data time
-                now_events = self._advance_time(data.ts_init, clocks)
+                raw_handlers = self._advance_time(data.ts_init, clocks)
+                raw_handlers_count = raw_handlers.len
 
             # Process data through venue
             if isinstance(data, OrderBookData):
@@ -975,11 +1004,17 @@ cdef class BacktestEngine:
             last_ns = data.ts_init
             data = self._next()
             if data is None or data.ts_init > last_ns:
-                # Finally process the past time events
-                for event_handler in now_events:
-                    event_handler.handle()
-                # Clear processed events
-                now_events = []
+                # Finally process the time events
+                self._process_raw_time_event_handlers(
+                    raw_handlers,
+                    clocks,
+                    last_ns,
+                    only_now=True,
+                )
+
+                # Drop processed event handlers
+                vec_time_event_handlers_drop(raw_handlers)
+                raw_handlers_count = 0
 
             self._iteration += 1
         # ---------------------------------------------------------------------#
@@ -989,8 +1024,14 @@ cdef class BacktestEngine:
             exchange.process(self.kernel.clock.timestamp_ns())
 
         # Process remaining time events
-        for event_handler in now_events:
-            event_handler.handle()
+        if raw_handlers_count > 0:
+            self._process_raw_time_event_handlers(
+                raw_handlers,
+                clocks,
+                last_ns,
+                only_now=True,
+            )
+            vec_time_event_handlers_drop(raw_handlers)
 
     cdef Data _next(self):
         cdef uint64_t cursor = self._index
@@ -998,38 +1039,68 @@ cdef class BacktestEngine:
         if cursor < self._data_len:
             return self._data[cursor]
 
-    cdef list _advance_time(self, uint64_t now_ns, list clocks):
-        cdef list all_events = []  # type: list[TimeEventHandler]
-        cdef list now_events = []  # type: list[TimeEventHandler]
+    cdef CVec _advance_time(self, uint64_t ts_now, list clocks):
+        cdef TestClock clock
+        for clock in clocks:
+            time_event_accumulator_advance_clock(
+                &self._accumulator,
+                &clock._mem,
+                ts_now,
+                False,
+            )
 
-        cdef Actor actor
-        for actor in self._kernel.trader.actors():
-            all_events += actor.clock.advance_time(now_ns, set_time=False)
+        cdef CVec raw_handlers = time_event_accumulator_drain(&self._accumulator)
 
-        cdef Strategy strategy
-        for strategy in self._kernel.trader.strategies():
-            all_events += strategy.clock.advance_time(now_ns, set_time=False)
+        # Handle all events prior to the `ts_now`
+        self._process_raw_time_event_handlers(
+            raw_handlers,
+            clocks,
+            ts_now,
+            only_now=False,
+        )
 
-        all_events += self.kernel.clock.advance_time(now_ns, set_time=False)
+        # Set all clocks to now
+        for clock in clocks:
+            clock.set_time(ts_now)
 
-        # Handle all events prior to the `now_ns`
+        # Return all remaining events to be handled (at `ts_now`)
+        return raw_handlers
+
+    cdef void _process_raw_time_event_handlers(
+        self,
+        CVec raw_handler_vec,
+        list clocks,
+        uint64_t ts_now,
+        bint only_now,
+    ):
+        cdef TimeEventHandler_t* raw_handlers = <TimeEventHandler_t*>raw_handler_vec.ptr
         cdef:
-            TimeEventHandler event_handler
+            uint64_t i
+            uint64_t ts_event_init
+            uint64_t ts_last_init = 0
+            TimeEventHandler_t raw_handler
+            TimeEvent event
             TestClock clock
-        for event_handler in sorted(all_events):
-            if event_handler.event.ts_init == now_ns:
-                now_events.append(event_handler)
+            object callback
+            SimulatedExchange exchange
+        for i in range(raw_handler_vec.len):
+            raw_handler = <TimeEventHandler_t>raw_handlers[i]
+            ts_event_init = raw_handler.event.ts_init
+            if (only_now and ts_event_init < ts_now) or (not only_now and ts_event_init == ts_now):
                 continue
             for clock in clocks:
-                clock.set_time(event_handler.event.ts_init)
-            event_handler.handle()
+                clock.set_time(ts_event_init)
+            event = TimeEvent.from_mem_c(raw_handler.event)
 
-        # Set all clocks
-        for clock in clocks:
-            clock.set_time(now_ns)
+            # Cast raw `PyObject *` to a `PyObject`
+            callback = <object>raw_handler.callback_ptr
+            callback(event)
 
-        # Return all remaining events to be handled (at `now_ns`)
-        return now_events
+            if ts_event_init != ts_last_init:
+                # Process exchange messages
+                ts_last_init = ts_event_init
+                for exchange in self._venues.values():
+                    exchange.process(ts_event_init)
 
     def _log_pre_run(self):
         log_memory(self._log)

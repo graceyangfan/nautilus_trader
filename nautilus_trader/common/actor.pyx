@@ -66,7 +66,6 @@ from nautilus_trader.model.enums_c cimport BookType
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ComponentId
 from nautilus_trader.model.identifiers cimport InstrumentId
-from nautilus_trader.model.identifiers cimport TraderId
 from nautilus_trader.model.identifiers cimport Venue
 from nautilus_trader.model.instruments.base cimport Instrument
 from nautilus_trader.model.orderbook.data cimport OrderBookData
@@ -114,6 +113,7 @@ cdef class Actor(Component):
         self._warning_events: set[type] = set()
         self._signal_classes: dict[str, type] = {}
 
+        # Configuration
         self.config = config
 
         self.trader_id = None  # Initialized when registered
@@ -168,7 +168,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_start(self):
         """
@@ -258,7 +258,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_degrade(self):
         """
@@ -271,7 +271,7 @@ cdef class Actor(Component):
         Should be overridden in the actor implementation.
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_fault(self):
         """
@@ -286,7 +286,7 @@ cdef class Actor(Component):
         Should be overridden in the actor implementation.
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_venue_status_update(self, VenueStatusUpdate update):
         """
@@ -302,7 +302,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_instrument_status_update(self, InstrumentStatusUpdate update):
         """
@@ -319,7 +319,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_instrument_close(self, InstrumentClose update):
         """
@@ -336,7 +336,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_instrument(self, Instrument instrument):
         """
@@ -352,7 +352,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_order_book(self, OrderBook order_book):
         """
@@ -368,7 +368,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_order_book_delta(self, OrderBookData delta):
         """
@@ -384,7 +384,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_ticker(self, Ticker ticker):
         """
@@ -400,7 +400,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_quote_tick(self, QuoteTick tick):
         """
@@ -416,7 +416,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_trade_tick(self, TradeTick tick):
         """
@@ -432,7 +432,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_bar(self, Bar bar):
         """
@@ -448,7 +448,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_data(self, Data data):
         """
@@ -464,7 +464,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_historical_data(self, Data data):
         """
@@ -480,7 +480,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
     cpdef void on_event(self, Event event):
         """
@@ -496,7 +496,7 @@ cdef class Actor(Component):
         System method (not intended to be called by user code).
 
         """
-        pass  # Optionally override in subclass
+        # Optionally override in subclass
 
 # -- REGISTRATION ---------------------------------------------------------------------------------
 
@@ -540,8 +540,6 @@ cdef class Actor(Component):
         self.cache = cache
         self.clock = self._clock
         self.log = self._log
-
-        self.log.info(f"Registered {self.id}.")
 
     cpdef void register_warning_event(self, type event):
         """
@@ -1553,7 +1551,7 @@ cdef class Actor(Component):
 
 # -- REQUESTS -------------------------------------------------------------------------------------
 
-    cpdef void request_data(self, ClientId client_id, DataType data_type):
+    cpdef void request_data(self, ClientId client_id, DataType data_type, UUID4 request_id = None):
         """
         Request custom data for the given data type from the given data client.
 
@@ -1563,6 +1561,9 @@ cdef class Actor(Component):
             The data client ID.
         data_type : DataType
             The data type for the request.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         """
         Condition.not_none(client_id, "client_id")
@@ -1574,13 +1575,13 @@ cdef class Actor(Component):
             venue=None,
             data_type=data_type,
             callback=self._handle_data_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
         self._send_data_req(request)
 
-    cpdef void request_instrument(self, InstrumentId instrument_id, ClientId client_id = None):
+    cpdef void request_instrument(self, InstrumentId instrument_id, ClientId client_id = None, UUID4 request_id = None):
         """
         Request `Instrument` data for the given instrument ID.
 
@@ -1591,6 +1592,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         """
         Condition.not_none(instrument_id, "instrument_id")
@@ -1602,13 +1606,13 @@ cdef class Actor(Component):
                 "instrument_id": instrument_id,
             }),
             callback=self._handle_instrument_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
         self._send_data_req(request)
 
-    cpdef void request_instruments(self, Venue venue, ClientId client_id = None):
+    cpdef void request_instruments(self, Venue venue, ClientId client_id = None, UUID4 request_id = None):
         """
         Request all `Instrument` data for the given venue.
 
@@ -1619,6 +1623,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         """
         Condition.not_none(venue, "venue")
@@ -1630,7 +1637,7 @@ cdef class Actor(Component):
                 "venue": venue,
             }),
             callback=self._handle_instruments_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
@@ -1642,6 +1649,7 @@ cdef class Actor(Component):
         datetime start = None,
         datetime end = None,
         ClientId client_id = None,
+        UUID4 request_id = None,
     ):
         """
         Request historical `QuoteTick` data.
@@ -1660,6 +1668,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         Raises
         ------
@@ -1681,7 +1692,7 @@ cdef class Actor(Component):
                 "end": end,
             }),
             callback=self._handle_quote_ticks_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
@@ -1693,6 +1704,7 @@ cdef class Actor(Component):
         datetime start = None,
         datetime end = None,
         ClientId client_id = None,
+        UUID4 request_id = None,
     ):
         """
         Request historical `TradeTick` data.
@@ -1711,6 +1723,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         Raises
         ------
@@ -1732,7 +1747,7 @@ cdef class Actor(Component):
                 "end": end,
             }),
             callback=self._handle_trade_ticks_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
@@ -1744,6 +1759,7 @@ cdef class Actor(Component):
         datetime start = None,
         datetime end = None,
         ClientId client_id = None,
+        UUID4 request_id = None,
     ):
         """
         Request historical `Bar` data.
@@ -1762,6 +1778,9 @@ cdef class Actor(Component):
         client_id : ClientId, optional
             The specific client ID for the command.
             If ``None`` then will be inferred from the venue in the instrument ID.
+        request_id : UUID4, optional
+            The specific request ID for the command.
+            If ``None`` then will be generated.
 
         Raises
         ------
@@ -1783,7 +1802,7 @@ cdef class Actor(Component):
                 "end": end,
             }),
             callback=self._handle_bars_response,
-            request_id=UUID4(),
+            request_id=request_id or UUID4(),
             ts_init=self._clock.timestamp_ns(),
         )
 
@@ -2245,7 +2264,12 @@ cdef class Actor(Component):
                 raise
 
     cpdef void _handle_data_response(self, DataResponse response):
-        self.handle_data(response.data)
+        cdef Data data
+        if isinstance(response.data, list):
+            for data in response.data:
+                self.handle_historical_data(data)
+        else:
+            self.handle_historical_data(response.data)
 
     cpdef void _handle_instrument_response(self, DataResponse response):
         self.handle_instrument(response.data)

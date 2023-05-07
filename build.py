@@ -8,6 +8,7 @@ import subprocess
 import sysconfig
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from Cython.Build import build_ext
@@ -48,15 +49,14 @@ if platform.system() != "Darwin":
     os.environ["CC"] = "clang"
     os.environ["LDSHARED"] = "clang -shared"
 
-TARGET_DIR = os.path.join(os.getcwd(), "nautilus_core", "target", BUILD_MODE)
+TARGET_DIR = Path.cwd() / "nautilus_core" / "target" / BUILD_MODE
 
 if platform.system() == "Windows":
+    # Linker error 1181
     # https://docs.microsoft.com/en-US/cpp/error-messages/tool-errors/linker-tools-error-lnk1181?view=msvc-170&viewFallbackFrom=vs-2019
-    os.environ["LIBPATH"] = os.environ.get("LIBPATH", "") + f":{TARGET_DIR}"
     RUST_LIB_PFX = ""
     RUST_STATIC_LIB_EXT = "lib"
     RUST_DYLIB_EXT = "dll"
-    TARGET_DIR = TARGET_DIR.replace(BUILD_MODE, "x86_64-pc-windows-msvc/" + BUILD_MODE)
 elif platform.system() == "Darwin":
     RUST_LIB_PFX = "lib"
     RUST_STATIC_LIB_EXT = "a"
@@ -68,27 +68,35 @@ else:  # Linux
 
 # Directories with headers to include
 RUST_INCLUDES = ["nautilus_trader/core/includes"]
-RUST_LIBS = [
-    f"{TARGET_DIR}/{RUST_LIB_PFX}nautilus_common.{RUST_STATIC_LIB_EXT}",
-    f"{TARGET_DIR}/{RUST_LIB_PFX}nautilus_core.{RUST_STATIC_LIB_EXT}",
-    f"{TARGET_DIR}/{RUST_LIB_PFX}nautilus_model.{RUST_STATIC_LIB_EXT}",
-    f"{TARGET_DIR}/{RUST_LIB_PFX}nautilus_persistence.{RUST_STATIC_LIB_EXT}",
+RUST_LIB_PATHS: list[Path] = [
+    TARGET_DIR / f"{RUST_LIB_PFX}nautilus_backtest.{RUST_STATIC_LIB_EXT}",
+    TARGET_DIR / f"{RUST_LIB_PFX}nautilus_common.{RUST_STATIC_LIB_EXT}",
+    TARGET_DIR / f"{RUST_LIB_PFX}nautilus_core.{RUST_STATIC_LIB_EXT}",
+    TARGET_DIR / f"{RUST_LIB_PFX}nautilus_model.{RUST_STATIC_LIB_EXT}",
+    TARGET_DIR / f"{RUST_LIB_PFX}nautilus_persistence.{RUST_STATIC_LIB_EXT}",
 ]
+RUST_LIBS: list[str] = [str(path) for path in RUST_LIB_PATHS]
 
 
 def _build_rust_libs() -> None:
     try:
         # Build the Rust libraries using Cargo
-        build_options = ""
-        extra_flags = ""
-        if platform.system() == "Windows":
-            extra_flags = " --target x86_64-pc-windows-msvc"
-
-        build_options += " --release" if BUILD_MODE == "release" else ""
+        build_options = " --release" if BUILD_MODE == "release" else ""
         print("Compiling Rust libraries...")
-        build_cmd = f"(cd nautilus_core && cargo build{build_options}{extra_flags} --all-features)"
-        print(build_cmd)
-        os.system(build_cmd)  # noqa
+
+        cmd_args = [
+            "cargo",
+            "build",
+            *build_options.split(),
+            "--all-features",
+        ]
+        print(" ".join(cmd_args))
+
+        subprocess.run(
+            cmd_args,  # noqa
+            cwd="nautilus_core",
+            check=True,
+        )
     except subprocess.CalledProcessError as e:
         raise RuntimeError(
             f"Error running cargo: {e.stderr.decode()}",
@@ -125,7 +133,9 @@ def _build_extensions() -> list[Extension]:
     # disable it with " "#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION"
     # https://stackoverflow.com/questions/52749662/using-deprecated-numpy-api
     # From the Cython docs: "For the time being, it is just a warning that you can ignore."
-    define_macros = [("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")]
+    define_macros: list[tuple[str, Optional[str]]] = [
+        ("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION"),
+    ]
     if PROFILE_MODE or ANNOTATION_MODE:
         # Profiling requires special macro directives
         define_macros.append(("CYTHON_TRACE", "1"))
@@ -135,6 +145,9 @@ def _build_extensions() -> list[Extension]:
 
     if platform.system() == "Darwin":
         extra_compile_args.append("-Wno-unreachable-code-fallthrough")
+        extra_link_args.append("-flat_namespace")
+        extra_link_args.append("-undefined")
+        extra_link_args.append("suppress")
 
     if platform.system() != "Windows":
         # Suppress warnings produced by Cython boilerplate
@@ -159,7 +172,7 @@ def _build_extensions() -> list[Extension]:
         Extension(
             name=str(pyx.relative_to(".")).replace(os.path.sep, ".")[:-4],
             sources=[str(pyx)],
-            include_dirs=[np.get_include()] + RUST_INCLUDES,
+            include_dirs=[np.get_include(), *RUST_INCLUDES],
             define_macros=define_macros,
             language="c",
             extra_link_args=extra_link_args,
@@ -194,15 +207,15 @@ def _build_distribution(extensions: list[Extension]) -> Distribution:
 def _copy_build_dir_to_project(cmd: build_ext) -> None:
     # Copy built extensions back to the project tree
     for output in cmd.get_outputs():
-        relative_extension = os.path.relpath(output, cmd.build_lib)
-        if not os.path.exists(output):
+        relative_extension = Path(output).relative_to(cmd.build_lib)
+        if not Path(output).exists():
             continue
 
         # Copy the file and set permissions
         shutil.copyfile(output, relative_extension)
-        mode = os.stat(relative_extension).st_mode
+        mode = relative_extension.stat().st_mode
         mode |= (mode & 0o444) >> 2
-        os.chmod(relative_extension, mode)
+        relative_extension.chmod(mode)
 
     print("Copied all compiled dynamic library files into source")
 
@@ -210,8 +223,8 @@ def _copy_build_dir_to_project(cmd: build_ext) -> None:
 def _copy_rust_dylibs_to_project() -> None:
     # https://pyo3.rs/latest/building_and_distribution#manual-builds
     ext_suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    src = f"{TARGET_DIR}/{RUST_LIB_PFX}nautilus_pyo3.{RUST_DYLIB_EXT}"
-    dst = f"nautilus_trader/core/nautilus_pyo3{ext_suffix}"
+    src = Path(TARGET_DIR) / f"{RUST_LIB_PFX}nautilus_pyo3.{RUST_DYLIB_EXT}"
+    dst = Path("nautilus_trader/core") / f"nautilus_pyo3{ext_suffix}"
     shutil.copyfile(src=src, dst=dst)
 
     print(f"Copied {src} to {dst}")
@@ -220,9 +233,8 @@ def _copy_rust_dylibs_to_project() -> None:
 def _get_clang_version() -> str:
     try:
         result = subprocess.run(
-            "clang --version",
+            ["clang", "--version"],  # noqa
             check=True,
-            shell=True,
             capture_output=True,
         )
         output = (
@@ -243,9 +255,8 @@ def _get_clang_version() -> str:
 def _get_rustc_version() -> str:
     try:
         result = subprocess.run(
-            "rustc --version",
+            ["rustc", "--version"],  # noqa
             check=True,
-            shell=True,
             capture_output=True,
         )
         output = result.stdout.decode().lstrip("rustc ")[:-1]
@@ -258,8 +269,28 @@ def _get_rustc_version() -> str:
         ) from e
 
 
+def _strip_unneeded_symbols() -> None:
+    try:
+        print("Stripping unneeded symbols from binaries...")
+        for so in itertools.chain(Path("nautilus_trader").rglob("*.so")):
+            if platform.system() == "Linux":
+                strip_cmd = f"strip --strip-unneeded {so}"
+            elif platform.system() == "Darwin":
+                strip_cmd = f"strip -x {so}"
+            else:
+                raise RuntimeError(f"Cannot strip symbols for platform {platform.system()}")
+            subprocess.run(
+                strip_cmd,  # noqa
+                check=True,
+                shell=True,  # noqa
+                capture_output=True,
+            )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Error when stripping symbols.\n{e.stderr.decode()}") from e
+
+
 def build() -> None:
-    """Construct the extensions and distribution."""  # noqa
+    """Construct the extensions and distribution."""
     _build_rust_libs()
     _copy_rust_dylibs_to_project()
 
@@ -279,6 +310,9 @@ def build() -> None:
         if COPY_TO_SOURCE:
             # Copy the build back into the source tree for development and wheel packaging
             _copy_build_dir_to_project(cmd)
+
+    if platform.system() in ("Linux", "Darwin"):
+        _strip_unneeded_symbols()
 
 
 if __name__ == "__main__":

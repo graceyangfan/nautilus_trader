@@ -21,23 +21,26 @@
 .idea/
 .ipynb_checkpoints
 .mypy_cache/
-.nox/
 .profile/
 .pytest_cache/
 .python-version
+.ruff_cache/
 .vscode/
 
 __pycache__
 _build/
 build/
+data_catalog/
 dist/
 env/
 log/
 logs/
+*temp/
 *target/
 venv*/
 
 .DS_Store
+.null-ls*
 PERF.JSON
 output.json
 *dask-worker-space*

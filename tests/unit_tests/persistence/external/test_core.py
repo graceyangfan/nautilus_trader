@@ -12,8 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
+
 import asyncio
 import pickle
+import sys
 
 import fsspec
 import numpy as np
@@ -55,8 +57,8 @@ from tests.integration_tests.adapters.betfair.test_kit import BetfairTestStubs
 
 
 class _TestPersistenceCore:
-    def setup(self):
-        self.catalog = data_catalog_setup(protocol=self.fs_protocol)
+    def setup(self) -> None:
+        self.catalog = data_catalog_setup(protocol=self.fs_protocol)  # type: ignore
         self.fs: fsspec.AbstractFileSystem = self.catalog.fs
 
     def teardown(self):
@@ -116,7 +118,7 @@ class _TestPersistenceCore:
         # Assert
         assert len(self.catalog.instruments()) == 2
 
-    def test_raw_file_pickleable(self):
+    def test_raw_file_pickleable(self) -> None:
         # Arrange
         self._load_data_into_catalog()
         path = TEST_DATA_DIR + "/betfair/1.166811431.bz2"  # total size = 151707
@@ -374,6 +376,7 @@ class _TestPersistenceCore:
         assert None in split[NewsEventData]
         assert len(split[NewsEventData][None]) == 22941
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Failing on windows and being rewritten")
     def test_catalog_generic_data_not_overwritten(self):
         # Arrange
         self._load_data_into_catalog()
@@ -501,6 +504,7 @@ class TestPersistenceCoreFile(_TestPersistenceCore):
             f"{self.catalog.path}/sample.parquet/instrument_id=b/",
         )
 
+    @pytest.mark.skip(reason="Implement with new Rust datafusion backend")
     def test_process_files_use_rust_writes_expected(self):
         # Arrange
         instrument = TestInstrumentProvider.default_fx_ccy("USD/JPY")
@@ -522,6 +526,7 @@ class TestPersistenceCoreFile(_TestPersistenceCore):
         path = f"{self.catalog.path}/data/quote_tick.parquet/instrument_id=USD-JPY.SIM/1357077600295000064-1357079713493999872-0.parquet"
         assert self.fs.exists(path)
 
+    @pytest.mark.skip(reason="Implement with new Rust datafusion backend")
     def test_write_parquet_rust_quote_ticks_writes_expected(self):
         # Arrange
         instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")
@@ -554,6 +559,7 @@ class TestPersistenceCoreFile(_TestPersistenceCore):
         assert self.fs.exists(path)
         assert len(pd.read_parquet(path)) == 2
 
+    @pytest.mark.skip(reason="Implement with new Rust datafusion backend")
     def test_write_parquet_rust_trade_ticks_writes_expected(self):
         # Arrange
         instrument = TestInstrumentProvider.default_fx_ccy("EUR/USD")

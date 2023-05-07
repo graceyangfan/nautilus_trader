@@ -14,23 +14,19 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+import signal
 import time
 from datetime import timedelta
 from typing import Optional
 
 from nautilus_trader.cache.base import CacheFacade
-from nautilus_trader.common import Environment
 from nautilus_trader.common.enums import LogColor
-from nautilus_trader.common.enums import log_level_from_str
 from nautilus_trader.common.logging import Logger
-from nautilus_trader.config import CacheConfig
-from nautilus_trader.config import CacheDatabaseConfig
-from nautilus_trader.config import LiveDataEngineConfig
-from nautilus_trader.config import LiveExecEngineConfig
-from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.live.factories import LiveDataClientFactory
+from nautilus_trader.live.factories import LiveExecClientFactory
 from nautilus_trader.live.node_builder import TradingNodeBuilder
 from nautilus_trader.model.identifiers import TraderId
 from nautilus_trader.portfolio.base import PortfolioFacade
@@ -48,41 +44,24 @@ class TradingNode:
         The configuration for the instance.
     """
 
-    def __init__(self, config: Optional[TradingNodeConfig] = None):
+    def __init__(self, config: Optional[TradingNodeConfig] = None) -> None:
         if config is None:
             config = TradingNodeConfig()
         PyCondition.not_none(config, "config")
         PyCondition.type(config, TradingNodeConfig, "config")
 
         # Configuration
-        self._config = config
+        self._config: TradingNodeConfig = config
 
         # Setup loop
         loop = asyncio.get_event_loop()
 
         # Build core system kernel
         self.kernel = NautilusKernel(
-            environment=Environment.LIVE,
             name=type(self).__name__,
-            trader_id=TraderId(config.trader_id),
-            instance_id=config.instance_id,
-            cache_config=config.cache or CacheConfig(),
-            cache_database_config=config.cache_database or CacheDatabaseConfig(),
-            data_config=config.data_engine or LiveDataEngineConfig(),
-            risk_config=config.risk_engine or LiveRiskEngineConfig(),
-            exec_config=config.exec_engine or LiveExecEngineConfig(),
-            streaming_config=config.streaming,
-            actor_configs=config.actors,
-            strategy_configs=config.strategies,
+            config=config,
             loop=loop,
-            loop_debug=config.loop_debug,
-            load_state=config.load_state,
-            save_state=config.save_state,
             loop_sig_callback=self._loop_sig_handler,
-            log_level=log_level_from_str(config.log_level.upper()),
-            log_level_file=log_level_from_str(config.log_level_file.upper()),
-            log_file_path=config.log_file_path,
-            log_rate_limit=config.log_rate_limit,
         )
 
         self._builder = TradingNodeBuilder(
@@ -218,7 +197,7 @@ class TradingNode:
         """
         return self.kernel.logger
 
-    def add_data_client_factory(self, name: str, factory):
+    def add_data_client_factory(self, name: str, factory: type[LiveDataClientFactory]) -> None:
         """
         Add the given data client factory to the node.
 
@@ -226,8 +205,8 @@ class TradingNode:
         ----------
         name : str
             The name of the client factory.
-        factory : LiveDataClientFactory or LiveExecutionClientFactory
-            The factory to add.
+        factory : type[LiveDataClientFactory]
+            The factory class to add.
 
         Raises
         ------
@@ -239,7 +218,7 @@ class TradingNode:
         """
         self._builder.add_data_client_factory(name, factory)
 
-    def add_exec_client_factory(self, name: str, factory):
+    def add_exec_client_factory(self, name: str, factory: type[LiveExecClientFactory]) -> None:
         """
         Add the given execution client factory to the node.
 
@@ -247,8 +226,8 @@ class TradingNode:
         ----------
         name : str
             The name of the client factory.
-        factory : LiveDataClientFactory or LiveExecutionClientFactory
-            The factory to add.
+        factory : type[LiveExecutionClientFactory]
+            The factory class to add.
 
         Raises
         ------
@@ -323,14 +302,14 @@ class TradingNode:
 
             self.kernel.log.info("DISPOSING...")
 
-            self.kernel.log.debug(f"{self.kernel.data_engine.get_cmd_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.data_engine.get_req_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.data_engine.get_res_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.data_engine.get_data_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.exec_engine.get_cmd_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.exec_engine.get_evt_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.risk_engine.get_cmd_queue_task()}")
-            self.kernel.log.debug(f"{self.kernel.risk_engine.get_evt_queue_task()}")
+            self.kernel.log.debug(str(self.kernel.data_engine.get_cmd_queue_task()))
+            self.kernel.log.debug(str(self.kernel.data_engine.get_req_queue_task()))
+            self.kernel.log.debug(str(self.kernel.data_engine.get_res_queue_task()))
+            self.kernel.log.debug(str(self.kernel.data_engine.get_data_queue_task()))
+            self.kernel.log.debug(str(self.kernel.exec_engine.get_cmd_queue_task()))
+            self.kernel.log.debug(str(self.kernel.exec_engine.get_evt_queue_task()))
+            self.kernel.log.debug(str(self.kernel.risk_engine.get_cmd_queue_task()))
+            self.kernel.log.debug(str(self.kernel.risk_engine.get_evt_queue_task()))
 
             if self.kernel.trader.is_running:
                 self.kernel.trader.stop()
@@ -383,7 +362,7 @@ class TradingNode:
 
             self.kernel.log.info("DISPOSED.")
 
-    def _loop_sig_handler(self, sig) -> None:
+    def _loop_sig_handler(self, sig: signal.Signals) -> None:
         self.kernel.log.warning(f"Received {sig!s}, shutting down...")
         self.stop()
 

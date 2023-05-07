@@ -17,14 +17,19 @@
 
 use std::rc::Rc;
 
+use nautilus_core::time::UnixNanos;
+use nautilus_core::uuid::UUID4;
+use rust_fsm::*;
+use thiserror::Error;
+
 use crate::enums::{
     ContingencyType, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide, TimeInForce,
     TriggerType,
 };
 use crate::events::order::{
-    OrderAccepted, OrderCancelRejected, OrderDenied, OrderEvent, OrderInitialized, OrderMetadata,
-    OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderSubmitted,
-    OrderUpdated,
+    OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEvent, OrderExpired,
+    OrderFilled, OrderIdentifiers, OrderInitialized, OrderModifyRejected, OrderPendingCancel,
+    OrderPendingUpdate, OrderRejected, OrderSubmitted, OrderTriggered, OrderUpdated,
 };
 use crate::identifiers::account_id::AccountId;
 use crate::identifiers::client_order_id::ClientOrderId;
@@ -35,10 +40,8 @@ use crate::identifiers::venue_order_id::VenueOrderId;
 use crate::types::fixed::fixed_i64_to_f64;
 use crate::types::price::Price;
 use crate::types::quantity::Quantity;
-use nautilus_core::time::UnixNanos;
-use nautilus_core::uuid::UUID4;
-use rust_fsm::*;
-use thiserror::Error;
+
+pub mod limit;
 
 #[derive(Error, Debug)]
 pub enum OrderError {
@@ -188,7 +191,7 @@ struct Order {
     previous_status: Option<OrderStatus>,
     triggered_price: Option<Price>,
     pub status: OrderStatus,
-    pub metadata: Rc<OrderMetadata>,
+    pub ids: Rc<OrderIdentifiers>,
     pub venue_order_id: Option<VenueOrderId>,
     pub position_id: Option<PositionId>,
     pub account_id: Option<AccountId>,
@@ -227,7 +230,7 @@ struct Order {
 impl PartialEq<Self> for Order {
     fn eq(&self, other: &Self) -> bool {
         // TODO: can implement deref and deref mut for order metadata here too
-        self.metadata.client_order_id == other.metadata.client_order_id
+        self.ids.client_order_id == other.ids.client_order_id
     }
 }
 
@@ -243,7 +246,7 @@ impl From<OrderInitialized> for Order {
             previous_status: None,
             triggered_price: None,
             status: OrderStatus::Initialized,
-            metadata: value.metadata,
+            ids: value.ids,
             venue_order_id: None,
             position_id: None,
             account_id: None,
@@ -270,7 +273,7 @@ impl From<OrderInitialized> for Order {
             parent_order_id: value.parent_order_id,
             tags: value.tags,
             filled_qty: Quantity::new(0.0, 0),
-            leaves_qty: value.quantity,
+            leaves_qty: value.quantity.clone(),
             avg_px: None,
             slippage: None,
             init_id: value.event_id,
@@ -284,7 +287,7 @@ impl From<OrderInitialized> for Order {
 impl From<&Order> for OrderInitialized {
     fn from(value: &Order) -> Self {
         Self {
-            metadata: value.metadata.clone(),
+            ids: value.ids.clone(),
             order_side: value.side,
             order_type: value.order_type,
             quantity: value.quantity.clone(),
@@ -453,7 +456,13 @@ impl Order {
             OrderEvent::OrderRejected(event) => self.rejected(event),
             OrderEvent::OrderAccepted(event) => self.accepted(event),
             OrderEvent::OrderPendingUpdate(event) => self.pending_update(event),
+            OrderEvent::OrderPendingCancel(event) => self.pending_cancel(event),
+            OrderEvent::OrderModifyRejected(event) => self.modify_rejected(event),
+            OrderEvent::OrderCancelRejected(event) => self.cancel_rejected(event),
             OrderEvent::OrderUpdated(event) => self.updated(event),
+            OrderEvent::OrderTriggered(event) => self.triggered(event),
+            OrderEvent::OrderCanceled(event) => self.canceled(event),
+            OrderEvent::OrderExpired(event) => self.expired(event),
             _ => return Err(OrderError::UnrecognizedEvent),
         }
 
@@ -493,6 +502,12 @@ impl Order {
         self.status = self.previous_status.unwrap();
     }
 
+    fn triggered(&mut self, _event: &OrderTriggered) {}
+
+    fn canceled(&mut self, _event: &OrderCanceled) {}
+
+    fn expired(&mut self, _event: &OrderExpired) {}
+
     fn updated(&mut self, event: &OrderUpdated) {
         match &event.venue_order_id {
             Some(venue_order_id) => {
@@ -526,6 +541,32 @@ impl Order {
             self.quantity.raw - self.filled_qty.raw,
             self.quantity.precision,
         );
+    }
+
+    fn filled(&mut self, event: &OrderFilled) {
+        self.venue_order_id = Some(event.venue_order_id.clone());
+        self.position_id = event.position_id.clone();
+        self.trade_ids.push(event.trade_id.clone());
+        self.last_trade_id = Some(event.trade_id.clone());
+        self.liquidity_side = Some(event.liquidity_side);
+        self.filled_qty += &event.last_qty;
+        self.leaves_qty -= &event.last_qty;
+        self.ts_last = event.ts_event;
+        self.set_avg_px(&event.last_qty, &event.last_px);
+        self.set_slippage();
+    }
+
+    fn set_avg_px(&mut self, last_qty: &Quantity, last_px: &Price) {
+        if self.avg_px.is_none() {
+            self.avg_px = Some(last_px.as_f64());
+        }
+
+        let filled_qty = self.filled_qty.as_f64();
+        let total_qty = filled_qty + last_qty.as_f64();
+
+        let avg_px = ((self.avg_px.unwrap() * filled_qty) + (last_px.as_f64() * last_qty.as_f64()))
+            / total_qty;
+        self.avg_px = Some(avg_px);
     }
 
     fn set_slippage(&mut self) {
@@ -648,5 +689,49 @@ mod tests {
         assert!(!order.is_open());
         assert_eq!(order.event_count(), 1);
         assert_eq!(order.last_event(), Some(&event));
+    }
+
+    #[test]
+    fn test_buy_order_life_cyle_to_filled() {
+        // TODO: We should be able to derive defaults for the below?
+        let init = OrderInitializedBuilder::default().build().unwrap();
+        let submitted = OrderSubmittedBuilder::default()
+            .ids(init.ids.clone())
+            .account_id(AccountId::default())
+            .event_id(UUID4::default())
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .build()
+            .unwrap();
+        let accepted = OrderAcceptedBuilder::default()
+            .ids(init.ids.clone())
+            .account_id(AccountId::default())
+            .venue_order_id(VenueOrderId::default())
+            .event_id(UUID4::default())
+            .ts_event(UnixNanos::default())
+            .ts_init(UnixNanos::default())
+            .reconciliation(false)
+            .build()
+            .unwrap();
+        // let filled = OrderFilledBuilder::default()
+        //     .ids(init.ids.clone())
+        //     .account_id(AccountId::default())
+        //     .venue_order_id(VenueOrderId::default())
+        //     .position_id(None)
+        //     .trade_id(TradeId::new("001"))
+        //     .event_id(UUID4::default())
+        //     .ts_event(UnixNanos::default())
+        //     .ts_init(UnixNanos::default())
+        //     .reconciliation(false)
+        //     .build()
+        //     .unwrap();
+
+        let client_order_id = init.client_order_id.clone();
+        let mut order: Order = init.into();
+        let _ = order.apply(OrderEvent::OrderSubmitted(submitted));
+        let _ = order.apply(OrderEvent::OrderAccepted(accepted));
+        // let _ = order.apply(OrderEvent::OrderFilled(filled));
+
+        assert_eq!(order.ids.client_order_id, client_order_id);
     }
 }

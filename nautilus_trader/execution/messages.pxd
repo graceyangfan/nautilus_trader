@@ -14,10 +14,10 @@
 # -------------------------------------------------------------------------------------------------
 
 from nautilus_trader.core.message cimport Command
-from nautilus_trader.execution.algorithm cimport ExecAlgorithmSpecification
 from nautilus_trader.model.enums_c cimport OrderSide
 from nautilus_trader.model.identifiers cimport ClientId
 from nautilus_trader.model.identifiers cimport ClientOrderId
+from nautilus_trader.model.identifiers cimport ExecAlgorithmId
 from nautilus_trader.model.identifiers cimport InstrumentId
 from nautilus_trader.model.identifiers cimport PositionId
 from nautilus_trader.model.identifiers cimport StrategyId
@@ -43,10 +43,10 @@ cdef class TradingCommand(Command):
 cdef class SubmitOrder(TradingCommand):
     cdef readonly Order order
     """The order to submit.\n\n:returns: `Order`"""
+    cdef readonly ExecAlgorithmId exec_algorithm_id
+    """The execution algorithm ID for the order.\n\n:returns: `ExecAlgorithmId` or ``None``"""
     cdef readonly PositionId position_id
     """The position ID to associate with the order.\n\n:returns: `PositionId` or ``None``"""
-    cdef readonly ExecAlgorithmSpecification exec_algorithm_spec
-    """The execution algorithm specification for the order.\n\n:returns: `ExecAlgorithmSpecification` or ``None``"""
 
     @staticmethod
     cdef SubmitOrder from_dict_c(dict values)
@@ -58,10 +58,10 @@ cdef class SubmitOrder(TradingCommand):
 cdef class SubmitOrderList(TradingCommand):
     cdef readonly OrderList order_list
     """The order list to submit.\n\n:returns: `OrderList`"""
+    cdef readonly ExecAlgorithmId exec_algorithm_id
+    """The execution algorithm ID for the order list.\n\n:returns: `ExecAlgorithmId` or ``None``"""
     cdef readonly PositionId position_id
     """The position ID to associate with the orders.\n\n:returns: `PositionId` or ``None``"""
-    cdef readonly list exec_algorithm_specs
-    """The execution algorithm specifications for the orders.\n\n:returns: `list[ExecAlgorithmSpecification]` or ``None``"""
     cdef readonly bint has_emulated_order
     """If the contained order_list holds at least one emulated order.\n\n:returns: `bool`"""
 
