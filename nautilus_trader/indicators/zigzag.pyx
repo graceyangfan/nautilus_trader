@@ -14,6 +14,9 @@
 # -------------------------------------------------------------------------------------------------
 
 from collections import deque
+import numpy as np
+
+cimport numpy as np
 
 from libc.stdint cimport uint64_t
 
@@ -35,6 +38,7 @@ cdef class Zigzag(Indicator):
         self,
         double change_percent,
         bint full_close,
+        int bins_num = 10,
     ):
         """
         Initialize a new instance of the zigzag class.
@@ -45,11 +49,13 @@ cdef class Zigzag(Indicator):
         params = [
             change_percent,
             full_close,
+            bins_num 
         ]
         super().__init__(params=params)
 
         self.change_percent = change_percent
         self.full_close = full_close
+        self.bins_num = bins_num 
         self.threshold = 0
 
         self.virtual_high = 0
@@ -60,14 +66,14 @@ cdef class Zigzag(Indicator):
         self.zigzags_values = deque(maxlen = 3)
         self.zigzags_Type = deque(maxlen = 3)
         self.zigzags_datetime = deque(maxlen = 3)
+        self.price_array = [] 
+        self.volume_array = [] 
+        self.last_ts_event = 0 
+        self.num_bars = 0 
+        self.poi = 0 
         self.sum_volume  = 0 
         self.sum_value = 0 
         self.anchored_vwap  = 0 
-        self.anchored_bars  = 0 
-        self.last_sum_volume  = 0 
-        self.last_sum_value = 0 
-        self.last_anchored_vwap  = 0 
-        self.last_anchored_bars  = 0 
 
     cpdef void handle_bar(self, Bar bar) except *:
         """
@@ -126,11 +132,11 @@ cdef class Zigzag(Indicator):
 
         """
 
-        self.sum_volume  += volume
-        self.sum_value += close * volume  
-        self.anchored_vwap  = self.sum_value / self.sum_volume 
-        self.anchored_bars  += 1 
-
+        self.price_array.append(close)
+        self.volume_array.append(volume)
+        self.sum_value += close * volume
+        self.sum_volume += volume
+        self.anchored_vwap = self.sum_value / self.sum_volume
         if not self.initialized:
             self._set_has_inputs(True)
             if len(self.zigzags_values) >=3:
@@ -176,13 +182,16 @@ cdef class Zigzag(Indicator):
                 self.zigzags_values.append(high)
                 self.zigzags_Type.append("Peak")
                 self.zigzags_datetime.append(timestamp)
-                self.last_sum_volume  = self.sum_volume
-                self.last_sum_value = self.sum_value
-                self.last_anchored_vwap  = self.anchored_vwap
-                self.last_anchored_bars  = self.anchored_bars
-                self.sum_volume  = 0 
-                self.sum_value = 0 
-                self.anchored_bars  = 0 
+                if self.last_ts_event > 0 and len(self.zigzags_datetime)>=3:
+                    self.num_bars = (timestamp - self.zigzags_datetime[-3]) / (timestamp - self.last_ts_event)
+                    self.price_array = self.price_array[-self.num_bars:]
+                    self.volume_array = self.volume_array[-self.num_bars:]
+                    self.sum_value = 0 
+                    self.sum_volume = 0 
+                #if self.last_ts_event > 0 and len(self.zigzags_datetime)>=3:
+                    #self.num_bars = (timestamp - self.zigzags_datetime[-2]) / (timestamp - self.last_ts_event)
+                    #self.poi = np.dot(self.price_array[:-self.num_bars],self.volume_array[:-self.num_bars]) / np.sum(self.volume_array[:-self.num_bars])
+        
         else:
             perc_change_since_pivot = self.calc_change_since_pivot(low)
             is_reversing = perc_change_since_pivot <=-self.threshold
@@ -195,13 +204,15 @@ cdef class Zigzag(Indicator):
                 self.zigzags_values.append(low)
                 self.zigzags_Type.append("Trough")
                 self.zigzags_datetime.append(timestamp)
-                self.last_sum_volume  = self.sum_volume
-                self.last_sum_value = self.sum_value
-                self.last_anchored_vwap  = self.anchored_vwap
-                self.last_anchored_bars  = self.anchored_bars
-                self.sum_volume  = 0 
-                self.sum_value = 0 
-                self.anchored_bars  = 0 
+                if self.last_ts_event > 0 and len(self.zigzags_datetime)>=3:
+                    self.num_bars = (timestamp - self.zigzags_datetime[-3]) / (timestamp - self.last_ts_event)
+                    self.price_array = self.price_array[-self.num_bars:]
+                    self.volume_array = self.volume_array[-self.num_bars:]
+                    self.sum_value = 0 
+                    self.sum_volume = 0 
+                #if self.last_ts_event > 0 and len(self.zigzags_datetime)>=3:
+                    #self.num_bars = (timestamp - self.zigzags_datetime[-2]) / (timestamp - self.last_ts_event)
+                    #self.poi = np.dot(self.price_array[:-self.num_bars],self.volume_array[:-self.num_bars]) / np.sum(self.volume_array[:-self.num_bars])
 
         ## compute previous pivot
         if self.zigzags_datetime[-1] != timestamp:
@@ -215,6 +226,7 @@ cdef class Zigzag(Indicator):
                 self.virtual_direction = 1
 
         self.virtual_length  = self.virtual_high - self.virtual_low
+        self.last_ts_event = timestamp
 
     cpdef double calc_change_since_pivot(self,double current_value) except *:
         last_pivot = self.zigzags_values[-1]
@@ -227,14 +239,14 @@ cdef class Zigzag(Indicator):
         self.zigzags_values.clear()
         self.zigzags_Type.clear()
         self.zigzags_datetime.clear()
+        self.price_array[:] = [] 
+        self.volume_array[:] = [] 
+        self.last_ts_event = 0 
+        self.num_bars = 0 
+        self.poi = 0 
         self.sum_volume  = 0 
         self.sum_value = 0 
-        self.anchored_vwap  = 0 
-        self.anchored_bars  = 0 
-        self.last_sum_volume  = 0 
-        self.last_sum_value = 0 
-        self.last_anchored_vwap  = 0 
-        self.last_anchored_bars  = 0 
+        self.anchored_vwap  = 0       
         self.threshold = 0
         self.virtual_high = 0
         self.virtual_low = 0

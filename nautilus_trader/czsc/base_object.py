@@ -273,6 +273,8 @@ class ZS:
         self.ts_closed = self.end.ts_closed if self.end else self.start.ts_opened
         self.is_confirm = False 
         self.real = True 
+        self.high_supported = self.zd
+        self.low_supported = self.zg  
 
     def add_line(
         self, 
@@ -292,7 +294,21 @@ class ZS:
         if zgzd == 0:
             zgzd = 1
         return (zgzd / (self.gg - self.dd)) * 100
-
+    
+    def update_zs_supported(
+            self, 
+            threshold,
+        ):
+        cur_line = self.lines[-1]
+        if self.high_supported is None or self.low_supported is None:
+            return 
+        for line in self.lines[-2::-1]:
+            if abs(line.high - cur_line.high) < threshold and line.high > self.high_supported:
+                self.high_supported = line.high 
+        cur_line = self.lines[-1]
+        for line in self.lines[-2::-1]:
+            if abs(line.low - cur_line.low) < threshold and line.low < self.low_supported:
+                self.low_supported = line.low
 
 class TradePoint:
     """

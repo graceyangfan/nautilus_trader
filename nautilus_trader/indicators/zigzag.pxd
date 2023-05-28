@@ -22,6 +22,8 @@ from nautilus_trader.model.data.bar cimport Bar
 cdef class Zigzag(Indicator):
     cdef readonly object zigzags_values
     cdef object zigzags_Type
+    cdef readonly list price_array
+    cdef readonly list volume_array 
     cdef readonly object zigzags_datetime
 
     cdef readonly double sum_volume 
@@ -30,21 +32,19 @@ cdef class Zigzag(Indicator):
     """The sum value of bars in current zigzag_line.\n\n:returns: `double`"""
     cdef readonly double anchored_vwap  
     """The anchored vwap in current zigzag_line.\n\n:returns: `double`"""
-    cdef readonly int anchored_bars 
-    """The number of bars in current zigzag_line.\n\n:returns: `int`"""
-    cdef readonly double last_sum_volume 
-    """The sum volume of bars in last zigzag_line.\n\n:returns: `double`"""
-    cdef readonly double last_sum_value
-    """The sum value of bars in last zigzag_line.\n\n:returns: `double`"""
-    cdef readonly double last_anchored_vwap  
-    """The anchored vwap in last zigzag_line.\n\n:returns: `double`"""
-    cdef readonly int last_anchored_bars 
-    """The number of bars in last zigzag_line.\n\n:returns: `int`"""
+    cdef readonly uint64_t last_ts_event
+    """The last bar ts_event.\n\n:returns: `uint64`"""
+    cdef readonly double poi 
+    """The poi price in current zigzag line.\n\n:returns: `double`"""
+    cdef readonly int num_bars 
+    """The number of bars for different computing.\n\n:returns: `int`"""
 
     cdef readonly double change_percent
     """The zigzag change_percent .\n\n:returns: `double`"""
     cdef readonly bint full_close
-    """The zigzag full_close param.\n\n:returns: `double`"""
+    """The zigzag full_close param.\n\n:returns: `bool`"""
+    cdef readonly int bins_num
+    """The bins number for price array.\n\n:returns: `int`"""
     cdef readonly double threshold
     """The zigzag threshold .\n\n:returns: `double`"""
     cdef readonly double virtual_high

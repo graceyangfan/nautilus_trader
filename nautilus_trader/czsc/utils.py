@@ -20,6 +20,7 @@ from nautilus_trader.czsc.base_object import BI, LINE, MACD_INFOS
 from nautilus_trader.czsc.enums import Direction 
 from nautilus_trader.czsc.twist import Twist
 from nautilus_trader.czsc.base_object import ZS 
+import matplotlib.pyplot as plt 
 import numpy as np 
 
 
@@ -120,3 +121,33 @@ def bi_pause(bi: BI, twist: Twist):
         return True
 
     return False
+
+
+def plot_bis(bis: List):
+    for bi in bis:
+        if bi.is_confirm:
+            plt.plot([bi.ts_opened,bi.ts_closed],
+                     [bi.start.middle_twist_bar.close, bi.end.middle_twist_bar.close], color="red") 
+        else:
+            plt.plot([bi.ts_opened,bi.ts_closed],
+                     [bi.start.middle_twist_bar.close, bi.end.middle_twist_bar.close], color="blue")
+            
+def plot_zss(zss: List):
+    for zs in zss:
+        if zs.is_confirm:
+            plt.plot([zs.ts_opened,zs.ts_opened],[zs.dd,zs.gg], color="red")
+            plt.plot([zs.ts_opened,zs.ts_closed],[zs.dd,zs.dd], color="red")
+            plt.plot([zs.ts_opened,zs.ts_closed],[zs.gg,zs.gg], color="red")
+            plt.plot([zs.ts_closed,zs.ts_closed],[zs.dd,zs.gg], color="red")
+        else:
+            plt.plot([zs.ts_opened,zs.ts_opened],[zs.dd,zs.gg], color="blue")
+            plt.plot([zs.ts_opened,zs.ts_closed],[zs.dd,zs.dd], color="blue")
+            plt.plot([zs.ts_opened,zs.ts_closed],[zs.gg,zs.gg], color="blue")
+            plt.plot([zs.ts_closed,zs.ts_closed],[zs.dd,zs.gg], color="blue")
+
+def plot_xd(xds: List):
+    for xd in xds:
+        if xd.is_confirm:
+            plt.plot([xd.start_line.ts_opened,xd.end_line.ts_closed],[xd.start_line.start.middle_twist_bar.close,xd.end_line.end.middle_twist_bar.close], color="red")
+        else:
+            plt.plot([xd.start_line.ts_opened,xd.end_line.ts_closed],[xd.start_line.start.middle_twist_bar.close,xd.end_line.end.middle_twist_bar.close], color="blue")

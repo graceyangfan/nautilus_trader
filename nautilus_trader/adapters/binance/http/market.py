@@ -37,6 +37,7 @@ from nautilus_trader.adapters.binance.http.endpoint import BinanceHttpEndpoint
 from nautilus_trader.core.correctness import PyCondition
 from nautilus_trader.model.data.bar import BarType
 from nautilus_trader.model.data.tick import TradeTick
+from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.orderbook.data import OrderBookSnapshot
 
@@ -853,16 +854,27 @@ class BinanceMarketHttpAPI:
         start_time: Optional[str] = None,
         end_time: Optional[str] = None,
     ) -> list[BinanceBar]:
-        """Request Binance Bars from Klines."""
-        klines = await self.query_klines(
-            symbol=bar_type.instrument_id.symbol.value,
-            interval=interval,
-            limit=limit,
-            start_time=start_time,
-            end_time=end_time,
-        )
-        bars: list[BinanceBar] = [kline.parse_to_binance_bar(bar_type, ts_init) for kline in klines]
-        return bars
+        all_bars: list[BinanceBar] = []
+        while True:
+            klines = await self.query_klines(
+                symbol=bar_type.instrument_id.symbol.value,
+                interval=interval,
+                limit=limit,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            bars: list[BinanceBar] = [kline.parse_to_binance_bar(bar_type, ts_init) for kline in klines]
+            all_bars.extend(bars)
+
+            if len(klines) < limit:
+                # No more bars to fetch
+                break
+
+            # Update the start_time to fetch the next set of bars
+            start_time = klines[-1].open_time + 1
+
+        return all_bars
+
 
     async def query_ticker_24hr(
         self,

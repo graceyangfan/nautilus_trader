@@ -67,14 +67,14 @@ class TwistConfig(StrategyConfig):
     boll_period = 20 
     boll_k = 2 
     ma_period = 5 
-    bar_capacity: int = 1000
-    twist_bar_capacity: int = 1000
-    fx_capacity: int = 500
-    bi_capacity: int = 500
-    xd_capacity: int = 500
-    trend_capacity:int = 500
-    bi_zs_capacity: int = 250  
-    xd_zs_capacity: int = 250 
+    bar_capacity: int = 2000
+    twist_bar_capacity: int = 2000
+    fx_capacity: int = 1000
+    bi_capacity: int = 1000
+    xd_capacity: int = 1000
+    trend_capacity:int = 1000
+    bi_zs_capacity: int = 500  
+    xd_zs_capacity: int = 500 
     use_boll:bool = False 
     use_ma:bool = False 
 
@@ -103,6 +103,15 @@ class Twist:
         self.boll_period = config.boll_period 
         self.boll_k = config.boll_k
         self.ma_period = config.ma_period 
+
+        self.bar_capacity = config.bar_capacity
+        self.twist_bar_capacity = config.twist_bar_capacity
+        self.fx_capacity = config.fx_capacity
+        self.bi_capacity = config.bi_capacity
+        self.xd_capacity = config.xd_capacity
+        self.trend_capacity = config.trend_capacity
+        self.bi_zs_capacity = config.bi_zs_capacity
+        self.xd_zs_capacity = config.xd_zs_capacity
 
         self.use_boll = config.use_boll
         self.use_ma = config.use_ma 
@@ -152,10 +161,10 @@ class Twist:
         if self.use_ma:
             strategy.register_indicator_for_bars(self.bar_type, self.ma)
 
-
     def on_bar(self,bar: Bar):
         ## update newbar 
         ## update indciator 
+        self.memory_reduce()
         self.update_info(bar) 
 
         info = None 
@@ -185,7 +194,7 @@ class Twist:
         self.process_up_line(LineType.XD) if xd_update else False
         ## process bi and xd zs 
         self.process_zs(LineType.BI) if bi_update else None
-        self.process_zs(LineType.XD) if xd_update else None
+        self.process_zs(LineType.XD) if xd_update else None 
 
         self.process_trade_point(LineType.BI) if bi_update else None
         self.process_trade_point(LineType.XD) if xd_update else None
@@ -360,6 +369,7 @@ class Twist:
             return True 
 
         
+        #新增分型及其上一个真实分型 
         if fx.mark_type == Mark.DING and up_fx.mark_type == Mark.DING and up_fx.middle_twist_bar.high <= fx.middle_twist_bar.high:
             up_fx.real = False 
         elif fx.mark_type == Mark.DI and up_fx.mark_type == Mark.DI and up_fx.middle_twist_bar.low >= fx.middle_twist_bar.low:
@@ -389,30 +399,6 @@ class Twist:
         if not is_update:
             fx.index = self.fxs[-1].index + 1 
             self.fxs.append(fx)
-
-        ##get_real_fxs 
-        if len(self.fxs) >= 2:
-            if not self.fxs[-2].real:
-                if not self.fxs[-1].real:
-                    self.fxs.pop()
-                    self.fxs.pop() 
-                else:
-                    self.fxs[-2] = self.fxs[-1]
-                    self.fxs[-2].index = self.fxs[-3].index + 1  if len(self.fxs) >=3 else 0 
-                    self.fxs.pop()
-            else:
-                if not self.fxs[-1].real:
-                    self.fxs.pop() 
-        elif len(self.fxs) == 1:
-            if not self.fxs[-1].real:
-                self.fxs.pop()
-        else:
-            pass 
-        '''
-        self.fxs = [_fx for _fx in self.fxs if _fx.real]
-        for i in range(len(self.fxs)):
-            self.fxs[i].index = self.fxs[0].index + 1
-        '''
         return True
         
     def process_bi(self):
@@ -438,9 +424,10 @@ class Twist:
                 bi.pause = False 
 
         if bi is None: ## the first time to generate bi 
-            if len(self.fxs) < 2:
+            real_fx = [_fx for _fx in self.fxs if _fx.real]
+            if len(real_fx) < 2:
                 return False 
-            for fx in self.fxs:
+            for fx in real_fx:
                 if bi is None:
                     bi = BI(start = fx, index = 0) 
                     continue 
@@ -449,16 +436,20 @@ class Twist:
                 bi.end = fx 
                 bi.direction_type = Direction.UP if bi.start.mark_type == Mark.DI else Direction.DOWN 
                 bi.is_confirm = fx.is_confirm  
-                bi.jump = False 
+                bi.pause = False 
                 self.process_line_power(bi)
                 self.process_line_hl(bi)
                 self.bis.append(bi)
                 return True 
 
-        ## decide the last fx 
-        end_real_fx = self.fxs[-1]
-        if (bi.end.real is False and bi.end.mark_type == end_real_fx.mark_type) or \
-            (bi.end.index == end_real_fx.index and bi.is_confirm != end_real_fx.is_confirm):
+        # 确定最后一个有效分型
+        end_real_fx = None
+        for _fx in self.fxs[::-1]:
+            if _fx.real:
+                end_real_fx = _fx
+                break
+        if (bi.end.real is False and bi.end.mark_type == end_real_fx.mark_type):
+            #or  (bi.end.index == end_real_fx.index and bi.is_confirm != end_real_fx.is_confirm):
             bi.end = end_real_fx 
             bi.is_confirm = end_real_fx.is_confirm 
             self.process_line_power(bi)
@@ -1020,7 +1011,8 @@ class Twist:
         zs.zd = zs_range[1]
         zs.gg = zs_gg
         zs.dd = zs_dd
-
+        zs.high_supported = zs.zd
+        zs.low_supported = zs.zg 
         # compute zs direction 
 
         if zs.lines[0].direction_type == zs.lines[-1].direction_type:
@@ -1493,6 +1485,8 @@ class Twist:
         to_zs.zd = copy_zs.zd
         to_zs.gg = copy_zs.gg
         to_zs.dd = copy_zs.dd
+        to_zs.high_supported = copy_zs.high_supported
+        to_zs.low_supported = copy_zs.low_supported 
         to_zs.line_num = copy_zs.line_num
         to_zs.level = copy_zs.level
         to_zs.max_power = copy_zs.max_power
@@ -1551,6 +1545,57 @@ class Twist:
         start = line.end.middle_twist_bar.b_index+1
         fx_bars = self.newbars[start:]
         return np.sum([bar.close*bar.volume for bar in fx_bars])/np.sum([bar.volume for bar in fx_bars])
+
+    def memory_reduce(self):
+        if len(self.newbars) > self.bar_capacity:
+            middle_xd = self.xds[len(self.xds)//2]
+            start_index = middle_xd.start.twist_bars[0].elements[0].index
+            newbars = self.newbars[max(0,start_index-1):]
+
+            # reset info 
+            self.newbars = []       
+            self.twist_bars = [] 
+            self.fxs = []          
+            self.real_fxs = []   
+            self.bis = [] 
+            self.xds = []
+            self.big_trends = []
+            self.bi_zss = []
+            self.xd_zss = []
+
+            self.bar_count= 0 
+            
+            self.macd_dif = [] 
+            self.macd_dem = [] 
+            self.macd_value = [] 
+            self.boll_up = [] 
+            self.boll_middle = [] 
+            self.boll_down = [] 
+            self.ma_value = [] 
+
+            for bar in newbars:
+                bar.index = self.bar_count 
+                
+                self.newbars.append(bar) 
+                ##update twist bars 
+                self.process_twist_bar() 
+                ##update fx 
+                self.process_fx() 
+                ##update bi 
+                bi_update = self.process_bi()
+
+                ##update xd from bi 
+                xd_update = self.process_up_line(LineType.BI) if bi_update else False
+                ##update big_trend 
+                self.process_up_line(LineType.XD) if xd_update else False
+                ## process bi and xd zs 
+                self.process_zs(LineType.BI) if bi_update else None
+                self.process_zs(LineType.XD) if xd_update else None 
+
+                self.process_trade_point(LineType.BI) if bi_update else None
+                self.process_trade_point(LineType.XD) if xd_update else None
+                ##update bar_count 
+                self.bar_count += 1
 
     def on_reset(self):
         """
