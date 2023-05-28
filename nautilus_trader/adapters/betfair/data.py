@@ -216,8 +216,10 @@ class BetfairDataClient(LiveMarketDataClient):
     async def _subscribe_trade_ticks(self, instrument_id: InstrumentId) -> None:
         pass  # Subscribed as part of orderbook
 
-    async def _subscribe_instrument(self, instrument_id: InstrumentId):
-        instrument = self._instrument_provider.load(instrument_id)
+    async def _subscribe_instrument(self, instrument_id: InstrumentId) -> None:
+        # TODO: This is more like a Req/Res model?
+        self._instrument_provider.load(instrument_id)
+        instrument = self._instrument_provider.find(instrument_id)
         self._handle_data(instrument)
 
     async def _subscribe_instruments(self) -> None:
@@ -280,7 +282,7 @@ class BetfairDataClient(LiveMarketDataClient):
                     f"Received event: {data}, DataEngine not yet setup to send events",
                 )
             else:
-                raise RuntimeError()
+                raise RuntimeError
 
     def _check_stream_unhealthy(self, update: MCM):
         if update.stream_unreliable:

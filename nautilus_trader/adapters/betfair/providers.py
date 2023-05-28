@@ -34,8 +34,8 @@ from nautilus_trader.common.logging import Logger
 from nautilus_trader.common.providers import InstrumentProvider
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.instruments.base import Instrument
-from nautilus_trader.model.instruments.betting import BettingInstrument
+from nautilus_trader.model.instruments import BettingInstrument
+from nautilus_trader.model.instruments import Instrument
 
 
 class BetfairInstrumentProvider(InstrumentProvider):
@@ -80,14 +80,14 @@ class BetfairInstrumentProvider(InstrumentProvider):
         instrument_ids: list[InstrumentId],
         filters: Optional[dict] = None,
     ) -> None:
-        raise NotImplementedError()
+        raise NotImplementedError
 
     async def load_async(
         self,
         instrument_id: InstrumentId,
         filters: Optional[dict] = None,
     ):
-        raise NotImplementedError()
+        raise NotImplementedError
 
     @classmethod
     def from_instruments(

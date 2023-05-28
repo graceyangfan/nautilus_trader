@@ -14,7 +14,7 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
-import msgspec
+from typing import Any, Optional
 
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersDataClientConfig
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersExecClientConfig
@@ -25,6 +25,7 @@ from nautilus_trader.adapters.interactive_brokers.factories import (
     InteractiveBrokersLiveExecClientFactory,
 )
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.examples.strategies.subscribe import SubscribeStrategy
 from nautilus_trader.examples.strategies.subscribe import SubscribeStrategyConfig
@@ -37,7 +38,7 @@ from nautilus_trader.live.node import TradingNode
 # *** THIS INTEGRATION IS STILL UNDER CONSTRUCTION. ***
 # *** CONSIDER IT TO BE IN AN UNSTABLE BETA PHASE AND EXERCISE CAUTION. ***
 
-instrument_filters = [
+instrument_filters: Optional[list[dict[str, Any]]] = [
     {
         "secType": "STK",
         "symbol": "AAPL",
@@ -54,12 +55,12 @@ instrument_filters = [
 # Configure the trading node
 config_node = TradingNodeConfig(
     trader_id="TESTER-001",
-    log_level="DEBUG",
+    logging=LoggingConfig(log_level="INFO"),
     data_clients={
         "IB": InteractiveBrokersDataClientConfig(
             instrument_provider=InstrumentProviderConfig(
                 load_all=True,
-                filters=msgspec.json.encode(instrument_filters),
+                filters=instrument_filters,  # type: ignore
             ),
             start_gateway=False,
         ),
@@ -73,7 +74,7 @@ config_node = TradingNodeConfig(
     timeout_reconciliation=5.0,
     timeout_portfolio=5.0,
     timeout_disconnection=5.0,
-    timeout_post_stop=2.0,
+    timeout_post_stop=5.0,
 )
 
 # Instantiate the node with a configuration

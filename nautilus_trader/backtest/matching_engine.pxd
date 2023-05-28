@@ -72,6 +72,7 @@ cdef class OrderMatchingEngine:
     cdef OrderBook _closing_auction_book
     cdef FillModel _fill_model
     cdef object _auction_match_algo
+    cdef bint _bar_execution
     cdef bint _reject_stop_orders
     cdef bint _support_gtd_orders
     cdef dict _account_ids
@@ -150,8 +151,8 @@ cdef class OrderMatchingEngine:
     cdef void _update_limit_order(self, Order order, Quantity qty, Price price)
     cdef void _update_stop_market_order(self, StopMarketOrder order, Quantity qty, Price trigger_price)
     cdef void _update_stop_limit_order(self, StopLimitOrder order, Quantity qty, Price price, Price trigger_price)
-    cdef void _update_market_if_touched_order(self, MarketIfTouchedOrder order, Quantity qty, Price trigger_price)
-    cdef void _update_limit_if_touched_order(self, LimitIfTouchedOrder order, Quantity qty, Price price, Price trigger_price)
+    cdef void _update_market_if_touched_order(self, Order order, Quantity qty, Price trigger_price)
+    cdef void _update_limit_if_touched_order(self, Order order, Quantity qty, Price price, Price trigger_price)
     cdef void _update_trailing_stop_order(self, Order order)
 
 # -- ORDER PROCESSING -----------------------------------------------------------------------------

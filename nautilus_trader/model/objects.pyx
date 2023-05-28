@@ -43,7 +43,7 @@ from nautilus_trader.core.rust.model cimport Currency_t
 from nautilus_trader.core.rust.model cimport currency_clone
 from nautilus_trader.core.rust.model cimport currency_code_to_cstr
 from nautilus_trader.core.rust.model cimport currency_eq
-from nautilus_trader.core.rust.model cimport money_free
+from nautilus_trader.core.rust.model cimport money_drop
 from nautilus_trader.core.rust.model cimport money_from_raw
 from nautilus_trader.core.rust.model cimport money_new
 from nautilus_trader.core.rust.model cimport price_from_raw
@@ -73,9 +73,8 @@ cdef class Quantity:
     Represents a quantity with a non-negative value.
 
     Capable of storing either a whole number (no decimal places) of 'contracts'
-    or 'shares' (securities denominated in whole units) or a decimal value
-    containing decimal places for non-share quantity asset classes (instruments
-    denominated in fractional units).
+    or 'shares' (instruments denominated in whole units) or a decimal value
+    containing decimal places for instruments denominated in fractional units.
 
     Handles up to 9 decimals of precision.
 
@@ -834,7 +833,7 @@ cdef class Money:
 
     def __del__(self) -> None:
         if self._mem.currency.code != NULL:
-            money_free(self._mem)  # `self._mem` moved to Rust (then dropped)
+            money_drop(self._mem)  # `self._mem` moved to Rust (then dropped)
 
     def __getstate__(self):
         return self._mem.raw, self.currency_code_c()

@@ -15,6 +15,7 @@
 # -------------------------------------------------------------------------------------------------
 
 import asyncio
+from decimal import Decimal
 
 from nautilus_trader.adapters.betfair.factories import get_cached_betfair_client
 from nautilus_trader.adapters.betfair.factories import get_cached_betfair_instrument_provider
@@ -24,6 +25,7 @@ from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactor
 from nautilus_trader.common.clock import LiveClock
 from nautilus_trader.common.logging import Logger
 from nautilus_trader.config import CacheDatabaseConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalance
 from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalanceConfig
@@ -62,7 +64,7 @@ async def main(market_id: str):
     # Configure trading node
     config = TradingNodeConfig(
         timeout_connection=30.0,
-        log_level="DEBUG",
+        logging=LoggingConfig(log_level="DEBUG"),
         cache_database=CacheDatabaseConfig(type="in-memory"),
         data_clients={
             # "BETFAIR": BetfairDataClientConfig(market_filter=tuple(market_filter.items()))
@@ -79,7 +81,7 @@ async def main(market_id: str):
         OrderBookImbalance(
             config=OrderBookImbalanceConfig(
                 instrument_id=instrument.id.value,
-                max_trade_size=10,
+                max_trade_size=Decimal(10),
                 order_id_tag=instrument.selection_id,
             ),
         )

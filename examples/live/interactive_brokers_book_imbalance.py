@@ -14,6 +14,8 @@
 #  limitations under the License.
 # -------------------------------------------------------------------------------------------------
 
+from decimal import Decimal
+
 import msgspec
 
 from nautilus_trader.adapters.interactive_brokers.config import InteractiveBrokersDataClientConfig
@@ -25,7 +27,8 @@ from nautilus_trader.adapters.interactive_brokers.factories import (
     InteractiveBrokersLiveExecClientFactory,
 )
 from nautilus_trader.config import InstrumentProviderConfig
-from nautilus_trader.config import RiskEngineConfig
+from nautilus_trader.config import LiveRiskEngineConfig
+from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import RoutingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.examples.strategies.orderbook_imbalance import OrderBookImbalance
@@ -48,14 +51,14 @@ instrument_filters = [
 ]
 provider_config = InstrumentProviderConfig(
     load_all=True,
-    filters=msgspec.json.encode(instrument_filters),
+    filters=msgspec.json.encode(instrument_filters),  # type: ignore
 )
 
 # Configure the trading node
 config_node = TradingNodeConfig(
     trader_id="TESTER-001",
-    log_level="DEBUG",
-    risk_engine=RiskEngineConfig(bypass=True),
+    logging=LoggingConfig(log_level="INFO"),
+    risk_engine=LiveRiskEngineConfig(bypass=True),
     data_clients={
         "IB": InteractiveBrokersDataClientConfig(
             instrument_provider=provider_config,
@@ -65,7 +68,7 @@ config_node = TradingNodeConfig(
     },
     exec_clients={
         "IB": InteractiveBrokersExecClientConfig(
-            routing=RoutingConfig(default=True, venues={"IDEALPRO"}),
+            routing=RoutingConfig(default=True, venues=frozenset({"IDEALPRO"})),
             instrument_provider=provider_config,
             read_only_api=False,
             start_gateway=False,
@@ -75,7 +78,7 @@ config_node = TradingNodeConfig(
     timeout_reconciliation=5.0,
     timeout_portfolio=5.0,
     timeout_disconnection=5.0,
-    timeout_post_stop=2.0,
+    timeout_post_stop=5.0,
 )
 
 # Instantiate the node with a configuration
@@ -84,7 +87,7 @@ node = TradingNode(config=config_node)
 # Configure your strategy
 strategy_config = OrderBookImbalanceConfig(
     instrument_id="EUR/USD.IDEALPRO",
-    max_trade_size=1,
+    max_trade_size=Decimal(1),
     use_quote_ticks=True,
     book_type="L1_TBBO",
 )
