@@ -32,6 +32,13 @@ from nautilus_trader.adapters.binance.common.schemas.market import BinanceTicker
 from nautilus_trader.adapters.binance.common.schemas.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.common.types import BinanceBar
 from nautilus_trader.adapters.binance.common.types import BinanceTicker
+from nautilus_trader.adapters.binance.futures.types import (
+    OpenInterestHist,
+    TopLongShortAccountRatio,
+    TopLongShortPositionRatio,
+    GlobalLongShortAccountRatio,
+    TakerLongShortRatio,
+)
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.adapters.binance.http.market import BinanceMarketHttpAPI
 from nautilus_trader.adapters.binance.websocket.client import BinanceWebSocketClient
@@ -429,6 +436,114 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         pass  # TODO: Unsubscribe from Binance if no other subscriptions
 
     # -- REQUESTS ---------------------------------------------------------------------------------
+    async def _request(self, data_type: DataType, correlation_id: UUID4) -> None:
+        if data_type.type == OpenInterestHist:
+            start_time = data_type.metadata.get("start_time")
+            end_time = data_type.metadata.get("end_time")
+            instrument_id = data_type.metadata.get("instrument_id")
+            data = await self._http_market.request_open_insterest_hist(
+                instrument_id=instrument_id,
+                ts_init=self._clock.timestamp_ns(),
+                period = BinanceKlineInterval(data_type.metadata.get("period")),
+                limit = data_type.metadata.get("limit"),
+                start_time = secs_to_millis(start_time.timestamp()) if start_time else None,
+                end_time = secs_to_millis(end_time.timestamp()) if end_time else None,
+            )
+            data_type = DataType(
+                        data_type.type,
+                        metadata={"instrument_id": instrument_id},
+                    )
+            self._handle_data_response(
+                data_type=data_type,
+                data=data,
+                correlation_id=correlation_id,
+            )
+        elif data_type.type == TopLongShortAccountRatio:
+            start_time = data_type.metadata.get("start_time")
+            end_time = data_type.metadata.get("end_time")
+            instrument_id = data_type.metadata.get("instrument_id")
+            data = await self._http_market.request_top_long_short_account_ratio(
+                instrument_id=instrument_id,
+                ts_init=self._clock.timestamp_ns(),
+                period = BinanceKlineInterval(data_type.metadata.get("period")),
+                limit = data_type.metadata.get("limit"),
+                start_time = secs_to_millis(start_time.timestamp()) if start_time else None,
+                end_time = secs_to_millis(end_time.timestamp()) if end_time else None,
+            )
+            data_type = DataType(
+                        data_type.type,
+                        metadata={"instrument_id": instrument_id},
+                    )
+            self._handle_data_response(
+                data_type=data_type,
+                data=data,
+                correlation_id=correlation_id,
+            )
+        elif data_type.type == TopLongShortPositionRatio:
+            start_time = data_type.metadata.get("start_time")
+            end_time = data_type.metadata.get("end_time")
+            instrument_id = data_type.metadata.get("instrument_id")
+            data = await self._http_market.request_top_long_short_position_ratio(
+                instrument_id=instrument_id,
+                ts_init=self._clock.timestamp_ns(),
+                period = BinanceKlineInterval(data_type.metadata.get("period")),
+                limit = data_type.metadata.get("limit"),
+                start_time = secs_to_millis(start_time.timestamp()) if start_time else None,
+                end_time = secs_to_millis(end_time.timestamp()) if end_time else None,
+            )
+            data_type = DataType(
+                        data_type.type,
+                        metadata={"instrument_id": instrument_id},
+                    )
+            self._handle_data_response(
+                data_type=data_type,
+                data=data,
+                correlation_id=correlation_id,
+            )
+        elif data_type.type == GlobalLongShortAccountRatio:
+            start_time = data_type.metadata.get("start_time")
+            end_time = data_type.metadata.get("end_time")
+            instrument_id = data_type.metadata.get("instrument_id")
+            data = await self._http_market.request_global_long_short_account_ratio(
+                instrument_id=instrument_id,
+                ts_init=self._clock.timestamp_ns(),
+                period = BinanceKlineInterval(data_type.metadata.get("period")),
+                limit = data_type.metadata.get("limit"),
+                start_time = secs_to_millis(start_time.timestamp()) if start_time else None,
+                end_time = secs_to_millis(end_time.timestamp()) if end_time else None,
+            )
+            data_type = DataType(
+                        data_type.type,
+                        metadata={"instrument_id": instrument_id},
+                    )
+            self._handle_data_response(
+                data_type=data_type,
+                data=data,
+                correlation_id=correlation_id,
+            )
+        elif data_type.type == TakerLongShortRatio:
+            start_time = data_type.metadata.get("start_time")
+            end_time = data_type.metadata.get("end_time")
+            instrument_id = data_type.metadata.get("instrument_id")
+            data = await self._http_market.request_taker_long_short_ratio(
+                instrument_id=instrument_id,
+                ts_init=self._clock.timestamp_ns(),
+                period = BinanceKlineInterval(data_type.metadata.get("period")),
+                limit = data_type.metadata.get("limit"),
+                start_time = secs_to_millis(start_time.timestamp()) if start_time else None,
+                end_time = secs_to_millis(end_time.timestamp()) if end_time else None,
+            )
+            data_type = DataType(
+                        data_type.type,
+                        metadata={"instrument_id": instrument_id},
+                    )
+            self._handle_data_response(
+                data_type=data_type,
+                data=data,
+                correlation_id=correlation_id,
+            )
+        else:
+            raise NotImplementedError(f"Data type {data_type} not implemented.Please implemented it.")
 
     async def _request_instrument(self, instrument_id: InstrumentId, correlation_id: UUID4) -> None:
         instrument: Optional[Instrument] = self._instrument_provider.find(instrument_id)
