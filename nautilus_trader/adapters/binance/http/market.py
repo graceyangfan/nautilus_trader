@@ -32,6 +32,20 @@ from nautilus_trader.adapters.binance.common.schemas.market import BinanceTrade
 from nautilus_trader.adapters.binance.common.schemas.symbol import BinanceSymbol
 from nautilus_trader.adapters.binance.common.schemas.symbol import BinanceSymbols
 from nautilus_trader.adapters.binance.common.types import BinanceBar
+from nautilus_trader.adapters.binance.futures.schemas.market import (
+    BinanceFuturesOpenInterestHist,
+    BinanceFuturesTopLongShortAccountRatio,
+    BinanceFuturesTopLongShortPositionRatio,
+    BinanceFuturesGlobalLongShortAccountRatio,
+    BinanceFuturesTakerLongShortRatio,
+)
+from nautilus_trader.adapters.binance.futures.types import (
+    OpenInterestHist,
+    TopLongShortAccountRatio,
+    TopLongShortPositionRatio,
+    GlobalLongShortAccountRatio,
+    TakerLongShortRatio,
+)
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.adapters.binance.http.endpoint import BinanceHttpEndpoint
 from nautilus_trader.core.correctness import PyCondition
@@ -40,6 +54,7 @@ from nautilus_trader.model.data.tick import TradeTick
 from nautilus_trader.model.enums import BarAggregation
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.orderbook.data import OrderBookSnapshot
+
 
 
 class BinancePingHttp(BinanceHttpEndpoint):
@@ -330,8 +345,8 @@ class BinanceAggTradesHttp(BinanceHttpEndpoint):
         symbol: BinanceSymbol
         limit: Optional[int] = None
         fromId: Optional[str] = None
-        startTime: Optional[str] = None
-        endTime: Optional[str] = None
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
 
     async def _get(self, parameters: GetParameters) -> list[BinanceAggTrade]:
         method_type = BinanceMethodType.GET
@@ -584,6 +599,292 @@ class BinanceTickerBookHttp(BinanceHttpEndpoint):
             return self._get_arr_resp_decoder.decode(raw)
 
 
+class BinanceFuturesOpenInterestHistHttp(BinanceHttpEndpoint):
+    """
+    Endpoint of open interest in the past period for a symbol. 
+
+    `GET /futures/data/openInterestHist`
+
+    References
+    ----------
+    https://binance-docs.github.io/apidocs/futures/en/#open-interest-statistics
+    """
+
+    def __init__(
+        self,
+        client: BinanceHttpClient,
+        base_endpoint: str,
+    ):
+        methods = {
+            BinanceMethodType.GET: BinanceSecurityType.NONE,
+        }
+        url_path = base_endpoint + "openInterestHist"
+        super().__init__(
+            client,
+            methods,
+            url_path,
+        )
+        self._get_arr_resp_decoder = msgspec.json.Decoder(
+            list[BinanceFuturesOpenInterestHist]
+        )
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        GET parameters for open interest history.
+
+        Parameters
+        ----------
+        symbol : str
+            The trading pair.
+        period : BinanceKlineInterval
+            The period of the data. include "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+        limit : int
+            Default 30, max 500. setting as 1 to get the latest data. 
+        startTime : int
+            Default None. 
+        endTime : int
+            Default None.
+        """
+
+        symbol: BinanceSymbol
+        period: BinanceKlineInterval
+        limit: Optional[int] = 30
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
+
+    async def _get(self, parameters: GetParameters) -> list[BinanceFuturesOpenInterestHist]:
+        method_type = BinanceMethodType.GET
+        raw = await self._method(method_type, parameters)
+        return self._get_arr_resp_decoder.decode(raw)
+
+
+class BinanceFuturesTopLongShortAccountRatioHttp(BinanceHttpEndpoint):
+    """
+    Endpoint of top trader long/short ratio (accounts) in the past period for a symbol.
+    `GET /futures/data/topLongShortAccountRatio`
+    References
+    ----------
+    https://binance-docs.github.io/apidocs/futures/en/#top-trader-long-short-ratio-accounts-
+    """
+    
+    def __init__(
+        self,
+        client: BinanceHttpClient,
+        base_endpoint: str,
+    ):
+        methods = {
+            BinanceMethodType.GET: BinanceSecurityType.NONE,
+        }
+        url_path = base_endpoint + "topLongShortAccountRatio"
+        super().__init__(
+            client,
+            methods,
+            url_path,
+        )
+        self._get_arr_resp_decoder = msgspec.json.Decoder(
+            list[BinanceFuturesTopLongShortAccountRatio]
+        )
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        GET parameters for top trader long/short ratio (accounts).
+
+        Parameters
+        ----------
+        symbol : str
+            The trading pair.
+        period : BinanceKlineInterval
+            The period of the data. include "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+        limit : int
+            Default 30, max 500. setting as 1 to get the latest data. 
+        startTime : int
+            Default None. 
+        endTime : int
+            Default None.
+        """
+
+        symbol: BinanceSymbol
+        period: BinanceKlineInterval
+        limit: Optional[int] = 30
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
+
+    async def _get(self, parameters: GetParameters) -> list[BinanceFuturesTopLongShortAccountRatio]:
+        method_type = BinanceMethodType.GET
+        raw = await self._method(method_type, parameters)
+        return self._get_arr_resp_decoder.decode(raw)
+
+
+class BinanceFuturesTopLongShortPositionRatioHttp(BinanceHttpEndpoint):
+    """
+    Endpoint of top trader long/short ratio (positions) in the past period for a symbol.
+    `GET /futures/data/topLongShortPositionRatio`
+    References
+    ----------
+    https://binance-docs.github.io/apidocs/futures/en/#top-trader-long-short-ratio-positions-
+    """
+        
+    def __init__(
+        self,
+        client: BinanceHttpClient,
+        base_endpoint: str,
+    ):
+        methods = {
+            BinanceMethodType.GET: BinanceSecurityType.NONE,
+        }
+        url_path = base_endpoint + "topLongShortPositionRatio"
+        super().__init__(
+            client,
+            methods,
+            url_path,
+        )
+        self._get_arr_resp_decoder = msgspec.json.Decoder(
+            list[BinanceFuturesTopLongShortPositionRatio]
+        )
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        GET parameters for top trader long/short ratio (positions).
+
+        Parameters
+        ----------
+        symbol : str
+            The trading pair.
+        period : BinanceKlineInterval
+            The period of the data. include "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+        limit : int
+            Default 30, max 500. setting as 1 to get the latest data. 
+        startTime : int
+            Default None. 
+        endTime : int
+            Default None.
+        """
+
+        symbol: BinanceSymbol
+        period: BinanceKlineInterval
+        limit: Optional[int] = 30
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
+
+    async def _get(self, parameters: GetParameters) -> list[BinanceFuturesTopLongShortPositionRatio]:
+        method_type = BinanceMethodType.GET
+        raw = await self._method(method_type, parameters)
+        return self._get_arr_resp_decoder.decode(raw)
+
+class BinanceFuturesGlobalLongShortAccountRatioHttp(BinanceHttpEndpoint):
+    """
+    Endpoint of global long/short ratio (accounts) in the past period for a symbol.
+    `GET /futures/data/globalLongShortAccountRatio`
+    References
+    ----------
+    https://binance-docs.github.io/apidocs/futures/en/#global-long-short-ratio-accounts-
+    """
+        
+    def __init__(
+        self,
+        client: BinanceHttpClient,
+        base_endpoint: str,
+    ):
+        methods = {
+            BinanceMethodType.GET: BinanceSecurityType.NONE,
+        }
+        url_path = base_endpoint + "globalLongShortAccountRatio"
+        super().__init__(
+            client,
+            methods,
+            url_path,
+        )
+        self._get_arr_resp_decoder = msgspec.json.Decoder(
+            list[BinanceFuturesGlobalLongShortAccountRatio]
+        )
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        GET parameters for global long/short ratio (accounts).
+
+        Parameters
+        ----------
+        symbol : str
+            The trading pair.
+        period : BinanceKlineInterval
+            The period of the data. include "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+        limit : int
+            Default 30, max 500. setting as 1 to get the latest data. 
+        startTime : int
+            Default None. 
+        endTime : int
+            Default None.
+        """
+
+        symbol: BinanceSymbol
+        period: BinanceKlineInterval
+        limit: Optional[int] = 30
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
+
+    async def _get(self, parameters: GetParameters) -> list[BinanceFuturesGlobalLongShortAccountRatio]:
+        method_type = BinanceMethodType.GET
+        raw = await self._method(method_type, parameters)
+        return self._get_arr_resp_decoder.decode(raw)
+
+class BinanceFuturesTakerLongShortRatioHttp(BinanceHttpEndpoint):
+    """
+    Endpoint of taker buy/sell volume ratio in the past period for a symbol.
+    `GET /futures/data/takerlongshortRatio`
+    References
+    ----------
+    https://binance-docs.github.io/apidocs/futures/en/#taker-buy-sell-volume-ratio
+    """
+        
+    def __init__(
+        self,
+        client: BinanceHttpClient,
+        base_endpoint: str,
+    ):
+        methods = {
+            BinanceMethodType.GET: BinanceSecurityType.NONE,
+        }
+        url_path = base_endpoint + "takerlongshortRatio"
+        super().__init__(
+            client,
+            methods,
+            url_path,
+        )
+        self._get_arr_resp_decoder = msgspec.json.Decoder(
+            list[BinanceFuturesTakerLongShortRatio]
+        )
+
+    class GetParameters(msgspec.Struct, omit_defaults=True, frozen=True):
+        """
+        GET parameters for taker buy/sell volume ratio.
+
+        Parameters
+        ----------
+        symbol : str
+            The trading pair.
+        period : BinanceKlineInterval
+            The period of the data. include "5m","15m","30m","1h","2h","4h","6h","12h","1d"
+        limit : int
+            Default 30, max 500. setting as 1 to get the latest data. 
+        startTime : int
+            Default None. 
+        endTime : int
+            Default None.
+        """
+
+        symbol: BinanceSymbol
+        period: BinanceKlineInterval
+        limit: Optional[int] = 30
+        startTime: Optional[int] = None
+        endTime: Optional[int] = None
+
+    async def _get(self, parameters: GetParameters) -> list[BinanceFuturesTakerLongShortRatio]:
+        method_type = BinanceMethodType.GET
+        raw = await self._method(method_type, parameters)
+        return self._get_arr_resp_decoder.decode(raw)
+
+
+
 class BinanceMarketHttpAPI:
     """
     Provides access to the Binance Market HTTP REST API.
@@ -630,6 +931,11 @@ class BinanceMarketHttpAPI:
         self._endpoint_ticker_24hr = BinanceTicker24hrHttp(client, self.base_endpoint)
         self._endpoint_ticker_price = BinanceTickerPriceHttp(client, self.base_endpoint)
         self._endpoint_ticker_book = BinanceTickerBookHttp(client, self.base_endpoint)
+        self._endpoint_open_interest_hist = BinanceFuturesOpenInterestHistHttp(client, "/futures/data/")
+        self._endpoint_top_long_short_account_ratio = BinanceFuturesTopLongShortAccountRatioHttp(client, "/futures/data/")
+        self._endpoint_top_long_short_position_ratio = BinanceFuturesTopLongShortPositionRatioHttp(client, "/futures/data/")
+        self._endpoint_global_long_short_account_ratio = BinanceFuturesGlobalLongShortAccountRatioHttp(client, "/futures/data/")
+        self._endpoint_taker_long_short_ratio = BinanceFuturesTakerLongShortRatioHttp(client, "/futures/data/")
 
     async def ping(self) -> dict:
         """Ping Binance REST API."""
@@ -699,8 +1005,8 @@ class BinanceMarketHttpAPI:
         self,
         symbol: str,
         limit: Optional[int] = None,
-        start_time: Optional[str] = None,
-        end_time: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
         from_id: Optional[str] = None,
     ) -> list[BinanceAggTrade]:
         """Query aggregated trades for symbol."""
@@ -927,3 +1233,196 @@ class BinanceMarketHttpAPI:
                 symbols=BinanceSymbols(symbols),
             ),
         )
+
+
+    async def query_open_insterest_hist(
+        self,
+        symbol: BinanceSymbol,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[BinanceFuturesOpenInterestHist]:
+        """Query open interest for a symbol over a period."""
+        return await self._endpoint_open_interest_hist._get(
+            parameters=self._endpoint_open_interest_hist.GetParameters(
+                symbol=BinanceSymbol(symbol),
+                period=period,
+                limit=limit,
+                startTime=start_time,
+                endTime=end_time,
+            ),
+        )
+
+    async def query_top_long_short_account_ratio(
+        self,
+        symbol: BinanceSymbol,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[BinanceFuturesTopLongShortAccountRatio]:
+        """Query top long/short account ratio for a symbol over a period."""
+        return await self._endpoint_top_long_short_account_ratio._get(
+            parameters=self._endpoint_top_long_short_account_ratio.GetParameters(
+                symbol=BinanceSymbol(symbol),
+                period=period,
+                limit=limit,
+                startTime=start_time,
+                endTime=end_time,
+            ),
+        )
+    
+    async def query_top_long_short_position_ratio(
+        self,
+        symbol: BinanceSymbol,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[BinanceFuturesTopLongShortPositionRatio]:
+        """Query top long/short position ratio for a symbol over a period."""
+        return await self._endpoint_top_long_short_position_ratio._get(
+            parameters=self._endpoint_top_long_short_position_ratio.GetParameters(
+                symbol=BinanceSymbol(symbol),
+                period=period,
+                limit=limit,
+                startTime=start_time,
+                endTime=end_time,
+            ),
+        )
+    
+    async def query_global_long_short_account_ratio(
+        self,
+        symbol: BinanceSymbol,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[BinanceFuturesGlobalLongShortAccountRatio]:
+        """Query global long/short account ratio over a period."""
+        return await self._endpoint_global_long_short_account_ratio._get(
+            parameters=self._endpoint_global_long_short_account_ratio.GetParameters(
+                symbol=BinanceSymbol(symbol),
+                period=period,
+                limit=limit,
+                startTime=start_time,
+                endTime=end_time,
+            ),
+        )
+
+    async def query_taker_long_short_ratio(
+        self,
+        symbol: BinanceSymbol,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[BinanceFuturesTakerLongShortRatio]:
+        """Query taker long/short ratio for a symbol over a period."""
+        return await self._endpoint_taker_long_short_ratio._get(
+            parameters=self._endpoint_taker_long_short_ratio.GetParameters(
+                symbol=BinanceSymbol(symbol),
+                period=period,
+                limit=limit,
+                startTime=start_time,
+                endTime=end_time,
+            ),
+        )
+
+    async def request_open_insterest_hist(
+        self,
+        instrument_id: InstrumentId,
+        ts_init: int,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[OpenInterestHist]:
+        data = await self.query_open_insterest_hist(
+            instrument_id.symbol.value,
+            period,
+            limit,
+            start_time,
+            end_time,
+        )
+        return [item.parse_to_open_instert_hist(instrument_id,ts_init) for item in data]
+
+    async def request_top_long_short_account_ratio(
+        self,
+        instrument_id: InstrumentId,
+        ts_init: int,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[TopLongShortAccountRatio]:
+        data = await self.query_top_long_short_account_ratio(
+            instrument_id.symbol.value,
+            period,
+            limit,
+            start_time,
+            end_time,
+        )
+
+        return [item.parse_to_top_long_short_account_ratio(instrument_id,ts_init) for item in data]
+    
+    async def request_top_long_short_position_ratio(
+        self,
+        instrument_id: InstrumentId,
+        ts_init: int,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[TopLongShortPositionRatio]:
+        data = await self.query_top_long_short_position_ratio(
+            instrument_id.symbol.value,
+            period,
+            limit,
+            start_time,
+            end_time,
+        )
+
+        return [item.parse_to_top_long_short_position_ratio(instrument_id,ts_init) for item in data]
+
+    async def request_global_long_short_account_ratio(
+        self,
+        instrument_id: InstrumentId,
+        ts_init: int,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[GlobalLongShortAccountRatio]:
+        data = await self.query_global_long_short_account_ratio(
+            instrument_id.symbol.value,
+            period,
+            limit,
+            start_time,
+            end_time,
+        )
+
+        return [item.parse_to_global_long_short_account_ratio(instrument_id,ts_init) for item in data]
+
+    async def request_taker_long_short_ratio(
+        self,
+        instrument_id: InstrumentId,
+        ts_init: int,
+        period: BinanceKlineInterval,
+        limit: Optional[int] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> list[TakerLongShortRatio]:
+        data = await self.query_taker_long_short_ratio(
+            instrument_id.symbol.value,
+            period,
+            limit,
+            start_time,
+            end_time,
+        )
+
+        return [item.parse_to_taker_long_short_ratio(instrument_id,ts_init) for item in data]
+
+
+    
