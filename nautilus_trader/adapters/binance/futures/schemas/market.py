@@ -25,6 +25,13 @@ from nautilus_trader.adapters.binance.common.schemas.market import BinanceRateLi
 from nautilus_trader.adapters.binance.common.schemas.market import BinanceSymbolFilter
 from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesContractStatus
 from nautilus_trader.adapters.binance.futures.types import BinanceFuturesMarkPriceUpdate
+from nautilus_trader.adapters.binance.futures.types import (
+    OpenInterestHist,
+    TopLongShortAccountRatio,
+    TopLongShortPositionRatio,
+    GlobalLongShortAccountRatio,
+    TakerLongShortRatio,
+)
 from nautilus_trader.core.datetime import millis_to_nanos
 from nautilus_trader.model.currency import Currency
 from nautilus_trader.model.data.tick import TradeTick
@@ -126,6 +133,113 @@ class BinanceFuturesFundRate(msgspec.Struct, frozen=True):
     symbol: str
     fundingRate: str
     fundingTime: str
+
+
+
+#add data struct 
+class BinanceFuturesOpenInterestHist(msgspec.Struct, frozen=True):
+    """
+    Defines `Binance` Futures Open Interest Statistics.
+    """
+
+    symbol: Optional[str]
+    sumOpenInterest: Optional[str]  
+    sumOpenInterestValue: Optional[str]
+    timestamp: Optional[int]
+
+    def parse_to_open_instert_hist(self, instrument_id: InstrumentId,ts_init: int):
+        return OpenInterestHist(
+            instrument_id=instrument_id,
+            sumOpenInterest=Decimal(self.sumOpenInterest),
+            sumOpenInterestValue=Decimal(self.sumOpenInterestValue),
+            ts_event=millis_to_nanos(self.timestamp),
+            ts_init = ts_init,
+        )
+
+class BinanceFuturesTopLongShortAccountRatio(msgspec.Struct, frozen=True):
+    """
+    Defines `Binance` Futures Top Trader Long/Short Ratio (Accounts).
+    """
+        
+    symbol: Optional[str]
+    longShortRatio: Optional[str]
+    longAccount: Optional[str]
+    shortAccount: Optional[str]
+    timestamp: Optional[int]
+    
+    def parse_to_top_long_short_account_ratio(self, instrument_id: InstrumentId, ts_init: int):
+        return TopLongShortAccountRatio(
+            instrument_id=instrument_id,
+            longShortRatio=Decimal(self.longShortRatio),
+            longAccount=Decimal(self.longAccount),
+            shortAccount=Decimal(self.shortAccount),
+            ts_event=millis_to_nanos(self.timestamp),
+            ts_init=ts_init,
+        )
+    
+
+class BinanceFuturesTopLongShortPositionRatio(msgspec.Struct, frozen=True):
+    """
+    Defines `Binance` Futures Top Trader Long/Short Ratio (Positions).
+    """
+    
+    symbol: Optional[str]
+    longShortRatio: Optional[str]
+    longAccount: Optional[str]
+    shortAccount: Optional[str]
+    timestamp: Optional[int]
+
+    def parse_to_top_long_short_position_ratio(self, instrument_id: InstrumentId, ts_init: int):
+        return TopLongShortPositionRatio(
+            instrument_id=instrument_id,
+            longShortRatio=Decimal(self.longShortRatio),
+            longAccount=Decimal(self.longAccount),
+            shortAccount=Decimal(self.shortAccount),
+            ts_event=millis_to_nanos(self.timestamp),
+            ts_init=ts_init,
+        )
+
+class BinanceFuturesGlobalLongShortAccountRatio(msgspec.Struct, frozen=True):
+    """
+    Defines `Binance` Futures Global Long/Short Account Ratio.
+    """
+
+    symbol: Optional[str]
+    longShortRatio: Optional[str]
+    longAccount: Optional[str]
+    shortAccount: Optional[str]
+    timestamp: Optional[int]
+
+    def parse_to_global_long_short_account_ratio(self, instrument_id: InstrumentId, ts_init: int):
+        return GlobalLongShortAccountRatio(
+            instrument_id=instrument_id,
+            longShortRatio=Decimal(self.longShortRatio),
+            longAccount=Decimal(self.longAccount),
+            shortAccount=Decimal(self.shortAccount),
+            ts_event=millis_to_nanos(self.timestamp),
+            ts_init=ts_init,
+        )
+
+class BinanceFuturesTakerLongShortRatio(msgspec.Struct, frozen=True):
+    """
+    Defines `Binance` Futures Taker Long/Short Ratio.
+    """
+
+    buySellRatio: Optional[str]
+    buyVol: Optional[str]
+    sellVol: Optional[str]
+    timestamp: Optional[int]
+
+    def parse_to_taker_long_short_ratio(self, instrument_id: InstrumentId, ts_init: int):
+        return TakerLongShortRatio(
+            instrument_id=instrument_id,
+            buySellRatio=Decimal(self.buySellRatio),
+            buyVol=Decimal(self.buyVol),
+            sellVol=Decimal(self.sellVol),
+            ts_event=millis_to_nanos(self.timestamp),
+            ts_init=ts_init,
+        )
+
 
 
 ################################################################################
