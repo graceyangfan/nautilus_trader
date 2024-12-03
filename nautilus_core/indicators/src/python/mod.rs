@@ -42,6 +42,7 @@ pub fn indicators(_: Python<'_>, m: &PyModule) -> PyResult<()> {
 
     // Book
     m.add_class::<crate::book::imbalance::BookImbalanceRatio>()?;
+    m.add_class::<crate::book::resilience::MarketResilienceIndicator>()?;
 
     // Ratio
     m.add_class::<crate::ratio::efficiency_ratio::EfficiencyRatio>()?;
