@@ -286,6 +286,11 @@ class BinanceCommonDataClient(LiveMarketDataClient):
 
         if data_type.type == BinanceTicker:
             await self._ws_client.subscribe_ticker(instrument_id.symbol.value)
+        elif data_type.type == BinanceFuturesLiquidationOrder:
+            if instrument_id:
+                await self._ws_client.subscribe_liquidation_orders(instrument_id.symbol.value)
+            else:
+                await self._ws_client.subscribe_all_liquidation_orders()
         elif data_type.type == BinanceFuturesMarkPriceUpdate:
             if not self._binance_account_type.is_futures:
                 self._log.error(
@@ -303,12 +308,17 @@ class BinanceCommonDataClient(LiveMarketDataClient):
         instrument_id: InstrumentId | None = data_type.metadata.get("instrument_id")
         if instrument_id is None:
             self._log.error(
-                "Cannot subscribe to `BinanceFuturesMarkPriceUpdate` no instrument ID in `data_type` metadata",
+                f"Cannot unsubscribe from `{data_type.type}` no instrument ID in `data_type` metadata",
             )
             return
 
         if data_type.type == BinanceTicker:
             await self._ws_client.unsubscribe_ticker(instrument_id.symbol.value)
+        elif data_type.type == BinanceFuturesLiquidationOrder:
+            if instrument_id:
+                await self._ws_client.unsubscribe_liquidation_orders(instrument_id.symbol.value)
+            else:
+                await self._ws_client.unsubscribe_all_liquidation_orders()
         elif data_type.type == BinanceFuturesMarkPriceUpdate:
             if not self._binance_account_type.is_futures:
                 self._log.error(

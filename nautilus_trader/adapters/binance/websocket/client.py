@@ -539,3 +539,35 @@ class BinanceWebSocketClient:
             await self._client.send_text(msgspec.json.encode(msg))
         except WebSocketClientError as e:
             self._log.error(str(e))
+
+    async def subscribe_liquidation_orders(self, symbol: str) -> None:
+        """
+        Subscribe to liquidation order stream for a symbol.
+
+        Stream Name: <symbol>@forceOrder
+        Update Speed: Real-time
+        """
+        stream = f"{BinanceSymbol(symbol).lower()}@forceOrder"
+        await self._subscribe(stream)
+
+    async def unsubscribe_liquidation_orders(self, symbol: str) -> None:
+        """
+        Unsubscribe from liquidation order stream for a symbol.
+        """
+        stream = f"{BinanceSymbol(symbol).lower()}@forceOrder"
+        await self._unsubscribe(stream)
+
+    async def subscribe_all_liquidation_orders(self) -> None:
+        """
+        Subscribe to all market liquidation order stream.
+
+        Stream Name: !forceOrder@arr
+        Update Speed: Real-time
+        """
+        await self._subscribe("!forceOrder@arr")
+
+    async def unsubscribe_all_liquidation_orders(self) -> None:
+        """
+        Unsubscribe from all market liquidation order stream.
+        """
+        await self._unsubscribe("!forceOrder@arr")

@@ -17,6 +17,9 @@ from decimal import Decimal
 
 import msgspec
 
+from nautilus_trader.adapters.binance.common.enums import BinanceEnumParser
+from nautilus_trader.adapters.binance.common.enums import BinanceOrderSide
+from nautilus_trader.adapters.binance.common.enums import BinanceOrderStatus
 from nautilus_trader.adapters.binance.common.enums import BinanceOrderType
 from nautilus_trader.adapters.binance.common.enums import BinanceTimeInForce
 from nautilus_trader.adapters.binance.common.schemas.market import BinanceExchangeFilter
@@ -33,6 +36,7 @@ from nautilus_trader.model.identifiers import TradeId
 from nautilus_trader.model.objects import Currency
 from nautilus_trader.model.objects import Price
 from nautilus_trader.model.objects import Quantity
+from nautilus_trader.adapters.binance.futures.types import BinanceFuturesLiquidationOrder
 
 
 ################################################################################
@@ -235,3 +239,54 @@ class BinanceFuturesMarkPriceMsg(msgspec.Struct, frozen=True):
 
     stream: str
     data: BinanceFuturesMarkPriceData
+
+
+class BinanceFuturesLiquidationOrderData(msgspec.Struct, frozen=True):
+    """
+    WebSocket message 'inner struct' for Binance Futures Liquidation Order events.
+    """
+
+    e: str  # Event type
+    E: int  # Event time
+    o: dict  # Order details containing:
+             # s: Symbol
+             # S: Side
+             # o: Order Type
+             # f: Time in Force
+             # q: Original Quantity
+             # p: Price
+             # ap: Average Price
+             # X: Order Status
+             # l: Order Last Filled Quantity
+             # z: Order Filled Accumulated Quantity
+             # T: Order Trade Time
+
+    def parse_to_binance_futures_liquidation_order(
+        self,
+        instrument_id: InstrumentId,
+        enum_parser: BinanceEnumParser,
+        ts_init: int,
+    ) -> BinanceFuturesLiquidationOrder:
+        return BinanceFuturesLiquidationOrder(
+            instrument_id=instrument_id,
+            order_side=enum_parser.parse_binance_order_side(BinanceOrderSide(self.o["S"])),
+            order_type=enum_parser.parse_binance_order_type(BinanceOrderType(self.o["o"])),
+            time_in_force=enum_parser.parse_binance_time_in_force(BinanceTimeInForce(self.o["f"])),
+            original_quantity=Quantity.from_str(self.o["q"]),
+            price=Price.from_str(self.o["p"]),
+            avg_price=Price.from_str(self.o["ap"]),
+            order_status=enum_parser.parse_binance_order_status(BinanceOrderStatus(self.o["X"])),
+            last_filled_quantity=Quantity.from_str(self.o["l"]),
+            accumulated_filled_quantity=Quantity.from_str(self.o["z"]),
+            ts_event=millis_to_nanos(self.E),
+            ts_init=ts_init,
+        )
+
+
+class BinanceFuturesLiquidationOrderMsg(msgspec.Struct, frozen=True):
+    """
+    WebSocket message from Binance Futures Liquidation Order events.
+    """
+
+    stream: str
+    data: BinanceFuturesLiquidationOrderData

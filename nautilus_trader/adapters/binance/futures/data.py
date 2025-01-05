@@ -110,10 +110,12 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
 
         # Register additional futures websocket handlers
         self._ws_handlers["@markPrice"] = self._handle_mark_price
+        self._ws_handlers["@forceOrder"] = self._handle_liquidation_order
 
         # Websocket msgspec decoders
         self._decoder_futures_trade_msg = msgspec.json.Decoder(BinanceFuturesTradeMsg)
         self._decoder_futures_mark_price_msg = msgspec.json.Decoder(BinanceFuturesMarkPriceMsg)
+        self._decoder_futures_liquidation_order_msg = msgspec.json.Decoder(BinanceFuturesLiquidationOrderMsg)
 
     # -- WEBSOCKET HANDLERS ---------------------------------------------------------------------------------
 
@@ -157,3 +159,37 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
         )
         generic = CustomData(data_type=data_type, data=data)
         self._handle_data(generic)
+
+    def _handle_liquidation_order(self, raw: bytes) -> None:
+        """Handle incoming liquidation order messages."""
+        msg = self._decoder_futures_liquidation_order_msg.decode(raw)
+        instrument_id: InstrumentId = self._get_cached_instrument_id(msg.data.o["s"])
+        
+        liquidation_order = msg.data.parse_to_binance_futures_liquidation_order(
+            instrument_id=instrument_id,
+            enum_parser=self._futures_enum_parser,
+            ts_init=self._clock.timestamp_ns(),
+        )
+        
+        data_type = DataType(
+            BinanceFuturesLiquidationOrder,
+            metadata={"instrument_id": instrument_id},
+        )
+        
+        custom = CustomData(data_type=data_type, data=liquidation_order)
+        self._handle_data(custom)
+
+    async def _subscribe_liquidation_orders(
+        self,
+        instrument_id: InstrumentId,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        """Subscribe to liquidation order events for a specific instrument."""
+        await self._ws_client.subscribe_liquidation_orders(instrument_id.symbol.value)
+
+    async def _subscribe_all_liquidation_orders(
+        self,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        """Subscribe to all liquidation order events."""
+        await self._ws_client.subscribe_all_liquidation_orders()
