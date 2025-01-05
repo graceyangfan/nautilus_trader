@@ -16,7 +16,7 @@
 import asyncio
 
 import msgspec
-
+from typing import Any 
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.binance.data import BinanceCommonDataClient
@@ -24,7 +24,9 @@ from nautilus_trader.adapters.binance.futures.enums import BinanceFuturesEnumPar
 from nautilus_trader.adapters.binance.futures.http.market import BinanceFuturesMarketHttpAPI
 from nautilus_trader.adapters.binance.futures.schemas.market import BinanceFuturesMarkPriceMsg
 from nautilus_trader.adapters.binance.futures.schemas.market import BinanceFuturesTradeMsg
+from nautilus_trader.adapters.binance.futures.schemas.market import BinanceFuturesLiquidationOrderMsg
 from nautilus_trader.adapters.binance.futures.types import BinanceFuturesMarkPriceUpdate
+from nautilus_trader.adapters.binance.futures.types import BinanceFuturesLiquidationOrder 
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.common.component import LiveClock
@@ -110,7 +112,7 @@ class BinanceFuturesDataClient(BinanceCommonDataClient):
 
         # Register additional futures websocket handlers
         self._ws_handlers["@markPrice"] = self._handle_mark_price
-        self._ws_handlers["@forceOrder"] = self._handle_liquidation_order
+        self._ws_handlers["forceOrder"] = self._handle_liquidation_order
 
         # Websocket msgspec decoders
         self._decoder_futures_trade_msg = msgspec.json.Decoder(BinanceFuturesTradeMsg)

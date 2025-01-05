@@ -19,6 +19,7 @@ from typing import Any
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Price
+from nautilus_trader.model.objects import Quantity
 from nautilus_trader.model.functions import order_side_to_str
 from nautilus_trader.model.functions import order_side_from_str
 from nautilus_trader.model.functions import order_type_to_str

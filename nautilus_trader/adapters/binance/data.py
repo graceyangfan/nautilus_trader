@@ -37,6 +37,7 @@ from nautilus_trader.adapters.binance.common.types import BinanceBar
 from nautilus_trader.adapters.binance.common.types import BinanceTicker
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.binance.futures.types import BinanceFuturesMarkPriceUpdate
+from nautilus_trader.adapters.binance.futures.types import BinanceFuturesLiquidationOrder  
 from nautilus_trader.adapters.binance.http.client import BinanceHttpClient
 from nautilus_trader.adapters.binance.http.error import BinanceError
 from nautilus_trader.adapters.binance.http.market import BinanceMarketHttpAPI
@@ -278,7 +279,7 @@ class BinanceCommonDataClient(LiveMarketDataClient):
 
     async def _subscribe(self, data_type: DataType, params: dict[str, Any] | None = None) -> None:
         instrument_id: InstrumentId | None = data_type.metadata.get("instrument_id")
-        if instrument_id is None:
+        if instrument_id is None and data_type.type != BinanceFuturesLiquidationOrder:
             self._log.error(
                 f"Cannot subscribe to `{data_type.type}` no instrument ID in `data_type` metadata",
             )
