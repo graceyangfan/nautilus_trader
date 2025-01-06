@@ -15,6 +15,7 @@
 
 from decimal import Decimal
 from typing import Any
+import pyarrow as pa
 
 from nautilus_trader.core.data import Data
 from nautilus_trader.model.identifiers import InstrumentId
@@ -26,6 +27,8 @@ from nautilus_trader.model.functions import order_type_to_str
 from nautilus_trader.model.functions import order_type_from_str
 from nautilus_trader.model.functions import time_in_force_to_str
 from nautilus_trader.model.functions import time_in_force_from_str
+from nautilus_trader.model.functions import order_status_from_str
+from nautilus_trader.model.functions import order_status_to_str
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
@@ -242,7 +245,7 @@ class BinanceFuturesLiquidationOrder(Data):
             f"original_quantity={self.original_quantity}, "
             f"price={self.price}, "
             f"avg_price={self.avg_price}, "
-            f"order_status={self.order_status}, "
+            f"order_status={order_side_to_str(self.order_status)}, "
             f"last_filled_quantity={self.last_filled_quantity}, "
             f"accumulated_filled_quantity={self.accumulated_filled_quantity}, "
             f"ts_event={self.ts_event}, "
@@ -270,7 +273,7 @@ class BinanceFuturesLiquidationOrder(Data):
             original_quantity=Quantity.from_str(values["original_quantity"]),
             price=Price.from_str(values["price"]),
             avg_price=Price.from_str(values["avg_price"]),
-            order_status=values["order_status"],
+            order_status=order_status_from_str(values["order_status"]),
             last_filled_quantity=Quantity.from_str(values["last_filled_quantity"]),
             accumulated_filled_quantity=Quantity.from_str(values["accumulated_filled_quantity"]),
             ts_event=values["ts_event"],
@@ -291,9 +294,36 @@ class BinanceFuturesLiquidationOrder(Data):
             "original_quantity": str(obj.original_quantity),
             "price": str(obj.price),
             "avg_price": str(obj.avg_price),
-            "order_status": obj.order_status,
+            "order_status": order_status_to_str(obj.order_status),
             "last_filled_quantity": str(obj.last_filled_quantity),
             "accumulated_filled_quantity": str(obj.accumulated_filled_quantity),
             "ts_event": obj.ts_event,
             "ts_init": obj.ts_init,
         }
+
+    @classmethod
+    def schema(cls):
+        return pa.schema(
+            {
+                "instrument_id": pa.string(),
+                "order_side": pa.dictionary(pa.int8(), pa.string()),
+                "order_type": pa.dictionary(pa.int8(), pa.string()),
+                "time_in_force": pa.dictionary(pa.int8(), pa.string()),
+                "original_quantity": pa.string(),
+                "price": pa.string(),
+                "avg_price": pa.string(),
+                "order_status": pa.dictionary(pa.int8(), pa.string()),
+                "last_filled_quantity": pa.string(),
+                "accumulated_filled_quantity": pa.string(),
+                "ts_event": pa.uint64(),
+                "ts_init": pa.uint64(),
+            }
+        )
+    @staticmethod
+    def to_catalog(obj: "BinanceFuturesLiquidationOrder"):
+        return pa.RecordBatch.from_pylist([BinanceFuturesLiquidationOrder.to_dict(obj)], schema=BinanceFuturesLiquidationOrder.schema())
+
+    @classmethod
+    def from_catalog(cls, table: pa.Table):
+        return [BinanceFuturesLiquidationOrder.from_dict(d) for d in table.to_pylist()] 
+
