@@ -27,12 +27,13 @@ from nautilus_trader.model.functions import order_type_to_str
 from nautilus_trader.model.functions import order_type_from_str
 from nautilus_trader.model.functions import time_in_force_to_str
 from nautilus_trader.model.functions import time_in_force_from_str
-from nautilus_trader.model.functions import order_status_from_str
-from nautilus_trader.model.functions import order_status_to_str
+from nautilus_trader.model.enums import order_status_from_str
+from nautilus_trader.model.enums import order_status_to_str
 from nautilus_trader.model.enums import OrderSide
 from nautilus_trader.model.enums import OrderType
 from nautilus_trader.model.enums import TimeInForce
 from nautilus_trader.model.enums import OrderStatus
+
 
 
 class BinanceFuturesMarkPriceUpdate(Data):
@@ -236,6 +237,7 @@ class BinanceFuturesLiquidationOrder(Data):
         self._ts_init = ts_init
 
     def __repr__(self) -> str:
+        order_status = order_status_to_str(self.order_status)
         return (
             f"{type(self).__name__}("
             f"instrument_id={self.instrument_id}, "
@@ -245,7 +247,7 @@ class BinanceFuturesLiquidationOrder(Data):
             f"original_quantity={self.original_quantity}, "
             f"price={self.price}, "
             f"avg_price={self.avg_price}, "
-            f"order_status={order_side_to_str(self.order_status)}, "
+            f"order_status={order_status}, "
             f"last_filled_quantity={self.last_filled_quantity}, "
             f"accumulated_filled_quantity={self.accumulated_filled_quantity}, "
             f"ts_event={self.ts_event}, "
@@ -326,4 +328,3 @@ class BinanceFuturesLiquidationOrder(Data):
     @classmethod
     def from_catalog(cls, table: pa.Table):
         return [BinanceFuturesLiquidationOrder.from_dict(d) for d in table.to_pylist()] 
-
