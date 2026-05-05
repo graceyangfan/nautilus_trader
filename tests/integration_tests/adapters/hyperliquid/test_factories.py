@@ -69,6 +69,7 @@ class TestHyperliquidDataClientConfig:
             product_types=(
                 HyperliquidProductType.PERP,
                 HyperliquidProductType.PERP_HIP3,
+                HyperliquidProductType.OUTCOME,
             ),
         )
 
@@ -76,6 +77,7 @@ class TestHyperliquidDataClientConfig:
         assert config.product_types == (
             HyperliquidProductType.PERP,
             HyperliquidProductType.PERP_HIP3,
+            HyperliquidProductType.OUTCOME,
         )
 
 
@@ -159,6 +161,7 @@ class TestHyperliquidExecClientConfig:
             product_types=(
                 HyperliquidProductType.PERP,
                 HyperliquidProductType.PERP_HIP3,
+                HyperliquidProductType.OUTCOME,
             ),
         )
 
@@ -166,6 +169,7 @@ class TestHyperliquidExecClientConfig:
         assert config.product_types == (
             HyperliquidProductType.PERP,
             HyperliquidProductType.PERP_HIP3,
+            HyperliquidProductType.OUTCOME,
         )
 
 

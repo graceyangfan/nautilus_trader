@@ -868,6 +868,8 @@ pub enum HyperliquidInfoRequestType {
     UserFees,
     /// Get metadata for all perp dexes (standard + HIP-3).
     AllPerpMetas,
+    /// Get outcome (prediction) market metadata.
+    OutcomeMeta,
 }
 
 impl HyperliquidInfoRequestType {
@@ -903,6 +905,7 @@ impl HyperliquidInfoRequestType {
             Self::ValidatorStats => "validatorStats",
             Self::UserFees => "userFees",
             Self::AllPerpMetas => "allPerpMetas",
+            Self::OutcomeMeta => "outcomeMeta",
         }
     }
 }
@@ -953,6 +956,8 @@ pub enum HyperliquidProductType {
     Perp,
     /// Spot markets.
     Spot,
+    /// Outcome (prediction) markets.
+    Outcome,
 }
 
 impl HyperliquidProductType {
@@ -966,6 +971,8 @@ impl HyperliquidProductType {
             Ok(Self::Perp)
         } else if symbol.ends_with("-SPOT") {
             Ok(Self::Spot)
+        } else if symbol.ends_with("-OUTCOME") {
+            Ok(Self::Outcome)
         } else {
             anyhow::bail!("Invalid Hyperliquid symbol format: {symbol}")
         }
