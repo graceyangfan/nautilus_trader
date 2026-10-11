@@ -33,8 +33,8 @@ use nautilus_common::{
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{
         BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
-        ExecutionActionResult, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
-        TradingCommand,
+        ExecutionAction, ExecutionActionResult, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+        SubmitOrderList, TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
     timer::TimeEvent,
@@ -1282,7 +1282,7 @@ pub trait Strategy: DataActor {
         Ok(())
     }
 
-    /// Executes an adapter-defined action through the execution client.
+    /// Executes an action through the execution client.
     ///
     /// Returns the generated command ID. The execution client later delivers
     /// one [`ExecutionActionResult`] through [`Self::on_execution_action_result`].
@@ -1290,15 +1290,15 @@ pub trait Strategy: DataActor {
     /// # Errors
     ///
     /// Returns an error if the strategy is not registered.
-    fn execute_action(
+    fn execute_action<A>(
         &mut self,
         account_id: AccountId,
         client_id: Option<ClientId>,
-        action: impl Into<String>,
-        params: Option<Params>,
+        action: A,
     ) -> anyhow::Result<UUID4>
     where
         Self: StrategyNative,
+        A: Into<ExecutionAction>,
     {
         let core = StrategyNative::strategy_core_mut(self);
         let trader_id = registered_trader_id(core)?;
@@ -1310,10 +1310,9 @@ pub trait Strategy: DataActor {
             client_id,
             strategy_id,
             account_id,
-            action,
+            action.into(),
             command_id,
             ts_init,
-            params,
             None, // correlation_id
         );
 

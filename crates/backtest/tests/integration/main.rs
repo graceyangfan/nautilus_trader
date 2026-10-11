@@ -25,6 +25,7 @@ mod exchange;
 mod fee_model;
 mod grid_mm;
 mod grid_mm_itch;
+mod hip4_outcome_actions;
 mod netting_fill_void;
 mod option_chain_backtest;
 mod option_chain_data_client;

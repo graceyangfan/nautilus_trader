@@ -23,11 +23,15 @@ use nautilus_common::{
     clients::ExecutionClient,
     clock::Clock,
     factories::OrderEventFactory,
-    messages::execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+    messages::{
+        ExecutionEvent,
+        execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
+            ExecutionActionResult, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+            SubmitOrderList, TradingCommand,
+        },
     },
-    msgbus::{self, MessagingSwitchboard},
+    msgbus::{self, MessagingSwitchboard, switchboard},
 };
 use nautilus_core::{Params, UnixNanos, WeakCell};
 use nautilus_execution::client::core::ExecutionClientCore;
@@ -55,13 +59,13 @@ pub struct BacktestExecutionClient {
     cache: Rc<RefCell<Cache>>,
     clock: Rc<RefCell<dyn Clock>>,
     exchange: WeakCell<SimulatedExchange>,
-    /// Buffered order events for deferred processing.
+    /// Buffered execution events for deferred processing.
     ///
     /// Events like `OrderSubmitted` cannot be sent synchronously through
     /// the msgbus during `submit_order` because the exec engine holds a
     /// borrow via its `execute` handler. Instead, events are buffered here
     /// and drained by the engine after the execute borrow is released.
-    queued_events: Rc<RefCell<Vec<OrderEventAny>>>,
+    queued_events: Rc<RefCell<Vec<ExecutionEvent>>>,
     routing: bool,
     _frozen_account: bool,
 }
@@ -122,18 +126,39 @@ impl BacktestExecutionClient {
         Ok(self.cache.borrow().try_order_owned(&client_order_id)?)
     }
 
-    /// Drain buffered order events, sending each to the exec engine.
+    /// Drains buffered execution events in their venue emission order.
     pub fn drain_queued_events(&self) {
-        let events: Vec<OrderEventAny> = self.queued_events.borrow_mut().drain(..).collect();
+        let events: Vec<ExecutionEvent> = self.queued_events.borrow_mut().drain(..).collect();
         let endpoint = MessagingSwitchboard::exec_engine_process();
+
         for event in events {
-            msgbus::send_order_event(endpoint, event);
+            match event {
+                ExecutionEvent::Order(event) => msgbus::send_order_event(endpoint, event),
+                ExecutionEvent::Action(result) => {
+                    let topic = switchboard::get_execution_action_result_topic(result.strategy_id);
+                    msgbus::publish_execution_action_result(topic, &result);
+                }
+                _ => unreachable!("Backtest execution client queued an unsupported event"),
+            }
         }
     }
 
     pub(crate) fn order_event_handler(&self) -> Rc<dyn Fn(OrderEventAny)> {
         let queued_events = Rc::clone(&self.queued_events);
-        Rc::new(move |event| queued_events.borrow_mut().push(event))
+        Rc::new(move |event| {
+            queued_events
+                .borrow_mut()
+                .push(ExecutionEvent::Order(event));
+        })
+    }
+
+    pub(crate) fn execution_action_result_handler(&self) -> Rc<dyn Fn(ExecutionActionResult)> {
+        let queued_events = Rc::clone(&self.queued_events);
+        Rc::new(move |result| {
+            queued_events
+                .borrow_mut()
+                .push(ExecutionEvent::Action(result));
+        })
     }
 }
 
@@ -192,19 +217,37 @@ impl ExecutionClient for BacktestExecutionClient {
         Ok(())
     }
 
+    fn reset(&mut self) -> anyhow::Result<()> {
+        self.queued_events.borrow_mut().clear();
+        Ok(())
+    }
+
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         // Buffer the OrderSubmitted event for deferred processing to avoid
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
         let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
-        self.queued_events.borrow_mut().push(event);
+        self.queued_events
+            .borrow_mut()
+            .push(ExecutionEvent::Order(event));
 
         if let Some(exchange) = self.exchange.upgrade() {
             exchange.borrow_mut().send(TradingCommand::SubmitOrder(cmd));
         } else {
             log::error!("submit_order: SimulatedExchange has been dropped");
         }
+        Ok(())
+    }
+
+    fn execute_action(&self, cmd: ExecuteAction) -> anyhow::Result<()> {
+        let exchange = self
+            .exchange
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("SimulatedExchange has been dropped"))?;
+        exchange
+            .borrow_mut()
+            .send(TradingCommand::ExecuteAction(cmd));
         Ok(())
     }
 
@@ -221,7 +264,7 @@ impl ExecutionClient for BacktestExecutionClient {
 
         for order in &orders {
             let event = self.factory.generate_order_submitted(order, ts_init);
-            queued.push(event);
+            queued.push(ExecutionEvent::Order(event));
         }
         drop(queued);
 
@@ -299,7 +342,13 @@ impl ExecutionClient for BacktestExecutionClient {
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::{clock::VirtualClock, messages::execution::QueryOrder};
+    use nautilus_common::{
+        clock::VirtualClock,
+        messages::execution::{
+            BinaryOptionAction, BinaryOptionPair, ExecuteAction, ExecutionAction,
+            ExecutionActionStatus, QueryOrder,
+        },
+    };
     use nautilus_core::{DurationNanos, UUID4};
     use nautilus_execution::models::{
         fee::{FeeModelAny, MakerTakerFeeModel},
@@ -309,7 +358,7 @@ mod tests {
         enums::{AccountType, BookType, OmsType},
         identifiers::{InstrumentId, StrategyId},
         stubs::TestDefault,
-        types::{Currency, Money},
+        types::{Currency, Money, Quantity},
     };
     use rstest::rstest;
 
@@ -332,6 +381,7 @@ mod tests {
             .book_type(BookType::L2_MBP)
             .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
             .latency_model(LatencyModelHandle::new(latency_model))
+            .use_message_queue(false)
             .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
             .build()
             .unwrap();
@@ -374,6 +424,27 @@ mod tests {
             UUID4::new(),
             UnixNanos::default(),
             None,
+            None,
+        )
+    }
+
+    fn execute_action() -> ExecuteAction {
+        ExecuteAction::new(
+            TraderId::test_default(),
+            None,
+            StrategyId::test_default(),
+            AccountId::test_default(),
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.SIM"),
+                    InstrumentId::from("42-NO-OUTCOME.SIM"),
+                )
+                .unwrap(),
+                quantity: Quantity::from("1"),
+                params: None,
+            }),
+            UUID4::new(),
+            UnixNanos::default(),
             None,
         )
     }
@@ -421,5 +492,47 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(exchange_ref.max_inflight_command_ts(), None);
+    }
+
+    #[rstest]
+    fn test_execute_action_is_forwarded_to_simulated_exchange() {
+        let (client, exchange) = setup_client_with_latency();
+        let action = execute_action();
+        exchange
+            .borrow_mut()
+            .set_execution_action_result_handler(client.execution_action_result_handler());
+
+        client.execute_action(action.clone()).unwrap();
+
+        let queued_events = client.queued_events.borrow();
+        assert_eq!(queued_events.len(), 1);
+        let ExecutionEvent::Action(result) = &queued_events[0] else {
+            panic!("Expected an execution action result")
+        };
+        assert_eq!(result.command_id, action.command_id);
+        assert_eq!(result.status, ExecutionActionStatus::Rejected);
+        assert_eq!(
+            result.reason.as_deref(),
+            Some("Simulated exchange does not support execution actions")
+        );
+    }
+
+    #[rstest]
+    fn test_reset_discards_queued_execution_action_result() {
+        let (mut client, _) = setup_client_with_latency();
+        let action = execute_action();
+
+        client.execution_action_result_handler()(ExecutionActionResult::new(
+            &action,
+            ExecutionActionStatus::Accepted,
+            None,
+            None,
+            UnixNanos::default(),
+        ));
+        assert_eq!(client.queued_events.borrow().len(), 1);
+
+        client.reset().unwrap();
+
+        assert!(client.queued_events.borrow().is_empty());
     }
 }

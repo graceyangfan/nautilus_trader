@@ -310,6 +310,9 @@ impl BacktestEngine {
                 .borrow_mut()
                 .set_event_handler(exec_client.order_event_handler());
         }
+        exchange
+            .borrow_mut()
+            .set_execution_action_result_handler(exec_client.execution_action_result_handler());
 
         exchange
             .borrow_mut()
@@ -2483,7 +2486,11 @@ mod tests {
         enums::Environment,
         messages::{
             data::{DataCommand, UnsubscribeCommand},
-            execution::{BatchModifyOrders, ModifyOrder, SubmitOrder, TradingCommand},
+            execution::{
+                BatchModifyOrders, BinaryOptionAction, BinaryOptionPair, ExecuteAction,
+                ExecutionAction, ExecutionActionResult, ExecutionActionStatus, ModifyOrder,
+                SubmitOrder, TradingCommand,
+            },
         },
         msgbus::{
             self, MessagingSwitchboard, TypedHandler,
@@ -2492,9 +2499,17 @@ mod tests {
     };
     use nautilus_execution::{
         engine::{SnapshotAnchorer, stubs::StubExecutionClient},
-        models::fee::{FeeModelAny, MakerTakerFeeModel},
+        models::{
+            fee::{FeeModelAny, MakerTakerFeeModel},
+            latency::{LatencyModelHandle, StaticLatencyModel},
+            outcome_action::{
+                BinaryOptionActionConfig, BinaryOptionActionProfile, BinaryOptionActionValidator,
+                BinaryOptionActionValidatorHandle,
+            },
+        },
     };
     use nautilus_model::{
+        accounts::Account,
         data::{Data, InstrumentStatus, QuoteTick},
         enums::{
             AccountType, BookType, ContingencyType, LiquiditySide, MarketStatus,
@@ -2502,15 +2517,20 @@ mod tests {
             TriggerType,
         },
         events::OrderEventAny,
-        identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
+        identifiers::{
+            AccountId, ActorId, ClientId, ClientOrderId, InstrumentId, PositionId, StrategyId,
+            Venue,
+        },
         instruments::{
-            CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
+            CryptoPerpetual, Instrument, InstrumentAny,
+            stubs::{binary_option, crypto_perpetual_ethusdt},
         },
         orders::{
             Order, OrderAny, OrderTestBuilder,
             stubs::{OrderFilledTestBuilder, TestOrderEventStubs},
         },
-        types::{Money, Price, Quantity},
+        stubs::TestDefault,
+        types::{Currency, Money, Price, Quantity},
     };
     use nautilus_system::{KernelEventStore, RegisteredComponents};
     use nautilus_testkit::{
@@ -2522,6 +2542,8 @@ mod tests {
         strategy::{config::StrategyConfig, core::StrategyCore},
     };
     use rstest::*;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use ustr::Ustr;
 
     use super::*;
@@ -2895,6 +2917,450 @@ mod tests {
 
     fn send_execution_command(command: TradingCommand) {
         msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), command);
+    }
+
+    #[derive(Debug)]
+    struct TestBinaryOptionActionValidator;
+
+    impl BinaryOptionActionValidator for TestBinaryOptionActionValidator {
+        fn validate(&self, action: &BinaryOptionAction, _cache: &Cache) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                action.pair()
+                    == BinaryOptionPair::new(
+                        InstrumentId::from("42-YES-OUTCOME.SIM"),
+                        InstrumentId::from("42-NO-OUTCOME.SIM"),
+                    )?,
+                "Unsupported test binary option pair"
+            );
+            Ok(())
+        }
+    }
+
+    fn test_binary_option_action_profile() -> BinaryOptionActionProfile {
+        test_binary_option_action_profile_with_fee_rates(Decimal::ZERO, Decimal::ZERO)
+    }
+
+    fn test_binary_option_action_profile_with_fee_rates(
+        split_fee_rate: Decimal,
+        merge_fee_rate: Decimal,
+    ) -> BinaryOptionActionProfile {
+        BinaryOptionActionProfile::new(
+            BinaryOptionActionConfig::new(split_fee_rate, merge_fee_rate).unwrap(),
+            BinaryOptionActionValidatorHandle::new(TestBinaryOptionActionValidator),
+        )
+    }
+
+    fn create_binary_option_action_engine(starting_balance: Money) -> BacktestEngine {
+        create_binary_option_action_engine_with_profile(
+            starting_balance,
+            test_binary_option_action_profile(),
+        )
+    }
+
+    fn create_binary_option_action_engine_with_profile(
+        starting_balance: Money,
+        profile: BinaryOptionActionProfile,
+    ) -> BacktestEngine {
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![starting_balance])
+            .binary_option_action_profile(profile)
+            .use_message_queue(false)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        create_binary_option_action_engine_with_config(venue_config)
+    }
+
+    fn create_binary_option_action_engine_with_latency(
+        starting_balance: Money,
+        insert_latency: DurationNanos,
+    ) -> BacktestEngine {
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![starting_balance])
+            .binary_option_action_profile(test_binary_option_action_profile())
+            .latency_model(LatencyModelHandle::new(StaticLatencyModel::new(
+                DurationNanos::default(),
+                insert_latency,
+                DurationNanos::default(),
+                DurationNanos::default(),
+            )))
+            .use_message_queue(true)
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .build()
+            .unwrap();
+        create_binary_option_action_engine_with_config(venue_config)
+    }
+
+    fn create_binary_option_action_engine_with_config(
+        venue_config: SimulatedVenueConfig,
+    ) -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        engine.add_venue(venue_config).unwrap();
+
+        let mut yes = binary_option();
+        yes.id = InstrumentId::from("42-YES-OUTCOME.SIM");
+        yes.expiration_ns = UnixNanos::from(1_000);
+        let mut no = yes.clone();
+        no.id = InstrumentId::from("42-NO-OUTCOME.SIM");
+        engine
+            .add_instrument(&InstrumentAny::BinaryOption(yes))
+            .unwrap();
+        engine
+            .add_instrument(&InstrumentAny::BinaryOption(no))
+            .unwrap();
+        engine
+            .venues
+            .get(&Venue::from("SIM"))
+            .unwrap()
+            .borrow_mut()
+            .initialize_account();
+        engine
+    }
+
+    fn binary_option_action(strategy_id: StrategyId, action: &str) -> ExecuteAction {
+        let pair = BinaryOptionPair::new(
+            InstrumentId::from("42-YES-OUTCOME.SIM"),
+            InstrumentId::from("42-NO-OUTCOME.SIM"),
+        )
+        .unwrap();
+        let action = match action {
+            "test.binary_option.split" => BinaryOptionAction::Split {
+                pair,
+                quantity: Quantity::from("1.25"),
+                params: None,
+            },
+            "test.binary_option.merge" => BinaryOptionAction::Merge {
+                pair,
+                quantity: Quantity::from("1.25"),
+                params: None,
+            },
+            _ => panic!("Unsupported test binary option action: {action}"),
+        };
+        ExecuteAction::new(
+            TraderId::test_default(),
+            Some(ClientId::from("SIM")),
+            strategy_id,
+            AccountId::from("SIM-001"),
+            ExecutionAction::BinaryOption(action),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )
+    }
+
+    #[rstest]
+    fn test_binary_option_actions_update_state_before_accepted_result() {
+        let engine = create_binary_option_action_engine(Money::from("100 USDC"));
+        let strategy_id = StrategyId::from("BINARY-ACTION-001");
+        let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+        let observed = Rc::new(RefCell::new(Vec::<(Money, usize)>::new()));
+        let cache = Rc::clone(&engine.kernel.cache);
+
+        msgbus::subscribe_execution_action_results(
+            nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id)
+                .into(),
+            TypedHandler::from({
+                let results = Rc::clone(&results);
+                let observed = Rc::clone(&observed);
+                move |result: &ExecutionActionResult| {
+                    let cache = cache.borrow();
+                    let balance = cache
+                        .account(&AccountId::from("SIM-001"))
+                        .and_then(|account| account.balance_total(Some(Currency::USDC())))
+                        .unwrap();
+                    let position_count = cache
+                        .positions_open_refs(
+                            Some(&Venue::from("SIM")),
+                            None,
+                            Some(&strategy_id),
+                            Some(&AccountId::from("SIM-001")),
+                            None,
+                        )
+                        .len();
+                    observed.borrow_mut().push((balance, position_count));
+                    results.borrow_mut().push(result.clone());
+                }
+            }),
+            None,
+        );
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.split",
+        )));
+        engine.drain_command_queues().unwrap();
+
+        {
+            let cache = engine.kernel.cache.borrow();
+            assert_eq!(
+                cache
+                    .account(&AccountId::from("SIM-001"))
+                    .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+                Some(Money::from("98.75 USDC"))
+            );
+            assert_eq!(
+                cache
+                    .positions_open_refs(
+                        Some(&Venue::from("SIM")),
+                        None,
+                        Some(&strategy_id),
+                        Some(&AccountId::from("SIM-001")),
+                        None,
+                    )
+                    .len(),
+                2
+            );
+            assert_eq!(cache.orders_total_count(None, None, None, None, None), 0);
+        }
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.merge",
+        )));
+        engine.drain_command_queues().unwrap();
+
+        assert_eq!(
+            results
+                .borrow()
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ExecutionActionStatus::Accepted,
+                ExecutionActionStatus::Accepted
+            ]
+        );
+        assert_eq!(
+            *observed.borrow(),
+            vec![(Money::from("98.75 USDC"), 2), (Money::from("100 USDC"), 0)]
+        );
+        let cache = engine.kernel.cache.borrow();
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-001"))
+                .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+            Some(Money::from("100 USDC"))
+        );
+        assert!(
+            cache
+                .positions_open_refs(
+                    Some(&Venue::from("SIM")),
+                    None,
+                    Some(&strategy_id),
+                    Some(&AccountId::from("SIM-001")),
+                    None,
+                )
+                .is_empty()
+        );
+        assert_eq!(cache.orders_total_count(None, None, None, None, None), 0);
+    }
+
+    #[rstest]
+    fn test_binary_option_actions_apply_configured_fees() {
+        let engine = create_binary_option_action_engine_with_profile(
+            Money::from("100 USDC"),
+            test_binary_option_action_profile_with_fee_rates(dec!(0.01), dec!(0.02)),
+        );
+        let strategy_id = StrategyId::from("BINARY-ACTION-FEES");
+        let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+
+        msgbus::subscribe_execution_action_results(
+            nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id)
+                .into(),
+            TypedHandler::from({
+                let results = Rc::clone(&results);
+                move |result: &ExecutionActionResult| results.borrow_mut().push(result.clone())
+            }),
+            None,
+        );
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.split",
+        )));
+        engine.drain_command_queues().unwrap();
+
+        let cache = engine.kernel.cache.borrow();
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-001"))
+                .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+            Some(Money::from("98.7375 USDC"))
+        );
+        drop(cache);
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.merge",
+        )));
+        engine.drain_command_queues().unwrap();
+
+        assert_eq!(
+            results
+                .borrow()
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>(),
+            vec![
+                ExecutionActionStatus::Accepted,
+                ExecutionActionStatus::Accepted
+            ]
+        );
+        assert_eq!(
+            engine
+                .kernel
+                .cache
+                .borrow()
+                .account(&AccountId::from("SIM-001"))
+                .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+            Some(Money::from("99.9625 USDC"))
+        );
+    }
+
+    #[rstest]
+    fn test_binary_option_action_rejection_does_not_mutate_state() {
+        let engine = create_binary_option_action_engine(Money::from("1 USDC"));
+        let strategy_id = StrategyId::from("BINARY-ACTION-001");
+        let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+
+        msgbus::subscribe_execution_action_results(
+            nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id)
+                .into(),
+            TypedHandler::from({
+                let results = Rc::clone(&results);
+                move |result: &ExecutionActionResult| results.borrow_mut().push(result.clone())
+            }),
+            None,
+        );
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.split",
+        )));
+        engine.drain_command_queues().unwrap();
+
+        assert_eq!(results.borrow().len(), 1);
+        assert_eq!(results.borrow()[0].status, ExecutionActionStatus::Rejected);
+        assert_eq!(
+            results.borrow()[0].reason.as_deref(),
+            Some("Insufficient free USDC balance for split")
+        );
+        let cache = engine.kernel.cache.borrow();
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-001"))
+                .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+            Some(Money::from("1 USDC"))
+        );
+        assert!(
+            cache
+                .positions_open_refs(
+                    Some(&Venue::from("SIM")),
+                    None,
+                    Some(&strategy_id),
+                    Some(&AccountId::from("SIM-001")),
+                    None,
+                )
+                .is_empty()
+        );
+        assert_eq!(cache.orders_total_count(None, None, None, None, None), 0);
+    }
+
+    #[rstest]
+    fn test_binary_option_action_respects_insert_latency() {
+        let engine = create_binary_option_action_engine_with_latency(
+            Money::from("100 USDC"),
+            DurationNanos::new(10),
+        );
+        let strategy_id = StrategyId::from("BINARY-ACTION-001");
+        let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+
+        msgbus::subscribe_execution_action_results(
+            nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id)
+                .into(),
+            TypedHandler::from({
+                let results = Rc::clone(&results);
+                move |result: &ExecutionActionResult| results.borrow_mut().push(result.clone())
+            }),
+            None,
+        );
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.split",
+        )));
+        engine.drain_command_queues().unwrap();
+        engine
+            .settle_venues(UnixNanos::from(9), SettlementScope::All)
+            .unwrap();
+
+        assert!(results.borrow().is_empty());
+        let cache = engine.kernel.cache.borrow();
+        assert_eq!(
+            cache
+                .account(&AccountId::from("SIM-001"))
+                .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+            Some(Money::from("100 USDC"))
+        );
+        assert!(
+            cache
+                .positions_open_refs(
+                    Some(&Venue::from("SIM")),
+                    None,
+                    Some(&strategy_id),
+                    Some(&AccountId::from("SIM-001")),
+                    None,
+                )
+                .is_empty()
+        );
+        drop(cache);
+
+        engine
+            .settle_venues(UnixNanos::from(10), SettlementScope::All)
+            .unwrap();
+
+        assert_eq!(results.borrow().len(), 1);
+        assert_eq!(results.borrow()[0].status, ExecutionActionStatus::Accepted);
+    }
+
+    #[rstest]
+    fn test_reset_discards_delayed_binary_option_action() {
+        let mut engine = create_binary_option_action_engine_with_latency(
+            Money::from("100 USDC"),
+            DurationNanos::new(10),
+        );
+        let strategy_id = StrategyId::from("BINARY-ACTION-001");
+        let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+
+        msgbus::subscribe_execution_action_results(
+            nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id)
+                .into(),
+            TypedHandler::from({
+                let results = Rc::clone(&results);
+                move |result: &ExecutionActionResult| results.borrow_mut().push(result.clone())
+            }),
+            None,
+        );
+
+        send_execution_command(TradingCommand::ExecuteAction(binary_option_action(
+            strategy_id,
+            "test.binary_option.split",
+        )));
+        engine.drain_command_queues().unwrap();
+        engine.reset().unwrap();
+        engine
+            .settle_venues(UnixNanos::from(10), SettlementScope::All)
+            .unwrap();
+
+        assert!(results.borrow().is_empty());
     }
 
     #[rstest]

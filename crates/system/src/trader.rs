@@ -2473,7 +2473,7 @@ mod tests {
                 client_id: Some(ClientId::from("HYPERLIQUID")),
                 strategy_id,
                 account_id: AccountId::from("HYPERLIQUID-001"),
-                action: "hyperliquid.user_outcome.split".to_string(),
+                action: "binary_option.split".to_string(),
                 command_id: UUID4::new(),
                 status: ExecutionActionStatus::Accepted,
                 reason: None,

@@ -36,6 +36,7 @@ python = [
   "dep:nautilus-system",
   "nautilus-common/python",
   "nautilus-core/python",
+  "nautilus-execution/python",
   "nautilus-live/python",
   "nautilus-model/python",
   "nautilus-network/python",
@@ -57,6 +58,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 nautilus-common = { workspace = true, features = ["live"] }
 nautilus-core = { workspace = true }
+nautilus-execution = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true, features = ["transport-sockudo"] }

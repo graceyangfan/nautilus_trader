@@ -33,6 +33,7 @@ use nautilus_execution::{
         fee::{FeeModelAny, FeeModelHandle},
         fill::{FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, LatencyModelHandle},
+        outcome_action::BinaryOptionActionProfile,
     },
 };
 use nautilus_model::{
@@ -297,6 +298,12 @@ pub struct SimulatedVenueConfig {
     /// Missing configuration must not silently turn a fee-paying replay into
     /// a zero-fee replay.
     pub fee_model: FeeModelHandle,
+    /// The optional profile for simulating venue-owned binary-option actions.
+    ///
+    /// When configured, actions are resolved by the profile's venue-specific resolver and
+    /// executed as two orderless fill events. This requires a mutable cash account and netting
+    /// position management.
+    pub binary_option_action_profile: Option<BinaryOptionActionProfile>,
     /// The optional model used to simulate command latency.
     pub latency_model: Option<LatencyModelHandle>,
     /// If the execution client supports routing orders to other venues.
@@ -424,6 +431,30 @@ impl SimulatedVenueConfig {
                 ),
             ),
         );
+
+        if self.binary_option_action_profile.is_some() {
+            errors.check(
+                self.account_type == AccountType::Cash,
+                ConfigError::invalid_value(
+                    "binary_option_action_profile",
+                    "requires account_type=Cash",
+                ),
+            );
+            errors.check(
+                self.oms_type == OmsType::Netting,
+                ConfigError::invalid_value(
+                    "binary_option_action_profile",
+                    "requires oms_type=Netting",
+                ),
+            );
+            errors.check(
+                !self.frozen_account,
+                ConfigError::invalid_value(
+                    "binary_option_action_profile",
+                    "requires frozen_account=false",
+                ),
+            );
+        }
 
         errors.into_result()
     }
@@ -1569,6 +1600,7 @@ mod tests {
     fn test_minimal_sim_config_is_valid() {
         let config = minimal_sim_builder!().build().unwrap();
         assert!(config.defer_option_settlement);
+        assert!(config.binary_option_action_profile.is_none());
     }
 
     #[rstest]

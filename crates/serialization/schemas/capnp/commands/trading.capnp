@@ -245,17 +245,40 @@ struct QueryAccount {
     causationId @6 :Base.UUID4;  # Optional
 }
 
+struct BinaryOptionPair {
+    yesInstrumentId @0 :Identifiers.InstrumentId;
+    noInstrumentId @1 :Identifiers.InstrumentId;
+}
+
+struct BinaryOptionSplitAction {
+    pair @0 :BinaryOptionPair;
+    quantity @1 :Types.Quantity;
+    params @2 :Base.StringMap;
+}
+
+struct BinaryOptionMergeAction {
+    pair @0 :BinaryOptionPair;
+    quantity @1 :Types.Quantity;
+    params @2 :Base.StringMap;
+}
+
+struct BinaryOptionAction {
+    union {
+        split @0 :BinaryOptionSplitAction;
+        merge @1 :BinaryOptionMergeAction;
+    }
+}
+
 struct ExecuteAction {
     traderId @0 :Identifiers.TraderId;
     clientId @1 :Identifiers.ClientId;  # Optional
     strategyId @2 :Identifiers.StrategyId;
     accountId @3 :Identifiers.AccountId;
-    action @4 :Text;
+    action @4 :BinaryOptionAction;
     commandId @5 :Base.UUID4;
     tsInit @6 :Base.UnixNanos;
-    params @7 :Base.StringMap;
-    correlationId @8 :Base.UUID4;  # Optional
-    causationId @9 :Base.UUID4;  # Optional
+    correlationId @7 :Base.UUID4;  # Optional
+    causationId @8 :Base.UUID4;  # Optional
 }
 
 # Execution report commands

@@ -248,7 +248,7 @@ pub trait ExecutionClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the client does not support the action or cannot
+    /// Returns an error if the client does not support the action or cannot
     /// schedule its delivery.
     fn execute_action(&self, cmd: ExecuteAction) -> anyhow::Result<()> {
         Err(anyhow::anyhow!(

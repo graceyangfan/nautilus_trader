@@ -18,3 +18,4 @@
 pub mod fee;
 pub mod fill;
 pub mod latency;
+pub mod outcome_action;

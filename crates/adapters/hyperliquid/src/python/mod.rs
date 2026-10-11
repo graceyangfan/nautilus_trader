@@ -30,9 +30,11 @@ pub mod arrow;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
+use nautilus_execution::python::outcome_action::PyBinaryOptionActionProfile;
 use nautilus_model::{data::ensure_rust_extractor_registered, identifiers::ClientOrderId};
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
+use rust_decimal::Decimal;
 
 use crate::{
     account::resolve_execution_account_address,
@@ -52,7 +54,25 @@ use crate::{
     },
     factories::{HyperliquidDataClientFactory, HyperliquidExecutionClientFactory},
     http::{HyperliquidHttpClient, models::Cloid},
+    hyperliquid_outcome_action_profile,
 };
+
+/// Creates the Hyperliquid HIP-4 binary-outcome action profile.
+///
+/// # Errors
+///
+/// Returns an error if either fee rate is outside the inclusive `[0, 1]` range.
+#[pyfunction]
+#[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.adapters.hyperliquid")]
+#[pyo3(name = "hyperliquid_outcome_action_profile")]
+fn py_hyperliquid_outcome_action_profile(
+    split_fee_rate: Decimal,
+    merge_fee_rate: Decimal,
+) -> PyResult<PyBinaryOptionActionProfile> {
+    hyperliquid_outcome_action_profile(split_fee_rate, merge_fee_rate)
+        .map(PyBinaryOptionActionProfile::new)
+        .map_err(to_pyvalue_err)
+}
 
 /// Approve the Nautilus builder fee for Hyperliquid trading.
 ///
@@ -229,6 +249,7 @@ pub fn hyperliquid(m: &Bound<'_, PyModule>) -> PyResult<()> {
         py_hyperliquid_resolve_execution_account_address,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(py_hyperliquid_outcome_action_profile, m)?)?;
     m.add_function(wrap_pyfunction!(py_builder_fee_approve, m)?)?;
     m.add_function(wrap_pyfunction!(py_builder_fee_revoke, m)?)?;
     m.add_class::<HyperliquidDataClientConfig>()?;

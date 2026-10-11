@@ -94,6 +94,7 @@ impl SandboxExecutionClientConfig {
             fee_model,
             fill_model,
             latency_model,
+            binary_option_action_profile: None,
             frozen_account,
             bar_execution,
             trade_execution,

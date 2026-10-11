@@ -20,23 +20,26 @@ pub mod config;
 pub mod node;
 pub mod runtime;
 
-use nautilus_common::messages::{
-    data::{
-        SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth, SubscribeCustomData,
-        SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument, SubscribeInstrumentClose,
-        SubscribeInstrumentStatus, SubscribeInstruments, SubscribeMarkPrices,
-        SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades, UnsubscribeBars,
-        UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData,
-        UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
-        UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
-        UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+use nautilus_common::{
+    messages::{
+        data::{
+            SubscribeBars, SubscribeBookDeltas, SubscribeBookDepth, SubscribeCustomData,
+            SubscribeFundingRates, SubscribeIndexPrices, SubscribeInstrument,
+            SubscribeInstrumentClose, SubscribeInstrumentStatus, SubscribeInstruments,
+            SubscribeMarkPrices, SubscribeOptionGreeks, SubscribeQuotes, SubscribeTrades,
+            UnsubscribeBars, UnsubscribeBookDeltas, UnsubscribeBookDepth, UnsubscribeCustomData,
+            UnsubscribeFundingRates, UnsubscribeIndexPrices, UnsubscribeInstrument,
+            UnsubscribeInstrumentClose, UnsubscribeInstrumentStatus, UnsubscribeInstruments,
+            UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
+        },
+        execution::{
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
+            ExecutionActionResult, ExecutionActionStatus, GenerateFillReports,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
+        },
     },
-    execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
-        ExecutionActionResult, ExecutionActionStatus, GenerateFillReports,
-        GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
-        ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
-    },
+    python::execution_action::PyBinaryOptionAction,
 };
 use nautilus_portfolio::config::PortfolioConfig;
 use pyo3::prelude::*;
@@ -91,6 +94,7 @@ pub fn live(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CancelAllOrders>()?;
     m.add_class::<BatchCancelOrders>()?;
     m.add_class::<ExecutionActionStatus>()?;
+    m.add_class::<PyBinaryOptionAction>()?;
     m.add_class::<ExecuteAction>()?;
     m.add_class::<ExecutionActionResult>()?;
     m.add_class::<QueryAccount>()?;

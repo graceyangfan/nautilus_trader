@@ -37,7 +37,10 @@ use nautilus_model::{
     python::orders::order_any_to_pyobject,
     types::{Price, Quantity},
 };
-use pyo3::{prelude::*, types::PyDict};
+use pyo3::{
+    prelude::*,
+    types::{PyAny, PyDict},
+};
 
 use crate::{
     enums::LogLevel,
@@ -59,6 +62,7 @@ use crate::{
             QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
+    python::execution_action::execution_action_to_pyobject,
 };
 
 #[pymethods]
@@ -2083,8 +2087,8 @@ impl ExecuteAction {
 
     #[getter]
     #[pyo3(name = "action")]
-    fn py_action(&self) -> String {
-        self.action.clone()
+    fn py_action(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        execution_action_to_pyobject(py, self.action.clone())
     }
 
     #[getter]
@@ -2097,15 +2101,6 @@ impl ExecuteAction {
     #[pyo3(name = "ts_init")]
     fn py_ts_init(&self) -> u64 {
         self.ts_init.as_u64()
-    }
-
-    #[getter]
-    #[pyo3(name = "params")]
-    fn py_params(&self, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
-        self.params
-            .as_ref()
-            .map(|params| params_to_pydict(py, params))
-            .transpose()
     }
 
     #[getter]

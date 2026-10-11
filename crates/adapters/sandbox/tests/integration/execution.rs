@@ -29,8 +29,9 @@ use nautilus_common::{
     messages::{
         ExecutionEvent,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, BinaryOptionAction, BinaryOptionPair,
+            CancelAllOrders, CancelOrder, ExecuteAction, ExecutionAction, ExecutionActionResult,
+            ExecutionActionStatus, ModifyOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -50,10 +51,17 @@ use nautilus_execution::{
         fee::{FeeModelAny, MakerTakerFeeModel, ProbabilityPriceFeeModel},
         fill::{DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, StaticLatencyModel},
+        outcome_action::{
+            BinaryOptionActionConfig, BinaryOptionActionProfile, BinaryOptionActionValidator,
+            BinaryOptionActionValidatorHandle,
+        },
     },
 };
+use nautilus_hyperliquid::{
+    common::outcome_pair_instrument_ids, hyperliquid_outcome_action_profile,
+};
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{Account, AccountAny, CashAccount, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
     enums::{
         AccountType, AggressorSide, BookType, ContingencyType, InstrumentCloseType, LiquiditySide,
@@ -73,8 +81,9 @@ use nautilus_model::{
     },
     orders::{Order, OrderAny, OrderList, OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
-    types::{Currency, Money, Price, Quantity},
+    types::{AccountBalance, Currency, Money, Price, Quantity},
 };
+use nautilus_portfolio::portfolio::Portfolio;
 use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
 #[cfg(feature = "python")]
 use pyo3::{IntoPyObjectExt, Python, ffi::c_str, types::PyAnyMethods};
@@ -126,6 +135,7 @@ fn create_config(
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model: None,
+        binary_option_action_profile: None,
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,
@@ -142,6 +152,96 @@ fn create_config(
         oto_full_trigger: false,
         price_protection_points: 0,
     }
+}
+
+#[derive(Debug)]
+struct TestBinaryOptionActionValidator;
+
+impl BinaryOptionActionValidator for TestBinaryOptionActionValidator {
+    fn validate(&self, action: &BinaryOptionAction, _cache: &Cache) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            action.pair()
+                == BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.SIM"),
+                    InstrumentId::from("42-NO-OUTCOME.SIM"),
+                )?,
+            "Unsupported test binary-option pair"
+        );
+        Ok(())
+    }
+}
+
+fn test_binary_option_action_profile() -> BinaryOptionActionProfile {
+    BinaryOptionActionProfile::new(
+        BinaryOptionActionConfig::new(Decimal::ZERO, Decimal::ZERO).unwrap(),
+        BinaryOptionActionValidatorHandle::new(TestBinaryOptionActionValidator),
+    )
+}
+
+fn test_binary_option_pair() -> (InstrumentAny, InstrumentAny) {
+    let mut yes = binary_option();
+    yes.id = InstrumentId::from("42-YES-OUTCOME.SIM");
+    yes.expiration_ns = UnixNanos::from(1_000);
+    let mut no = yes.clone();
+    no.id = InstrumentId::from("42-NO-OUTCOME.SIM");
+    (
+        InstrumentAny::BinaryOption(yes),
+        InstrumentAny::BinaryOption(no),
+    )
+}
+
+fn test_binary_option_action(operation: BinaryOptionAction) -> ExecutionAction {
+    ExecutionAction::BinaryOption(operation)
+}
+
+fn test_binary_option_pair_id() -> BinaryOptionPair {
+    BinaryOptionPair::new(
+        InstrumentId::from("42-YES-OUTCOME.SIM"),
+        InstrumentId::from("42-NO-OUTCOME.SIM"),
+    )
+    .unwrap()
+}
+
+fn test_split_action(quantity: &str) -> ExecutionAction {
+    test_binary_option_action(BinaryOptionAction::Split {
+        pair: test_binary_option_pair_id(),
+        quantity: Quantity::from(quantity),
+        params: None,
+    })
+}
+
+fn test_merge_action(quantity: &str) -> ExecutionAction {
+    test_binary_option_action(BinaryOptionAction::Merge {
+        pair: test_binary_option_pair_id(),
+        quantity: Quantity::from(quantity),
+        params: None,
+    })
+}
+
+fn add_cash_account(cache: &mut Cache, account_id: AccountId, balance: Money) -> AccountState {
+    let state = AccountState::new(
+        account_id,
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            balance,
+            Money::zero(balance.currency),
+            balance,
+        )],
+        Vec::new(),
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        Some(balance.currency),
+    );
+    cache
+        .add_account(AccountAny::Cash(CashAccount::new(
+            state.clone(),
+            true,
+            true,
+        )))
+        .unwrap();
+    state
 }
 
 #[fixture]
@@ -1432,6 +1532,510 @@ fn test_config_default() {
     assert!(!config.use_market_order_acks);
     assert!(!config.oto_full_trigger);
     assert_eq!(config.price_protection_points, 0);
+}
+
+#[rstest]
+fn test_binary_option_action_profile_requires_cash_account(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.binary_option_action_profile = Some(test_binary_option_action_profile());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::from("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+
+    let err = SandboxExecutionClient::new(core, config, clock, cache).unwrap_err();
+
+    assert_eq!(
+        err.to_string(),
+        "Sandbox binary_option_action_profile requires account_type=Cash"
+    );
+}
+
+#[rstest]
+fn test_unconfigured_binary_option_action_returns_rejection(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let config = create_config(trader_id, account_id, venue);
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::from("SANDBOX"),
+        config.venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    client.start().unwrap();
+
+    let command = ExecuteAction::new(
+        trader_id,
+        Some(ClientId::from("SANDBOX")),
+        StrategyId::from("BINARY-ACTION-001"),
+        account_id,
+        test_split_action("1.25"),
+        UUID4::new(),
+        UnixNanos::default(),
+        None,
+    );
+    client.execute_action(command).unwrap();
+
+    let ExecutionEvent::Action(result) = rx.try_recv().unwrap() else {
+        panic!("Expected an execution action result");
+    };
+    assert_eq!(result.status, ExecutionActionStatus::Rejected);
+    assert_eq!(
+        result.reason.as_deref(),
+        Some("Sandbox execution actions are not configured for this venue")
+    );
+    assert!(rx.try_recv().is_err());
+
+    client.stop().unwrap();
+}
+
+#[rstest]
+fn test_binary_option_action_lifecycle_updates_engine_before_each_accepted_result(
+    trader_id: TraderId,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let venue = Venue::from("SIM");
+    let client_id = ClientId::from("SANDBOX");
+    let account_id = AccountId::from("SIM-001");
+    let strategy_id = StrategyId::from("BINARY-ACTION-001");
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let (yes, no) = test_binary_option_pair();
+    cache.borrow_mut().add_instrument(yes).unwrap();
+    cache.borrow_mut().add_instrument(no).unwrap();
+    let account_state =
+        add_cash_account(&mut cache.borrow_mut(), account_id, Money::from("100 USDC"));
+
+    let engine = Rc::new(RefCell::new(ExecutionEngine::new(
+        clock.clone(),
+        cache.clone(),
+        None,
+    )));
+    ExecutionEngine::register_msgbus_handlers(&engine);
+    let mut portfolio = Portfolio::new(clock.clone(), cache.clone(), None);
+    portfolio.update_account(&account_state);
+
+    let results = Rc::new(RefCell::new(Vec::<ExecutionActionResult>::new()));
+    let observed = Rc::new(RefCell::new(Vec::<(Money, usize)>::new()));
+    let position_events = Rc::new(RefCell::new(Vec::<PositionEvent>::new()));
+    msgbus::subscribe_position_events(
+        "events.position.*".into(),
+        TypedHandler::from({
+            let position_events = Rc::clone(&position_events);
+            move |event: &PositionEvent| position_events.borrow_mut().push(event.clone())
+        }),
+        None,
+    );
+    msgbus::subscribe_execution_action_results(
+        nautilus_common::msgbus::switchboard::get_execution_action_result_topic(strategy_id).into(),
+        TypedHandler::from({
+            let cache = Rc::clone(&cache);
+            let results = Rc::clone(&results);
+            let observed = Rc::clone(&observed);
+            move |result: &ExecutionActionResult| {
+                let cache = cache.borrow();
+                let balance = cache
+                    .account(&account_id)
+                    .and_then(|account| account.balance_total(Some(Currency::USDC())))
+                    .unwrap();
+                let positions = cache
+                    .positions_open_refs(
+                        Some(&venue),
+                        None,
+                        Some(&strategy_id),
+                        Some(&account_id),
+                        None,
+                    )
+                    .len();
+                observed.borrow_mut().push((balance, positions));
+                results.borrow_mut().push(result.clone());
+            }
+        }),
+        None,
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.base_currency = Some(Currency::USDC());
+    config.starting_balances = vec![Money::from("100 USDC")];
+    config.binary_option_action_profile = Some(test_binary_option_action_profile());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        client_id,
+        venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache.clone()).unwrap();
+    client.start().unwrap();
+    engine
+        .borrow_mut()
+        .register_client(Box::new(client))
+        .unwrap();
+
+    let mut execute_action = |action: ExecutionAction| {
+        let command = ExecuteAction::new(
+            trader_id,
+            Some(client_id),
+            strategy_id,
+            account_id,
+            action,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        );
+        engine
+            .borrow_mut()
+            .execute(TradingCommand::ExecuteAction(command));
+
+        for _ in 0..3 {
+            match rx.try_recv().unwrap() {
+                ExecutionEvent::Order(event) => engine.borrow_mut().process(&event),
+                ExecutionEvent::Action(result) => {
+                    let topic =
+                        nautilus_common::msgbus::switchboard::get_execution_action_result_topic(
+                            result.strategy_id,
+                        );
+                    msgbus::publish_execution_action_result(topic, &result);
+                }
+                event => panic!("Unexpected sandbox execution event: {event:?}"),
+            }
+        }
+    };
+    execute_action(test_split_action("1.25"));
+    execute_action(test_merge_action("0.5"));
+    execute_action(test_merge_action("0.75"));
+    execute_action(test_split_action("0.5"));
+
+    assert_eq!(
+        results
+            .borrow()
+            .iter()
+            .map(|result| result.status)
+            .collect::<Vec<_>>(),
+        vec![ExecutionActionStatus::Accepted; 4]
+    );
+    assert_eq!(
+        *observed.borrow(),
+        vec![
+            (Money::from("98.75 USDC"), 2),
+            (Money::from("99.25 USDC"), 2),
+            (Money::from("100 USDC"), 0),
+            (Money::from("99.5 USDC"), 2),
+        ]
+    );
+    let position_kinds: Vec<(&str, InstrumentId)> = position_events
+        .borrow()
+        .iter()
+        .map(|event| match event {
+            PositionEvent::PositionOpened(event) => ("opened", event.instrument_id),
+            PositionEvent::PositionChanged(event) => ("changed", event.instrument_id),
+            PositionEvent::PositionClosed(event) => ("closed", event.instrument_id),
+            PositionEvent::PositionAdjusted(event) => ("adjusted", event.instrument_id),
+        })
+        .collect();
+    assert_eq!(
+        position_kinds,
+        vec![
+            ("opened", InstrumentId::from("42-YES-OUTCOME.SIM")),
+            ("opened", InstrumentId::from("42-NO-OUTCOME.SIM")),
+            ("changed", InstrumentId::from("42-YES-OUTCOME.SIM")),
+            ("changed", InstrumentId::from("42-NO-OUTCOME.SIM")),
+            ("closed", InstrumentId::from("42-YES-OUTCOME.SIM")),
+            ("closed", InstrumentId::from("42-NO-OUTCOME.SIM")),
+            ("opened", InstrumentId::from("42-YES-OUTCOME.SIM")),
+            ("opened", InstrumentId::from("42-NO-OUTCOME.SIM")),
+        ]
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .account(&account_id)
+            .and_then(|account| account.balance_total(Some(Currency::USDC()))),
+        Some(Money::from("99.5 USDC"))
+    );
+    assert_eq!(
+        cache
+            .borrow()
+            .orders_total_count(None, None, None, None, None),
+        0
+    );
+
+    engine.borrow_mut().stop_clients();
+}
+
+/// An action must wait behind the same insert-latency boundary as a venue write. Once it is due,
+/// the sandbox emits both normal fill events before its correlated acceptance.
+#[rstest]
+fn test_binary_option_action_respects_insert_latency(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+) {
+    const INSERT_LATENCY_NS: u64 = 1_000_000_000;
+
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let (mut yes, mut no) = test_binary_option_pair();
+    for instrument in [&mut yes, &mut no] {
+        let InstrumentAny::BinaryOption(instrument) = instrument else {
+            unreachable!("test pair must contain binary options");
+        };
+        instrument.expiration_ns = UnixNanos::from(2 * INSERT_LATENCY_NS);
+    }
+    cache.borrow_mut().add_instrument(yes).unwrap();
+    cache.borrow_mut().add_instrument(no).unwrap();
+    add_cash_account(&mut cache.borrow_mut(), account_id, Money::from("100 USDC"));
+
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.base_currency = Some(Currency::USDC());
+    config.starting_balances = vec![Money::from("100 USDC")];
+    config.latency_model = Some(static_latency_model(INSERT_LATENCY_NS, 0, 0));
+    config.binary_option_action_profile = Some(test_binary_option_action_profile());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::from("SANDBOX"),
+        venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    client.start().unwrap();
+
+    client
+        .execute_action(ExecuteAction::new(
+            trader_id,
+            Some(ClientId::from("SANDBOX")),
+            StrategyId::from("BINARY-ACTION-001"),
+            account_id,
+            test_split_action("1.25"),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        rx.try_recv().is_err(),
+        "the action must not apply before its insert latency elapses"
+    );
+    assert_eq!(
+        advance_and_fire(&test_clock, UnixNanos::from(INSERT_LATENCY_NS)),
+        1,
+        "the delayed action must arm one inbound alert"
+    );
+
+    let events: Vec<ExecutionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ExecutionEvent::Order(OrderEventAny::Filled(_)),
+                ExecutionEvent::Order(OrderEventAny::Filled(_)),
+                ExecutionEvent::Action(ExecutionActionResult {
+                    status: ExecutionActionStatus::Accepted,
+                    ..
+                }),
+            ]
+        ),
+        "unexpected sandbox action events: {events:?}"
+    );
+
+    client.stop().unwrap();
+}
+
+/// Reset and stop discard queued writes without inventing an acknowledgement for an action that
+/// never reached the simulated venue. This mirrors the live client-generation cancellation rule.
+#[rstest]
+#[case::reset(true)]
+#[case::stop(false)]
+fn test_binary_option_action_lifecycle_cancellation_emits_no_result(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    #[case] reset: bool,
+) {
+    const INSERT_LATENCY_NS: u64 = 1_000_000_000;
+
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let test_clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let clock: Rc<RefCell<dyn Clock>> = test_clock.clone();
+    let (yes, no) = test_binary_option_pair();
+    cache.borrow_mut().add_instrument(yes).unwrap();
+    cache.borrow_mut().add_instrument(no).unwrap();
+    add_cash_account(&mut cache.borrow_mut(), account_id, Money::from("100 USDC"));
+
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.base_currency = Some(Currency::USDC());
+    config.starting_balances = vec![Money::from("100 USDC")];
+    config.latency_model = Some(static_latency_model(INSERT_LATENCY_NS, 0, 0));
+    config.binary_option_action_profile = Some(test_binary_option_action_profile());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::from("SANDBOX"),
+        venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    client.start().unwrap();
+
+    client
+        .execute_action(ExecuteAction::new(
+            trader_id,
+            Some(ClientId::from("SANDBOX")),
+            StrategyId::from("BINARY-ACTION-001"),
+            account_id,
+            test_split_action("1.25"),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    if reset {
+        client.reset();
+    } else {
+        client.stop().unwrap();
+    }
+
+    assert_eq!(
+        advance_and_fire(&test_clock, UnixNanos::from(INSERT_LATENCY_NS)),
+        0,
+        "{case} must cancel the delayed action alert",
+        case = if reset { "reset" } else { "stop" },
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "{case} must discard the delayed action without a result",
+        case = if reset { "reset" } else { "stop" },
+    );
+}
+
+/// The venue profile is adapter-owned: the sandbox consumes the exact Hyperliquid action name,
+/// `outcome` selector, and HIP-4 Yes/No identifiers rather than a test-only pair resolver.
+#[rstest]
+fn test_hyperliquid_outcome_action_profile_runs_through_sandbox(trader_id: TraderId) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+
+    let venue = Venue::from("HYPERLIQUID");
+    let account_id = AccountId::from("HYPERLIQUID-001");
+    let [yes_id, no_id] = outcome_pair_instrument_ids(42).unwrap();
+    let mut yes = binary_option();
+    yes.id = yes_id;
+    yes.expiration_ns = UnixNanos::from(1_000);
+    let mut no = yes.clone();
+    no.id = no_id;
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::BinaryOption(yes))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::BinaryOption(no))
+        .unwrap();
+    add_cash_account(&mut cache.borrow_mut(), account_id, Money::from("100 USDC"));
+
+    let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+    let mut config = create_config(trader_id, account_id, venue);
+    config.account_type = AccountType::Cash;
+    config.base_currency = Some(Currency::USDC());
+    config.starting_balances = vec![Money::from("100 USDC")];
+    config.binary_option_action_profile =
+        Some(hyperliquid_outcome_action_profile(Decimal::ZERO, Decimal::ZERO).unwrap());
+    let core = ExecutionClientCore::new(
+        trader_id,
+        ClientId::from("SANDBOX"),
+        venue,
+        config.oms_type,
+        config.account_id,
+        config.account_type,
+        config.base_currency,
+        cache.clone(),
+    );
+    let mut client = SandboxExecutionClient::new(core, config, clock, cache).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    set_exec_event_sender(tx);
+    client.start().unwrap();
+
+    client
+        .execute_action(ExecuteAction::new(
+            trader_id,
+            Some(ClientId::from("SANDBOX")),
+            StrategyId::from("HIP4-ACTION-001"),
+            account_id,
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(yes_id, no_id).unwrap(),
+                quantity: Quantity::from("1.25"),
+                params: None,
+            }),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        ))
+        .unwrap();
+
+    let events: Vec<ExecutionEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(matches!(events.as_slice(), [
+        ExecutionEvent::Order(OrderEventAny::Filled(yes_fill)),
+        ExecutionEvent::Order(OrderEventAny::Filled(no_fill)),
+        ExecutionEvent::Action(ExecutionActionResult {
+            status: ExecutionActionStatus::Accepted,
+            ..
+        }),
+    ] if yes_fill.instrument_id == yes_id && no_fill.instrument_id == no_id));
+
+    client.stop().unwrap();
 }
 
 #[rstest]
@@ -3561,6 +4165,7 @@ fn test_instrument_close_sync_cleanup_handles_synchronous_position_closed_reentr
             fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
             fill_model: None,
             latency_model: None,
+            binary_option_action_profile: None,
             frozen_account: false,
             bar_execution: false,
             trade_execution: false,
@@ -4770,6 +5375,7 @@ fn test_submit_order_through_exec_engine_no_reentrant_panic(
         fee_model: Some(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero())),
         fill_model: None,
         latency_model,
+        binary_option_action_profile: None,
         frozen_account: false,
         bar_execution: false,
         trade_execution: false,

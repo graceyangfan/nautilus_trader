@@ -36,6 +36,7 @@ __all__ = [
     "HyperliquidPublicTrade",
     "HyperliquidTwapHistory",
     "HyperliquidTwapSliceFill",
+    "hyperliquid_outcome_action_profile",
 ]
 
 fixup_module_names(globals(), __name__)

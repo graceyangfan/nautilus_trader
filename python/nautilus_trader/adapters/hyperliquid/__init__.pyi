@@ -6,6 +6,7 @@ import decimal
 import enum
 import typing
 
+from nautilus_trader import execution
 from nautilus_trader import model
 from nautilus_trader import network
 
@@ -25,6 +26,7 @@ __all__ = [
     "HyperliquidPublicTrade",
     "HyperliquidTwapHistory",
     "HyperliquidTwapSliceFill",
+    "hyperliquid_outcome_action_profile",
 ]
 
 HYPERLIQUID: str
@@ -605,6 +607,9 @@ class HyperliquidTrailingOffsetType(enum.Enum):
 def builder_fee_approve() -> bool: ...
 def builder_fee_revoke() -> bool: ...
 def hyperliquid_cloid_from_client_order_id(client_order_id: model.ClientOrderId) -> str: ...
+def hyperliquid_outcome_action_profile(
+    split_fee_rate: decimal.Decimal, merge_fee_rate: decimal.Decimal
+) -> execution.BinaryOptionActionProfile: ...
 def hyperliquid_product_type_from_symbol(symbol: str) -> HyperliquidProductType: ...
 def hyperliquid_resolve_execution_account_address(
     private_key: str | None = None,

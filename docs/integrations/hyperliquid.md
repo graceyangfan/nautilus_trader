@@ -565,16 +565,27 @@ lifecycle. The returned command ID correlates the request with the later
 `on_execution_action_result` callback:
 
 ```python
+from nautilus_trader.live import BinaryOptionAction
+from nautilus_trader.model import Quantity
+
+split = BinaryOptionAction.split(
+    yes_instrument_id=self.yes_instrument_id,
+    no_instrument_id=self.no_instrument_id,
+    quantity=Quantity.from_str("1.0"),
+)
 self._split_command_id = self.execute_action(
     account_id=self.account_id,
-    action="hyperliquid.user_outcome.split",
-    params={"outcome": 50, "amount": "1.0"},
+    action=split,
 )
 
+merge = BinaryOptionAction.merge(
+    yes_instrument_id=self.yes_instrument_id,
+    no_instrument_id=self.no_instrument_id,
+    quantity=Quantity.from_str("1.0"),
+)
 self._merge_command_id = self.execute_action(
     account_id=self.account_id,
-    action="hyperliquid.user_outcome.merge",
-    params={"outcome": 50, "amount": None},  # Merge the maximum available.
+    action=merge,
 )
 
 
@@ -625,11 +636,58 @@ workflows and for `mergeQuestion` or `negateOutcome`, which are not in the
 strategy action allow-list.
 
 :::note
-Sandbox and backtest clients currently reject these actions without changing
-state. The live acknowledgement semantics, state-convergence boundary, and
-second-milestone simulation design are specified in
+Sandbox and backtest support these actions when their venue has an explicit
+binary-option action profile. For Python HIP-4 backtests, create the profile
+with `hyperliquid_outcome_action_profile(split_fee_rate, merge_fee_rate)` and
+pass it to `BacktestEngine.add_venue` as `binary_option_action_profile`. The
+simulator emits its ordinary account and position updates before the correlated
+`Accepted` result. The live acknowledgement semantics and state-convergence
+boundary are specified in
 [Execution Actions: HIP-4 Split and Merge](../developer_guide/execution_actions.md).
 :::
+
+#### Testnet split/merge tester
+
+[`outcome_actions_tester.py`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/hyperliquid/outcome_actions_tester.py)
+performs one testnet split followed by its matching merge. It is intentionally
+guarded: it only sends actions with an explicit environment confirmation, and
+it only submits the merge after an accepted split result *and* one matching
+external fill for each Yes/No leg.
+
+Select an active, unheld outcome from the current `outcomeMeta`, then provide
+an amount supported by both legs:
+
+```bash
+./examples/live/hyperliquid/run-outcome-actions-testnet.bash
+```
+
+The launcher fixes the conversion amount at `1` USDC, matching the successful
+testnet probe. It sets the explicit action-confirmation variable only for its
+child process; invoking it performs a real testnet split and merge cycle.
+
+The tester selects the earliest-expiring currently loaded HIP-4 **BTC daily
+price-binary (up/down)** Yes/No pair with at least five minutes remaining. To
+test a particular still-active BTC daily outcome, provide
+`HYPERLIQUID_OUTCOME_ACTION_OUTCOME=<outcome>`; adjust the five-minute safety
+margin with `HYPERLIQUID_OUTCOME_ACTION_MIN_REMAINING_SECS` if needed.
+
+The existing `HYPERLIQUID_TESTNET_PK` credential is required; set
+`HYPERLIQUID_ACCOUNT_ADDRESS` when using an API wallet. The tester claims both
+instruments as external strategy instruments, allowing the normal
+venue-fill-to-account-and-position pipeline to route their materialized state
+to the strategy. It logs `ACTION_RESULT`, `ORDER_FILLED`, and every
+`POSITION_OPENED`, `POSITION_CHANGED`, and `POSITION_CLOSED` callback, plus
+the cached account and open positions at each point.
+
+The post acknowledgement and the two venue fills are separate messages and
+their relative order is not an invariant. For a previously flat pair, expect
+two split fills and normally two position-opened callbacks, followed by two
+merge fills and normally two position-closed callbacks. Existing inventory
+can instead result in position-changed callbacks. Keep the process running
+until all callbacks are observed, then stop it with Ctrl-C. For each action the
+strategy also logs `ACK_RECEIVED`, `FILL_RECEIVED`, and position-callback
+latencies. These use the strategy's monotonic clock, so `elapsed_ms` measures
+local send-to-callback time rather than a venue timestamp.
 
 ### Order constraints
 

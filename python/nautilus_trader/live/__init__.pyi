@@ -19,6 +19,7 @@ __all__ = [
     "BarsResponse",
     "BatchCancelOrders",
     "BatchModifyOrders",
+    "BinaryOptionAction",
     "BookDeltasResponse",
     "BookDepthResponse",
     "BookResponse",
@@ -458,13 +459,11 @@ class ExecuteAction:
     @property
     def account_id(self) -> model.AccountId: ...
     @property
-    def action(self) -> str: ...
+    def action(self) -> typing.Any: ...
     @property
     def command_id(self) -> core.UUID4: ...
     @property
     def ts_init(self) -> int: ...
-    @property
-    def params(self) -> dict | None: ...
     @property
     def correlation_id(self) -> core.UUID4 | None: ...
     @property
@@ -970,6 +969,33 @@ class PluginConfig:
         config: typing.Mapping[str, typing.Any] | None = None,
         sha256: str | None = None,
     ) -> PluginConfig: ...
+
+@typing.final
+class BinaryOptionAction:
+    @staticmethod
+    def split(
+        yes_instrument_id: model.InstrumentId,
+        no_instrument_id: model.InstrumentId,
+        quantity: model.Quantity,
+        params: dict | None = None,
+    ) -> BinaryOptionAction: ...
+    @staticmethod
+    def merge(
+        yes_instrument_id: model.InstrumentId,
+        no_instrument_id: model.InstrumentId,
+        quantity: model.Quantity,
+        params: dict | None = None,
+    ) -> BinaryOptionAction: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def yes_instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def no_instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def quantity(self) -> model.Quantity: ...
+    @property
+    def params(self) -> dict | None: ...
 
 @typing.final
 class ClientCache:

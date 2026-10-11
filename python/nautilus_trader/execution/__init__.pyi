@@ -8,6 +8,7 @@ from nautilus_trader import model
 
 __all__ = [
     "BestPriceFillModel",
+    "BinaryOptionActionProfile",
     "CappedOptionFeeModel",
     "CompetitionAwareFillModel",
     "DefaultFillModel",
@@ -254,6 +255,9 @@ class ProbabilityPriceFeeModel(FeeModel):
         fill_px: model.Price,
         instrument: typing.Any,
     ) -> model.Money: ...
+
+@typing.final
+class BinaryOptionActionProfile: ...
 
 @typing.final
 class SizeAwareFillModel:

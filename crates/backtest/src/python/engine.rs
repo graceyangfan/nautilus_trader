@@ -33,7 +33,7 @@ use nautilus_core::{
 };
 use nautilus_execution::python::{
     fee::pyobject_to_fee_model_handle, fill::pyobject_to_fill_model_handle,
-    latency::pyobject_to_latency_model_any,
+    latency::pyobject_to_latency_model_any, outcome_action::PyBinaryOptionActionProfile,
 };
 #[cfg(feature = "defi")]
 use nautilus_model::defi::DefiData;
@@ -166,6 +166,7 @@ impl PyBacktestEngine {
             liquidation_enabled = false,
             liquidation_trigger_ratio = None,
             liquidation_cancel_open_orders = true,
+            binary_option_action_profile = None,
         )
     )]
     #[expect(
@@ -209,6 +210,7 @@ impl PyBacktestEngine {
         liquidation_enabled: bool,
         liquidation_trigger_ratio: Option<f64>,
         liquidation_cancel_open_orders: bool,
+        binary_option_action_profile: Option<PyBinaryOptionActionProfile>,
     ) -> PyResult<()> {
         let leverages: AHashMap<InstrumentId, Decimal> = leverages
             .map(|m| m.into_iter().collect())
@@ -234,6 +236,8 @@ impl PyBacktestEngine {
             .map(|obj| Python::attach(|py| pyobject_to_latency_model_any(obj.bind(py))))
             .transpose()?
             .map(Into::into);
+        let binary_option_action_profile =
+            binary_option_action_profile.map(|profile| profile.profile());
         let modules = modules
             .map(|objs| {
                 objs.into_iter()
@@ -280,6 +284,7 @@ impl PyBacktestEngine {
             .liquidation_enabled(liquidation_enabled)
             .liquidation_trigger_ratio(liquidation_trigger_ratio.unwrap_or(1.0))
             .liquidation_cancel_open_orders(liquidation_cancel_open_orders)
+            .maybe_binary_option_action_profile(binary_option_action_profile)
             .build()
             .map_err(config_error_to_pyvalue_err)?;
 
@@ -1801,6 +1806,7 @@ mod model_tests {
                     false,
                     None,
                     true,
+                    None,
                 )
                 .unwrap();
 

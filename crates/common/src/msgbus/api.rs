@@ -1674,7 +1674,8 @@ mod tests {
                 TradesResponse, UnsubscribeCommand, UnsubscribeQuotes,
             },
             execution::{
-                CancelAllOrders, ExecuteAction, ExecutionActionStatus, GenerateExecutionMassStatus,
+                BinaryOptionAction, BinaryOptionPair, CancelAllOrders, ExecuteAction,
+                ExecutionAction, ExecutionActionStatus, GenerateExecutionMassStatus,
                 TradingCommand,
             },
         },
@@ -3332,10 +3333,17 @@ mod tests {
             Some(ClientId::from("HYPERLIQUID")),
             StrategyId::from("STRATEGY-001"),
             AccountId::from("HYPERLIQUID-001"),
-            "hyperliquid.user_outcome.split",
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.HYPERLIQUID"),
+                    InstrumentId::from("42-NO-OUTCOME.HYPERLIQUID"),
+                )
+                .unwrap(),
+                quantity: Quantity::from("1"),
+                params: None,
+            }),
             UUID4::from("00000000-0000-4000-8000-000000000001"),
             UnixNanos::from(1_000_000_000),
-            None,
             None,
         );
         ExecutionActionResult::new(

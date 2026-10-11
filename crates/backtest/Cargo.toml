@@ -95,6 +95,7 @@ pyo3 = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-hyperliquid = { workspace = true }
 nautilus-indicators = { workspace = true }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence = { workspace = true }

@@ -5195,7 +5195,8 @@ mod tests {
     use nautilus_common::{
         clock::VirtualClock,
         messages::execution::{
-            ExecuteAction, ExecutionActionResult, ExecutionActionStatus, TradingCommand,
+            BinaryOptionAction, BinaryOptionPair, ExecuteAction, ExecutionAction,
+            ExecutionActionResult, ExecutionActionStatus, TradingCommand,
         },
         msgbus::{MessageBus, set_message_bus, switchboard},
     };
@@ -5206,11 +5207,14 @@ mod tests {
             OrderFillVoided,
             order::spec::{OrderCanceledSpec, OrderFillVoidedSpec, OrderFilledSpec},
         },
-        identifiers::{AccountId, ClientId, ClientOrderId, TradeId, TraderId, Venue, VenueOrderId},
+        identifiers::{
+            AccountId, ClientId, ClientOrderId, InstrumentId, TradeId, TraderId, Venue,
+            VenueOrderId,
+        },
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::PositionFillVoid,
-        types::Price,
+        types::{Price, Quantity},
     };
     use rstest::*;
 
@@ -5239,10 +5243,17 @@ mod tests {
             Some(client_id),
             StrategyId::from("STRATEGY-001"),
             account_id,
-            "hyperliquid.user_outcome.split",
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.HYPERLIQUID"),
+                    InstrumentId::from("42-NO-OUTCOME.HYPERLIQUID"),
+                )
+                .unwrap(),
+                quantity: Quantity::from("1"),
+                params: None,
+            }),
             UUID4::from("00000000-0000-4000-8000-000000000001"),
             UnixNanos::from(1),
-            None,
             None,
         );
         let results = Rc::new(RefCell::new(Vec::new()));

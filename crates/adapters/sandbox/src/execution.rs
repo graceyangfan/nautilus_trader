@@ -28,14 +28,14 @@ use nautilus_common::{
     messages::{
         ExecutionEvent,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder,
-            GenerateFillReports, GenerateOrderStatusReport, GenerateOrderStatusReports,
-            GeneratePositionStatusReports, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
-            SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
+            ExecutionActionResult, ExecutionActionStatus, GenerateFillReports,
+            GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
+            ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
-        self, MStr, MessagingSwitchboard, Pattern, TypedHandler,
+        self, MStr, MessagingSwitchboard, Pattern, TypedHandler, switchboard,
         typed_handler::ShareableMessageHandler,
     },
     timer::{TimeEvent, TimeEventCallback},
@@ -44,12 +44,15 @@ use nautilus_core::{DurationNanos, Params, UUID4, UnixNanos, WeakCell};
 use nautilus_execution::{
     client::core::ExecutionClientCore,
     matching_engine::{OrderMatchingEngine, inflight::InflightOrders},
-    models::{fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel},
+    models::{
+        fee::FeeModelHandle, fill::FillModelHandle, latency::LatencyModel,
+        outcome_action::plan_binary_option_action,
+    },
 };
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::OmsType,
+    enums::{AccountType, OmsType},
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -131,6 +134,21 @@ impl SandboxExecutionClient {
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
     ) -> anyhow::Result<Self> {
+        if config.binary_option_action_profile.is_some() {
+            anyhow::ensure!(
+                config.account_type == AccountType::Cash,
+                "Sandbox binary_option_action_profile requires account_type=Cash"
+            );
+            anyhow::ensure!(
+                config.oms_type == OmsType::Netting,
+                "Sandbox binary_option_action_profile requires oms_type=Netting"
+            );
+            anyhow::ensure!(
+                !config.frozen_account,
+                "Sandbox binary_option_action_profile requires frozen_account=false"
+            );
+        }
+
         let mut balances = AHashMap::new();
         for money in &config.starting_balances {
             balances.insert(money.currency.code.to_string(), *money);
@@ -159,6 +177,7 @@ impl SandboxExecutionClient {
                 next_engine_raw_id: 0,
                 balances,
                 event_handler: None,
+                action_result_handler: None,
                 inbound_queue: BinaryHeap::new(),
                 inflight_orders: InflightOrders::default(),
                 inbound_seq: 0,
@@ -641,13 +660,20 @@ impl ExecutionClient for SandboxExecutionClient {
         }
 
         if let Some(sender) = try_get_exec_event_sender() {
+            let action_sender = sender.clone();
             let handler: Rc<dyn Fn(OrderEventAny)> = Rc::new(move |event: OrderEventAny| {
                 if let Err(e) = sender.send(ExecutionEvent::Order(event)) {
                     log::warn!("Failed to send order event: {e}");
                 }
             });
+            let action_result_handler: Rc<dyn Fn(ExecutionActionResult)> = Rc::new(move |result| {
+                if let Err(e) = action_sender.send(ExecutionEvent::Action(result)) {
+                    log::warn!("Failed to send execution action result: {e}");
+                }
+            });
             let mut inner = self.inner.borrow_mut();
             inner.event_handler = Some(handler.clone());
+            inner.action_result_handler = Some(action_result_handler);
             for engine in inner.matching_engines.values_mut() {
                 engine.set_event_handler(handler.clone());
             }
@@ -745,6 +771,16 @@ impl ExecutionClient for SandboxExecutionClient {
             inner.apply_submit_order(&cmd)?;
         } else {
             inner.defer_or_apply(TradingCommand::SubmitOrder(cmd));
+        }
+        Ok(())
+    }
+
+    fn execute_action(&self, cmd: ExecuteAction) -> anyhow::Result<()> {
+        let mut inner = self.inner.borrow_mut();
+        if inner.config.latency_model.is_none() {
+            inner.apply_execution_action(&cmd);
+        } else {
+            inner.defer_or_apply(TradingCommand::ExecuteAction(cmd));
         }
         Ok(())
     }
@@ -899,6 +935,8 @@ struct SandboxInner {
     /// Forwards order events to the runner's execution channel once `start` finds a sender; shared
     /// with every matching engine this client owns.
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
+    /// Forwards action results through the same runner execution channel as order events.
+    action_result_handler: Option<Rc<dyn Fn(ExecutionActionResult)>>,
     /// Inbound commands deferred by latency, ordered as a min-heap by due time.
     inbound_queue: BinaryHeap<DelayedCommand>,
     inflight_orders: InflightOrders,
@@ -1218,9 +1256,7 @@ impl SandboxInner {
         }
 
         match cmd {
-            TradingCommand::ExecuteAction(_) => {
-                log::warn!("Sandbox execution actions are not modeled");
-            }
+            TradingCommand::ExecuteAction(cmd) => self.apply_execution_action(cmd),
             TradingCommand::SubmitOrder(cmd) => self.apply_submit_order(cmd)?,
             TradingCommand::SubmitOrderList(cmd) => {
                 // Only a deferred leg has an `OrderSubmitted` out that nothing else would resolve
@@ -1240,6 +1276,85 @@ impl SandboxInner {
 
     fn reject_command(&self, command: &TradingCommand, reason: &str) {
         self.reject_command_deduped(command, reason, &mut AHashSet::new());
+    }
+
+    fn apply_execution_action(&self, command: &ExecuteAction) {
+        let Some(profile) = &self.config.binary_option_action_profile else {
+            self.send_execution_action_result(
+                command,
+                ExecutionActionStatus::Rejected,
+                Some("Sandbox execution actions are not configured for this venue".to_string()),
+            );
+            return;
+        };
+
+        if command.account_id != self.account_id {
+            self.send_execution_action_result(
+                command,
+                ExecutionActionStatus::Rejected,
+                Some("Action account does not match sandbox execution client".to_string()),
+            );
+            return;
+        }
+
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let fills = {
+            let cache = self.cache.borrow();
+            plan_binary_option_action(profile, command, &cache, ts_event)
+        };
+
+        match fills {
+            Ok(fills) => {
+                if fills
+                    .iter()
+                    .any(|fill| fill.instrument_id.venue != self.config.venue)
+                {
+                    self.send_execution_action_result(
+                        command,
+                        ExecutionActionStatus::Rejected,
+                        Some(
+                            "Resolved binary option pair does not match sandbox venue".to_string(),
+                        ),
+                    );
+                    return;
+                }
+
+                for fill in fills {
+                    self.dispatch_order_event(OrderEventAny::Filled(fill));
+                }
+                self.send_execution_action_result(command, ExecutionActionStatus::Accepted, None);
+            }
+            Err(e) => self.send_execution_action_result(
+                command,
+                ExecutionActionStatus::Rejected,
+                Some(e.to_string()),
+            ),
+        }
+    }
+
+    fn send_execution_action_result(
+        &self,
+        command: &ExecuteAction,
+        status: ExecutionActionStatus,
+        reason: Option<String>,
+    ) {
+        let result = ExecutionActionResult::new(
+            command,
+            status,
+            reason,
+            None,
+            self.clock.borrow().timestamp_ns(),
+        );
+        self.dispatch_execution_action_result(result);
+    }
+
+    fn dispatch_execution_action_result(&self, result: ExecutionActionResult) {
+        if let Some(handler) = &self.action_result_handler {
+            handler(result);
+        } else {
+            let topic = switchboard::get_execution_action_result_topic(result.strategy_id);
+            msgbus::publish_execution_action_result(topic, &result);
+        }
     }
 
     /// Dispatches the rejection for `command`, skipping any order that has already received a
@@ -1632,10 +1747,9 @@ impl SandboxInner {
         };
 
         match command {
-            TradingCommand::ExecuteAction(_) => DurationNanos::ZERO,
-            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
-                latency_model.get_insert_latency()
-            }
+            TradingCommand::ExecuteAction(_)
+            | TradingCommand::SubmitOrder(_)
+            | TradingCommand::SubmitOrderList(_) => latency_model.get_insert_latency(),
             TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
                 latency_model.get_update_latency()
             }

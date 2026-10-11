@@ -18,7 +18,10 @@
 use ahash::AHashMap;
 use nautilus_execution::{
     matching_engine::config::OrderMatchingEngineConfig,
-    models::{fee::FeeModelAny, fill::FillModelAny, latency::LatencyModelAny},
+    models::{
+        fee::FeeModelAny, fill::FillModelAny, latency::LatencyModelAny,
+        outcome_action::BinaryOptionActionProfile,
+    },
 };
 use nautilus_model::{
     enums::{AccountType, BookType, OmsType},
@@ -36,7 +39,11 @@ use serde::{
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
-    pyo3::pyclass(module = "nautilus_trader.adapters.sandbox", from_py_object)
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.sandbox",
+        from_py_object,
+        unsendable
+    )
 )]
 #[cfg_attr(
     feature = "python",
@@ -93,6 +100,17 @@ pub struct SandboxExecutionClientConfig {
         deserialize_with = "deserialize_latency_model"
     )]
     pub latency_model: Option<LatencyModelAny>,
+    /// The optional profile for simulating venue-owned binary-option actions.
+    ///
+    /// This runtime-only profile is configured by Rust callers. It enables an adapter-owned
+    /// resolver and fee schedule without coupling the generic sandbox adapter to any venue.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_binary_option_action_profile",
+        deserialize_with = "deserialize_binary_option_action_profile"
+    )]
+    pub binary_option_action_profile: Option<BinaryOptionActionProfile>,
     /// If True, account balances won't change (frozen).
     #[builder(default)]
     pub frozen_account: bool,
@@ -263,6 +281,37 @@ where
     }
 }
 
+fn serialize_binary_option_action_profile<S>(
+    profile: &Option<BinaryOptionActionProfile>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match profile {
+        None => serializer.serialize_none(),
+        Some(_) => Err(serde::ser::Error::custom(
+            "SandboxExecutionClientConfig.binary_option_action_profile is runtime-only and cannot be serialized",
+        )),
+    }
+}
+
+fn deserialize_binary_option_action_profile<'de, D>(
+    deserializer: D,
+) -> Result<Option<BinaryOptionActionProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<IgnoredAny>::deserialize(deserializer)?;
+
+    match value {
+        None => Ok(None),
+        Some(_) => Err(de::Error::custom(
+            "SandboxExecutionClientConfig.binary_option_action_profile must be configured at runtime, not deserialized",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_core::DurationNanos;
@@ -289,6 +338,7 @@ mod tests {
         assert!(config.fee_model.is_none());
         assert!(config.fill_model.is_none());
         assert!(config.latency_model.is_none());
+        assert!(config.binary_option_action_profile.is_none());
         assert_eq!(config.bar_execution, expected.bar_execution);
         assert_eq!(config.trade_execution, expected.trade_execution);
         assert_eq!(config.use_position_ids, expected.use_position_ids);
@@ -340,6 +390,15 @@ mod tests {
     fn test_exec_config_toml_rejects_latency_model_field() {
         let result =
             toml::from_str::<SandboxExecutionClientConfig>("latency_model = \"runtime-only\"");
+
+        assert!(result.is_err());
+    }
+
+    #[rstest]
+    fn test_exec_config_toml_rejects_binary_option_action_profile_field() {
+        let result = toml::from_str::<SandboxExecutionClientConfig>(
+            "binary_option_action_profile = \"runtime-only\"",
+        );
 
         assert!(result.is_err());
     }

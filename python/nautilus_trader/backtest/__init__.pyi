@@ -490,6 +490,7 @@ class BacktestEngine:
         liquidation_enabled: bool = False,
         liquidation_trigger_ratio: float | None = None,
         liquidation_cancel_open_orders: bool = True,
+        binary_option_action_profile: execution.BinaryOptionActionProfile | None = None,
     ) -> None: ...
     def change_fill_model(self, venue: model.Venue, fill_model: typing.Any) -> None: ...
     def add_data(

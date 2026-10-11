@@ -33,7 +33,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use strum::Display as StrumDisplay;
 
 pub use self::{
-    action::{ExecuteAction, ExecutionActionResult, ExecutionActionStatus},
+    action::{
+        BinaryOptionAction, BinaryOptionPair, ExecuteAction, ExecutionAction,
+        ExecutionActionResult, ExecutionActionStatus,
+    },
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
@@ -248,7 +251,7 @@ impl TradingCommand {
     #[must_use]
     pub const fn params(&self) -> Option<&Params> {
         match self {
-            Self::ExecuteAction(command) => command.params.as_ref(),
+            Self::ExecuteAction(command) => command.action.params(),
             Self::SubmitOrder(command) => command.params.as_ref(),
             Self::SubmitOrderList(command) => command.params.as_ref(),
             Self::ModifyOrder(command) => command.params.as_ref(),
@@ -353,10 +356,17 @@ mod tests {
                 client_id,
                 strategy_id,
                 AccountId::from("SIM-001"),
-                "hyperliquid.user_outcome.split",
+                ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                    pair: BinaryOptionPair::new(
+                        InstrumentId::from("42-YES-OUTCOME.SIM"),
+                        InstrumentId::from("42-NO-OUTCOME.SIM"),
+                    )
+                    .unwrap(),
+                    quantity: Quantity::from("1"),
+                    params: None,
+                }),
                 UUID4::from("00000000-0000-4000-8000-000000000010"),
                 ts_init,
-                None,
                 None,
             )),
             TradingCommand::SubmitOrder(submit_order),

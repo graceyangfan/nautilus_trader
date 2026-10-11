@@ -16,7 +16,6 @@
 //! Live execution client implementation for the Hyperliquid adapter.
 
 use std::{
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -94,6 +93,7 @@ use crate::{
         },
         parse::derive_outcome_settlements,
     },
+    outcome_actions::{HyperliquidOutcomeAction, hyperliquid_outcome_action},
     outcome_settlement::{OutcomeSettlementTracker, build_settlement_fills},
     websocket::{
         ExecutionReport, NautilusWsMessage, USER_STREAMS_ENDPOINT,
@@ -108,8 +108,6 @@ use crate::{
 
 const TASK_SHUTDOWN_DENIAL_REASON: &str = "Hyperliquid execution client is shutting down";
 const RECONNECT_SUBSCRIPTION_TIMEOUT: Duration = Duration::from_secs(10);
-const SPLIT_OUTCOME_ACTION: &str = "hyperliquid.user_outcome.split";
-const MERGE_OUTCOME_ACTION: &str = "hyperliquid.user_outcome.merge";
 
 // Covers timestamp disorder between `orderUpdates` and `userEvents` and clock skew in the
 // stream start time; recovered reports the stream already processed are deduplicated.
@@ -121,60 +119,29 @@ const RECONNECT_FOLLOW_UP_DELAY: Duration = Duration::from_secs(5);
 fn outcome_action_from_command(
     command: &ExecuteAction,
 ) -> anyhow::Result<HyperliquidExchangeAction> {
-    let params = command
-        .params
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Execution action '{}' requires params", command.action))?;
-    let outcome = params
-        .get_u64("outcome")
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Execution action '{}' requires a u32 outcome",
-                command.action
-            )
-        })?;
-
-    let op = match command.action.as_str() {
-        SPLIT_OUTCOME_ACTION => {
+    let action = command.action.binary_option().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Execution action '{}' is not supported by Hyperliquid",
+            command.action.name()
+        )
+    })?;
+    let action = hyperliquid_outcome_action(action)?;
+    let op = match action {
+        HyperliquidOutcomeAction::Split { outcome, amount } => {
             HyperliquidExchangeUserOutcomeOp::SplitOutcome(HyperliquidExchangeSplitOutcomeParams {
                 outcome,
-                amount: decimal_param(params, "amount")?,
+                amount,
             })
         }
-        MERGE_OUTCOME_ACTION => {
+        HyperliquidOutcomeAction::Merge { outcome, amount } => {
             HyperliquidExchangeUserOutcomeOp::MergeOutcome(HyperliquidExchangeMergeOutcomeParams {
                 outcome,
-                amount: optional_decimal_param(params, "amount")?,
+                amount: Some(amount),
             })
         }
-        _ => anyhow::bail!(
-            "Unsupported Hyperliquid execution action '{}'",
-            command.action
-        ),
     };
 
     Ok(HyperliquidExchangeAction::UserOutcome { op })
-}
-
-fn decimal_param(params: &Params, key: &str) -> anyhow::Result<Decimal> {
-    let value = params
-        .get(key)
-        .ok_or_else(|| anyhow::anyhow!("Execution action requires '{key}'"))?;
-    let value = value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .or_else(|| value.as_number().map(ToString::to_string))
-        .ok_or_else(|| anyhow::anyhow!("Execution action '{key}' must be a decimal string"))?;
-    Decimal::from_str(&value)
-        .map_err(|e| anyhow::anyhow!("Execution action '{key}' was not a valid decimal: {e}"))
-}
-
-fn optional_decimal_param(params: &Params, key: &str) -> anyhow::Result<Option<Decimal>> {
-    match params.get(key) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(_) => decimal_param(params, key).map(Some),
-    }
 }
 
 fn is_default_action_response(response: &HyperliquidExchangeResponse) -> bool {
@@ -4548,9 +4515,15 @@ mod tests {
     use std::{cell::RefCell, rc::Rc, sync::Arc};
 
     use alloy::signers::local::PrivateKeySigner;
-    use nautilus_common::{cache::Cache, messages::ExecutionEvent};
+    use nautilus_common::{
+        cache::Cache,
+        messages::{
+            ExecutionEvent,
+            execution::{BinaryOptionAction, BinaryOptionPair, ExecutionAction},
+        },
+    };
     use nautilus_core::{
-        Params, UUID4, UnixNanos, string::secret::SecretString, time::get_atomic_clock_realtime,
+        UUID4, UnixNanos, string::secret::SecretString, time::get_atomic_clock_realtime,
     };
     use nautilus_live::{
         ExecutionEventEmitter,
@@ -4582,11 +4555,10 @@ mod tests {
     use super::{
         CancelEntry, ExecuteAction, ExecutionActionStatus, ExecutionClient, ExecutionClientCore,
         ExecutionReport, FifoCache, HyperliquidExecutionClient, HyperliquidExecutionClientConfig,
-        HyperliquidHttpClient, HyperliquidWebSocketClient, MERGE_OUTCOME_ACTION,
-        PostRejectionRoute, SPLIT_OUTCOME_ACTION, StagedBracketChild, StagedBracketState,
-        WsDispatchState, attach_known_client_order_id, build_ouo_resize_request,
-        can_fast_cancel_order, classify_post_failure, determine_order_list_grouping,
-        emit_execution_action_result_if_current_generation,
+        HyperliquidHttpClient, HyperliquidWebSocketClient, PostRejectionRoute, StagedBracketChild,
+        StagedBracketState, WsDispatchState, attach_known_client_order_id,
+        build_ouo_resize_request, can_fast_cancel_order, classify_post_failure,
+        determine_order_list_grouping, emit_execution_action_result_if_current_generation,
         execution_action_result_from_post_outcome, handle_execution_report,
         outcome_action_from_command, reconnect_reports_from_history, register_order_context_into,
         resolve_order_legs, split_fast_cancel_requests, ts_venue, validate_order_for_hyperliquid,
@@ -4595,6 +4567,7 @@ mod tests {
         common::{
             consts::{HYPERLIQUID_CLIENT_ID, HYPERLIQUID_VENUE},
             enums::HyperliquidEnvironment,
+            outcome_pair_instrument_ids,
             parse::make_fill_trade_id,
             testing::load_test_data,
         },
@@ -4612,29 +4585,35 @@ mod tests {
 
     const TEST_INSTRUMENT_ID: &str = "BTC-USD-PERP.HYPERLIQUID";
 
-    fn outcome_action_command(action: &str, params: Params) -> ExecuteAction {
+    fn outcome_action_command(action: BinaryOptionAction) -> ExecuteAction {
         ExecuteAction::new(
             TraderId::from("TRADER-001"),
             Some(*HYPERLIQUID_CLIENT_ID),
             StrategyId::from("STRATEGY-001"),
             AccountId::from("HYPERLIQUID-001"),
-            action,
+            ExecutionAction::BinaryOption(action),
             UUID4::new(),
             UnixNanos::from(1),
-            Some(params),
             None,
         )
     }
 
+    fn outcome_pair() -> BinaryOptionPair {
+        let [yes_instrument_id, no_instrument_id] = outcome_pair_instrument_ids(42).unwrap();
+        BinaryOptionPair::new(yes_instrument_id, no_instrument_id).unwrap()
+    }
+
+    fn split_action() -> BinaryOptionAction {
+        BinaryOptionAction::Split {
+            pair: outcome_pair(),
+            quantity: Quantity::from("1.25"),
+            params: None,
+        }
+    }
+
     #[rstest]
     fn test_outcome_action_from_command_builds_split_request() {
-        let mut params = Params::new();
-        params.insert("outcome".to_string(), serde_json::json!(42));
-        params.insert("amount".to_string(), serde_json::json!("1.25"));
-
-        let action =
-            outcome_action_from_command(&outcome_action_command(SPLIT_OUTCOME_ACTION, params))
-                .unwrap();
+        let action = outcome_action_from_command(&outcome_action_command(split_action())).unwrap();
 
         assert_eq!(
             serde_json::to_value(action).unwrap(),
@@ -4646,26 +4625,27 @@ mod tests {
     }
 
     #[rstest]
-    fn test_outcome_action_from_command_builds_max_merge_request() {
-        let mut params = Params::new();
-        params.insert("outcome".to_string(), serde_json::json!(42));
-
+    fn test_outcome_action_from_command_builds_merge_request() {
         let action =
-            outcome_action_from_command(&outcome_action_command(MERGE_OUTCOME_ACTION, params))
-                .unwrap();
+            outcome_action_from_command(&outcome_action_command(BinaryOptionAction::Merge {
+                pair: outcome_pair(),
+                quantity: Quantity::from("1.25"),
+                params: None,
+            }))
+            .unwrap();
 
         assert_eq!(
             serde_json::to_value(action).unwrap(),
             serde_json::json!({
                 "type": "userOutcome",
-                "mergeOutcome": {"outcome": 42, "amount": null},
+                "mergeOutcome": {"outcome": 42, "amount": "1.25"},
             }),
         );
     }
 
     #[rstest]
     fn test_execution_action_result_preserves_post_delivery_evidence() {
-        let command = outcome_action_command(SPLIT_OUTCOME_ACTION, Params::new());
+        let command = outcome_action_command(split_action());
         let accepted = execution_action_result_from_post_outcome(
             &command,
             Ok(HyperliquidExchangeResponse::Status {
@@ -4785,7 +4765,7 @@ mod tests {
             .expect("initial task generation must be open")
             .cancellation_token();
         let result = execution_action_result_from_post_outcome(
-            &outcome_action_command(SPLIT_OUTCOME_ACTION, Params::new()),
+            &outcome_action_command(split_action()),
             Ok(HyperliquidExchangeResponse::Status {
                 status: "ok".to_string(),
                 response: serde_json::json!({"type": "default"}),

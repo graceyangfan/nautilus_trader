@@ -46,6 +46,7 @@ use nautilus_execution::{
         fee::FeeModelHandle,
         fill::FillModelHandle,
         latency::{LatencyModel, LatencyModelHandle},
+        outcome_action::{BinaryOptionActionProfile, plan_binary_option_action},
     },
 };
 use nautilus_model::{
@@ -153,6 +154,7 @@ pub struct SimulatedExchange {
     default_leverage: Decimal,
     exec_client: Option<Rc<dyn ExecutionClient>>,
     event_handler: Option<Rc<dyn Fn(OrderEventAny)>>,
+    action_result_handler: Option<Rc<dyn Fn(ExecutionActionResult)>>,
     /// Set only while a trading command is being processed synchronously, which is the
     /// window in which the execution engine holds a borrow and a re-entrant event would
     /// panic. Outside it (market data, iteration, expiration, liquidation, open-order
@@ -161,6 +163,7 @@ pub struct SimulatedExchange {
     fee_model: FeeModelHandle,
     fill_model: FillModelHandle,
     latency_model: Option<LatencyModelHandle>,
+    binary_option_action_profile: Option<BinaryOptionActionProfile>,
     instruments: AHashMap<InstrumentId, InstrumentAny>,
     matching_engines: IndexMap<InstrumentId, OrderMatchingEngine>,
     last_raw_id: u32,
@@ -247,10 +250,12 @@ impl SimulatedExchange {
             default_leverage,
             exec_client: None,
             event_handler: None,
+            action_result_handler: None,
             deferring_events: Rc::new(Cell::new(false)),
             fee_model: config.fee_model,
             fill_model: config.fill_model,
             latency_model: config.latency_model,
+            binary_option_action_profile: config.binary_option_action_profile,
             instruments: AHashMap::new(),
             matching_engines: IndexMap::new(),
             last_raw_id: 0,
@@ -539,6 +544,14 @@ impl SimulatedExchange {
             matching_engine.set_event_handler(Rc::clone(&gated));
         }
         self.event_handler = Some(gated);
+    }
+
+    /// Sets the deferred execution-action result handler.
+    pub(crate) fn set_execution_action_result_handler(
+        &mut self,
+        handler: Rc<dyn Fn(ExecutionActionResult)>,
+    ) {
+        self.action_result_handler = Some(handler);
     }
 
     /// Returns the best bid price for the given instrument, if available.
@@ -861,27 +874,41 @@ impl SimulatedExchange {
     }
 
     fn reject_execution_action(&self, command: &ExecuteAction, reason: &str) {
-        let result = ExecutionActionResult::new(
+        self.send_execution_action_result(
             command,
             ExecutionActionStatus::Rejected,
             Some(reason.to_string()),
+        );
+    }
+
+    fn accept_execution_action(&self, command: &ExecuteAction) {
+        self.send_execution_action_result(command, ExecutionActionStatus::Accepted, None);
+    }
+
+    fn send_execution_action_result(
+        &self,
+        command: &ExecuteAction,
+        status: ExecutionActionStatus,
+        reason: Option<String>,
+    ) {
+        let result = ExecutionActionResult::new(
+            command,
+            status,
+            reason,
             None,
             self.clock.borrow().timestamp_ns(),
         );
-        let topic = switchboard::get_execution_action_result_topic(command.strategy_id);
-        msgbus::publish_execution_action_result(topic, &result);
+
+        if let Some(handler) = &self.action_result_handler {
+            handler(result);
+        } else {
+            let topic = switchboard::get_execution_action_result_topic(command.strategy_id);
+            msgbus::publish_execution_action_result(topic, &result);
+        }
     }
 
     /// Sends a trading command to the exchange for processing.
     pub fn send(&mut self, command: TradingCommand) {
-        if let TradingCommand::ExecuteAction(action) = &command {
-            self.reject_execution_action(
-                action,
-                "Simulated exchange does not support execution actions",
-            );
-            return;
-        }
-
         if matches!(
             &command,
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
@@ -909,7 +936,9 @@ impl SimulatedExchange {
     fn generate_inflight_command(&mut self, command: &TradingCommand) -> (UnixNanos, u32) {
         if let Some(latency_model) = &self.latency_model {
             let ts = match command {
-                TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
+                TradingCommand::SubmitOrder(_)
+                | TradingCommand::SubmitOrderList(_)
+                | TradingCommand::ExecuteAction(_) => {
                     command.ts_init() + latency_model.get_insert_latency()
                 }
                 TradingCommand::ModifyOrder(_) | TradingCommand::ModifyOrders(_) => {
@@ -920,7 +949,6 @@ impl SimulatedExchange {
                 | TradingCommand::CancelAllOrders(_) => {
                     command.ts_init() + latency_model.get_delete_latency()
                 }
-                TradingCommand::ExecuteAction(_) => command.ts_init(),
                 _ => panic!("Cannot handle command: {command:?}"),
             };
 
@@ -1901,10 +1929,7 @@ impl SimulatedExchange {
         self.inflight_orders.remove(&command);
 
         if let TradingCommand::ExecuteAction(action) = &command {
-            self.reject_execution_action(
-                action,
-                "Simulated exchange does not support execution actions",
-            );
+            self.process_execution_action(action);
             return;
         }
 
@@ -1987,6 +2012,50 @@ impl SimulatedExchange {
             }
         } else {
             panic!("Matching engine not found for instrument {instrument_id}");
+        }
+    }
+
+    fn process_execution_action(&self, command: &ExecuteAction) {
+        let Some(profile) = &self.binary_option_action_profile else {
+            self.reject_execution_action(
+                command,
+                "Simulated exchange does not support execution actions",
+            );
+            return;
+        };
+
+        let Some(exec_client) = &self.exec_client else {
+            self.reject_execution_action(command, "Execution client is not initialized");
+            return;
+        };
+
+        if exec_client.account_id() != command.account_id {
+            self.reject_execution_action(command, "Action account does not match execution client");
+            return;
+        }
+
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let fills = {
+            let cache = self.cache.borrow();
+            plan_binary_option_action(profile, command, &cache, ts_event)
+        };
+
+        match fills {
+            Ok(fills) => {
+                if fills.iter().any(|fill| fill.instrument_id.venue != self.id) {
+                    self.reject_execution_action(
+                        command,
+                        "Resolved binary option pair does not match simulated venue",
+                    );
+                    return;
+                }
+
+                for fill in fills {
+                    self.dispatch_order_event(OrderEventAny::Filled(fill));
+                }
+                self.accept_execution_action(command);
+            }
+            Err(e) => self.reject_execution_action(command, &e.to_string()),
         }
     }
 
@@ -2161,23 +2230,38 @@ fn revert_funding_adjustments(
 
 #[cfg(test)]
 mod tests {
-    use nautilus_common::messages::execution::{QueryAccount, QueryOrder, SubmitOrder};
-    use nautilus_core::DurationNanos;
+    use async_trait::async_trait;
+    use nautilus_common::{
+        config::ConfigError,
+        messages::execution::{
+            BinaryOptionAction, BinaryOptionPair, ExecutionAction, QueryAccount, QueryOrder,
+            SubmitOrder,
+        },
+    };
+    use nautilus_core::{DurationNanos, Params};
     use nautilus_execution::models::{
         fee::{FeeModelAny, MakerTakerFeeModel},
         latency::{LatencyModelHandle, StaticLatencyModel},
+        outcome_action::{
+            BinaryOptionActionConfig, BinaryOptionActionProfile, BinaryOptionActionValidator,
+            BinaryOptionActionValidatorHandle,
+        },
     };
     use nautilus_model::{
-        accounts::MarginAccount,
+        accounts::{CashAccount, MarginAccount},
         enums::{AccountType, BookType, OrderSide, OrderType},
         events::AccountState,
-        identifiers::{ClientOrderId, StrategyId, TraderId},
-        instruments::{CurrencyPair, InstrumentAny, stubs::audusd_sim},
+        identifiers::{AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId},
+        instruments::{
+            CurrencyPair, InstrumentAny,
+            stubs::{audusd_sim, binary_option},
+        },
         orders::{OrderTestBuilder, stubs::TestOrderEventStubs},
         stubs::TestDefault,
-        types::AccountBalance,
+        types::{AccountBalance, Currency, MarginBalance},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
 
     use super::*;
 
@@ -2190,6 +2274,173 @@ mod tests {
         Queued,
         /// `use_message_queue = false`: synchronous `process_trading_command`.
         Immediate,
+    }
+
+    #[derive(Debug)]
+    struct TestActionValidator;
+
+    impl BinaryOptionActionValidator for TestActionValidator {
+        fn validate(&self, action: &BinaryOptionAction, _cache: &Cache) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                action.pair()
+                    == BinaryOptionPair::new(
+                        InstrumentId::from("42-YES-OUTCOME.SIM"),
+                        InstrumentId::from("42-NO-OUTCOME.SIM"),
+                    )?,
+                "Unsupported test binary-option pair"
+            );
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestExecutionClient {
+        account_id: AccountId,
+    }
+
+    #[async_trait(?Send)]
+    impl ExecutionClient for TestExecutionClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            ClientId::from("SIM")
+        }
+
+        fn account_id(&self) -> AccountId {
+            self.account_id
+        }
+
+        fn venue(&self) -> Venue {
+            Venue::from("SIM")
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+            _info: Option<Params>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn action_profile() -> BinaryOptionActionProfile {
+        BinaryOptionActionProfile::new(
+            BinaryOptionActionConfig::new(Decimal::ZERO, Decimal::ZERO).unwrap(),
+            BinaryOptionActionValidatorHandle::new(TestActionValidator),
+        )
+    }
+
+    fn action_command() -> ExecuteAction {
+        ExecuteAction::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("SIM")),
+            StrategyId::from("STRATEGY-001"),
+            AccountId::from("SIM-001"),
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.SIM"),
+                    InstrumentId::from("42-NO-OUTCOME.SIM"),
+                )
+                .unwrap(),
+                quantity: Quantity::from("1.25"),
+                params: None,
+            }),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )
+    }
+
+    fn setup_action_exchange(events: &Rc<RefCell<Vec<String>>>) -> SimulatedExchange {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut yes = binary_option();
+        yes.id = InstrumentId::from("42-YES-OUTCOME.SIM");
+        yes.expiration_ns = UnixNanos::from(2);
+        let mut no = yes.clone();
+        no.id = InstrumentId::from("42-NO-OUTCOME.SIM");
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::BinaryOption(yes))
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_instrument(InstrumentAny::BinaryOption(no))
+            .unwrap();
+
+        let balance = Money::from("100 USDC");
+        let account = CashAccount::new(
+            AccountState::new(
+                AccountId::from("SIM-001"),
+                AccountType::Cash,
+                vec![AccountBalance::new(
+                    balance,
+                    Money::zero(balance.currency),
+                    balance,
+                )],
+                Vec::new(),
+                true,
+                UUID4::new(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                Some(Currency::USDC()),
+            ),
+            true,
+            false,
+        );
+        cache
+            .borrow_mut()
+            .add_account(AccountAny::Cash(account))
+            .unwrap();
+
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(VirtualClock::new()));
+        let config = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Cash)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![balance])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .binary_option_action_profile(action_profile())
+            .use_message_queue(false)
+            .build()
+            .unwrap();
+        let mut exchange = SimulatedExchange::new(config, cache, clock).unwrap();
+
+        let order_events = events.clone();
+        exchange.set_event_handler(Rc::new(move |event| {
+            order_events
+                .borrow_mut()
+                .push(event.instrument_id().to_string());
+        }));
+        let action_events = events.clone();
+        exchange.set_execution_action_result_handler(Rc::new(move |result| {
+            action_events.borrow_mut().push(result.status.to_string());
+        }));
+        exchange.register_client(Rc::new(TestExecutionClient {
+            account_id: AccountId::from("SIM-001"),
+        }));
+        exchange
     }
 
     fn setup_exchange(dispatch: Dispatch) -> SimulatedExchange {
@@ -2219,6 +2470,67 @@ mod tests {
         }
 
         SimulatedExchange::new(config, cache, clock).unwrap()
+    }
+
+    #[rstest]
+    fn test_execution_action_emits_yes_no_fills_then_accepted() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut exchange = setup_action_exchange(&events);
+
+        exchange.send(TradingCommand::ExecuteAction(action_command()));
+
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                "42-YES-OUTCOME.SIM".to_string(),
+                "42-NO-OUTCOME.SIM".to_string(),
+                "accepted".to_string(),
+            ]
+        );
+    }
+
+    #[rstest]
+    fn test_execution_action_without_profile_is_rejected_without_order_events() {
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let order_event_count = Rc::new(Cell::new(0));
+        let mut exchange = setup_exchange(Dispatch::Immediate);
+        exchange.set_event_handler(Rc::new({
+            let order_event_count = Rc::clone(&order_event_count);
+            move |_| order_event_count.set(order_event_count.get() + 1)
+        }));
+        exchange.set_execution_action_result_handler(Rc::new({
+            let results = Rc::clone(&results);
+            move |result| results.borrow_mut().push(result)
+        }));
+
+        exchange.send(TradingCommand::ExecuteAction(action_command()));
+
+        assert_eq!(results.borrow().len(), 1);
+        assert_eq!(results.borrow()[0].status, ExecutionActionStatus::Rejected);
+        assert_eq!(
+            results.borrow()[0].reason.as_deref(),
+            Some("Simulated exchange does not support execution actions")
+        );
+        assert_eq!(order_event_count.get(), 0);
+    }
+
+    #[rstest]
+    fn test_binary_option_action_profile_requires_cash_netting_mutable_config() {
+        let result = SimulatedVenueConfig::builder()
+            .venue(Venue::from("SIM"))
+            .oms_type(OmsType::Hedging)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("100 USDC")])
+            .fee_model(FeeModelAny::MakerTaker(MakerTakerFeeModel::zero()).into())
+            .binary_option_action_profile(action_profile())
+            .frozen_account(true)
+            .build();
+
+        let Err(ConfigError::Multiple { errors }) = result else {
+            panic!("expected all incompatible action profile settings to be reported");
+        };
+        assert_eq!(errors.len(), 3);
     }
 
     #[rstest]

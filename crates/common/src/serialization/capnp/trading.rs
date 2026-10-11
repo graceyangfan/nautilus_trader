@@ -24,8 +24,9 @@ use nautilus_serialization::{
 };
 
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction, ModifyOrder,
-    QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+    BatchCancelOrders, BatchModifyOrders, BinaryOptionAction, BinaryOptionPair, CancelAllOrders,
+    CancelOrder, ExecuteAction, ModifyOrder, QueryAccount, QueryOrder, SubmitOrder,
+    SubmitOrderList, TradingCommand,
 };
 
 /// Populates a `StringMap` builder from `Params` (`IndexMap<String, Value>`).
@@ -36,6 +37,59 @@ fn populate_string_map(builder: base_capnp::string_map::Builder<'_>, params: &Pa
         entry_builder.set_key(key.as_str());
         let value_str = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
         entry_builder.set_value(value_str.as_str());
+    }
+}
+
+impl<'a> ToCapnp<'a> for BinaryOptionPair {
+    type Builder = trading_capnp::binary_option_pair::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        let yes_instrument_id_builder = builder.reborrow().init_yes_instrument_id();
+        self.yes_instrument_id.to_capnp(yes_instrument_id_builder);
+
+        let no_instrument_id_builder = builder.reborrow().init_no_instrument_id();
+        self.no_instrument_id.to_capnp(no_instrument_id_builder);
+    }
+}
+
+impl<'a> ToCapnp<'a> for BinaryOptionAction {
+    type Builder = trading_capnp::binary_option_action::Builder<'a>;
+
+    fn to_capnp(&self, builder: Self::Builder) {
+        match self {
+            Self::Split {
+                pair,
+                quantity,
+                params,
+            } => {
+                let mut split_builder = builder.init_split();
+                let pair_builder = split_builder.reborrow().init_pair();
+                pair.to_capnp(pair_builder);
+                let quantity_builder = split_builder.reborrow().init_quantity();
+                quantity.to_capnp(quantity_builder);
+
+                if let Some(params) = params {
+                    let params_builder = split_builder.reborrow().init_params();
+                    populate_string_map(params_builder, params);
+                }
+            }
+            Self::Merge {
+                pair,
+                quantity,
+                params,
+            } => {
+                let mut merge_builder = builder.init_merge();
+                let pair_builder = merge_builder.reborrow().init_pair();
+                pair.to_capnp(pair_builder);
+                let quantity_builder = merge_builder.reborrow().init_quantity();
+                quantity.to_capnp(quantity_builder);
+
+                if let Some(params) = params {
+                    let params_builder = merge_builder.reborrow().init_params();
+                    populate_string_map(params_builder, params);
+                }
+            }
+        }
     }
 }
 
@@ -327,18 +381,19 @@ impl<'a> ToCapnp<'a> for ExecuteAction {
 
         let account_id_builder = builder.reborrow().init_account_id();
         self.account_id.to_capnp(account_id_builder);
-        builder.set_action(&self.action);
+        let action_builder = builder.reborrow().init_action();
+
+        match &self.action {
+            crate::messages::execution::ExecutionAction::BinaryOption(action) => {
+                action.to_capnp(action_builder);
+            }
+        }
 
         let command_id_builder = builder.reborrow().init_command_id();
         self.command_id.to_capnp(command_id_builder);
 
         let mut ts_init_builder = builder.reborrow().init_ts_init();
         ts_init_builder.set_value(*self.ts_init);
-
-        if let Some(params) = self.params.as_ref() {
-            let params_builder = builder.reborrow().init_params();
-            populate_string_map(params_builder, params);
-        }
 
         if let Some(correlation_id) = self.correlation_id.as_ref() {
             let correlation_id_builder = builder.reborrow().init_correlation_id();
@@ -473,7 +528,7 @@ impl<'a> ToCapnp<'a> for TradingCommand {
 #[cfg(test)]
 mod tests {
     use capnp::message::Builder;
-    use nautilus_core::{Params, UnixNanos};
+    use nautilus_core::UnixNanos;
     use nautilus_model::{
         enums::{OrderSide, OrderType},
         identifiers::{
@@ -488,7 +543,7 @@ mod tests {
 
     use super::*;
     use crate::messages::execution::{
-        ExecuteAction,
+        BinaryOptionAction, BinaryOptionPair, ExecuteAction, ExecutionAction,
         cancel::{BatchCancelOrdersBuilder, CancelAllOrdersBuilder, CancelOrderBuilder},
         modify::{BatchModifyOrdersBuilder, ModifyOrderBuilder},
         query::{QueryAccountBuilder, QueryOrderBuilder},
@@ -1151,17 +1206,22 @@ mod tests {
         command_id: UUID4,
         ts_init: UnixNanos,
     ) {
-        let mut params = Params::new();
-        params.insert("outcome".to_string(), serde_json::json!(42));
         let command = TradingCommand::ExecuteAction(ExecuteAction::new(
             trader_id,
             Some(ClientId::from("HYPERLIQUID")),
             strategy_id,
             AccountId::from("HYPERLIQUID-001"),
-            "hyperliquid.user_outcome.split",
+            ExecutionAction::BinaryOption(BinaryOptionAction::Split {
+                pair: BinaryOptionPair::new(
+                    InstrumentId::from("42-YES-OUTCOME.HYPERLIQUID"),
+                    InstrumentId::from("42-NO-OUTCOME.HYPERLIQUID"),
+                )
+                .unwrap(),
+                quantity: Quantity::from("1.25"),
+                params: None,
+            }),
             command_id,
             ts_init,
-            Some(params),
             None,
         ));
 
@@ -1181,10 +1241,35 @@ mod tests {
             _ => panic!("Expected execute action variant"),
         };
 
+        let split = match action
+            .get_action()
+            .expect("Valid binary option action")
+            .which()
+            .expect("Valid binary option action variant")
+        {
+            trading_capnp::binary_option_action::Which::Split(split) => {
+                split.expect("Valid binary option split action")
+            }
+            trading_capnp::binary_option_action::Which::Merge(_) => {
+                panic!("Expected binary option split action")
+            }
+        };
+        let pair = split.get_pair().expect("Valid binary option pair");
         assert_eq!(
-            action.get_action().expect("Valid action"),
-            "hyperliquid.user_outcome.split",
+            InstrumentId::from_capnp(pair.get_yes_instrument_id().expect("Valid Yes ID"))
+                .expect("Yes ID decodes"),
+            InstrumentId::from("42-YES-OUTCOME.HYPERLIQUID"),
         );
-        assert!(action.has_params());
+        assert_eq!(
+            InstrumentId::from_capnp(pair.get_no_instrument_id().expect("Valid No ID"))
+                .expect("No ID decodes"),
+            InstrumentId::from("42-NO-OUTCOME.HYPERLIQUID"),
+        );
+        assert_eq!(
+            Quantity::from_capnp(split.get_quantity().expect("Valid quantity"))
+                .expect("Quantity decodes"),
+            Quantity::from("1.25"),
+        );
+        assert!(!split.has_params());
     }
 }

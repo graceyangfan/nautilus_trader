@@ -45,6 +45,7 @@ use nautilus_common::{
         cache::PyCache,
         clock::PyClock,
         config_error_to_pyvalue_err,
+        execution_action::pyobject_to_execution_action,
         indicators::{registered_python_indicators, wrap_python_indicator},
         logging::{PyLogger, format_exception},
         order_factory::PyOrderFactory,
@@ -2277,20 +2278,16 @@ impl PyStrategy {
     }
 
     #[pyo3(name = "execute_action")]
-    #[pyo3(signature = (account_id, action, client_id=None, params=None))]
+    #[pyo3(signature = (account_id, action, client_id=None))]
     fn py_execute_action(
         &mut self,
         py: Python<'_>,
         account_id: AccountId,
-        action: String,
+        action: Py<PyAny>,
         client_id: Option<ClientId>,
-        params: Option<Py<PyDict>>,
     ) -> PyResult<nautilus_core::UUID4> {
-        let params_map = match params {
-            Some(dict) => from_pydict(py, &dict)?,
-            None => None,
-        };
-        Strategy::execute_action(self.inner_mut(), account_id, client_id, action, params_map)
+        let action = pyobject_to_execution_action(py, action)?;
+        Strategy::execute_action(self.inner_mut(), account_id, client_id, action)
             .map_err(to_pyruntime_err)
     }
 

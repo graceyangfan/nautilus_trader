@@ -60,6 +60,7 @@ pub mod data_types;
 pub mod execution;
 pub mod factories;
 pub mod http;
+pub mod outcome_actions;
 pub mod outcome_settlement;
 pub mod signing;
 pub mod websocket;
@@ -75,5 +76,6 @@ pub use crate::{
     execution::HyperliquidExecutionClient,
     factories::{HyperliquidDataClientFactory, HyperliquidExecutionClientFactory},
     http::client::HyperliquidHttpClient,
+    outcome_actions::{HyperliquidBinaryOptionActionValidator, hyperliquid_outcome_action_profile},
     websocket::client::HyperliquidWebSocketClient,
 };

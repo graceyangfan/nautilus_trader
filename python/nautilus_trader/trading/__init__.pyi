@@ -620,9 +620,8 @@ class Strategy:
     def execute_action(
         self,
         account_id: model.AccountId,
-        action: str,
+        action: typing.Any,
         client_id: model.ClientId | None = None,
-        params: dict | None = None,
     ) -> core.UUID4: ...
     def query_order(
         self, order: typing.Any, client_id: model.ClientId | None = None, params: dict | None = None
