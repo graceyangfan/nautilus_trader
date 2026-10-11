@@ -48,8 +48,9 @@ use nautilus_common::{
     messages::{
         ExecutionReport,
         execution::{
-            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
-            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+            BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
+            ExecutionActionResult, ExecutionActionStatus, ModifyOrder, QueryAccount, QueryOrder,
+            SubmitOrder, SubmitOrderList, TradingCommand,
         },
     },
     msgbus::{
@@ -2191,6 +2192,15 @@ impl ExecutionEngine {
         if let Some(cid) = command.client_id()
             && self.external_clients.contains(&cid)
         {
+            if let TradingCommand::ExecuteAction(cmd) = &command {
+                self.reject_execution_action(
+                    cmd,
+                    "External execution clients cannot provide correlated execution action results"
+                        .to_string(),
+                );
+                return;
+            }
+
             let topic = format!("commands.trading.{cid}");
             msgbus::publish_any(topic.into(), &command);
 
@@ -2232,6 +2242,9 @@ impl ExecutionEngine {
             .to_string();
 
             match command {
+                TradingCommand::ExecuteAction(cmd) => {
+                    self.reject_execution_action(&cmd, reason);
+                }
                 TradingCommand::SubmitOrder(cmd) => {
                     let order = self
                         .cache
@@ -2260,6 +2273,7 @@ impl ExecutionEngine {
         };
 
         match command {
+            TradingCommand::ExecuteAction(cmd) => self.handle_execute_action(client, cmd),
             TradingCommand::SubmitOrder(cmd) => self.handle_submit_order(client, cmd),
             TradingCommand::SubmitOrderList(cmd) => self.handle_submit_order_list(client, cmd),
             TradingCommand::ModifyOrder(cmd) => self.handle_modify_order(client, cmd),
@@ -2399,6 +2413,10 @@ impl ExecutionEngine {
 
     fn routing_context_for_command(command: &TradingCommand) -> String {
         match command {
+            TradingCommand::ExecuteAction(cmd) => {
+                let issuer = cmd.account_id.get_issuer();
+                format!("account_id={}, issuer={issuer}", cmd.account_id)
+            }
             TradingCommand::SubmitOrder(cmd) => format!("venue={}", cmd.instrument_id.venue),
             TradingCommand::SubmitOrderList(cmd) => format!("venue={}", cmd.instrument_id.venue),
             TradingCommand::ModifyOrder(cmd) => format!("venue={}", cmd.instrument_id.venue),
@@ -2452,6 +2470,7 @@ impl ExecutionEngine {
 
     fn account_id_for_command(&self, command: &TradingCommand) -> Option<AccountId> {
         match command {
+            TradingCommand::ExecuteAction(cmd) => Some(cmd.account_id),
             TradingCommand::QueryAccount(cmd) => Some(cmd.account_id),
             TradingCommand::SubmitOrder(cmd) => self
                 .cache
@@ -2478,6 +2497,7 @@ impl ExecutionEngine {
 
     const fn instrument_id_for_command(command: &TradingCommand) -> Option<InstrumentId> {
         match command {
+            TradingCommand::ExecuteAction(_) => None,
             TradingCommand::SubmitOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::SubmitOrderList(cmd) => Some(cmd.instrument_id),
             TradingCommand::ModifyOrder(cmd) => Some(cmd.instrument_id),
@@ -2488,6 +2508,26 @@ impl ExecutionEngine {
             TradingCommand::QueryOrder(cmd) => Some(cmd.instrument_id),
             TradingCommand::QueryAccount(_) => None,
         }
+    }
+
+    fn handle_execute_action(&self, client: &dyn ExecutionClient, cmd: ExecuteAction) {
+        let rejected_cmd = cmd.clone();
+        if let Err(e) = client.execute_action(cmd) {
+            self.reject_execution_action(&rejected_cmd, e.to_string());
+        }
+    }
+
+    fn reject_execution_action(&self, cmd: &ExecuteAction, reason: String) {
+        let ts_event = self.clock.borrow().timestamp_ns();
+        let result = ExecutionActionResult::new(
+            cmd,
+            ExecutionActionStatus::Rejected,
+            Some(reason),
+            None,
+            ts_event,
+        );
+        let topic = switchboard::get_execution_action_result_topic(cmd.strategy_id);
+        msgbus::publish_execution_action_result(topic, &result);
     }
 
     fn handle_submit_order(&self, client: &dyn ExecutionClient, cmd: SubmitOrder) {
@@ -5154,16 +5194,19 @@ enum SubmissionValidationResult {
 mod tests {
     use nautilus_common::{
         clock::VirtualClock,
-        msgbus::{MessageBus, set_message_bus},
+        messages::execution::{
+            ExecuteAction, ExecutionActionResult, ExecutionActionStatus, TradingCommand,
+        },
+        msgbus::{MessageBus, set_message_bus, switchboard},
     };
     use nautilus_model::{
         accounts::CashAccount,
-        enums::{LiquiditySide, OrderSide, OrderType, PositionSide},
+        enums::{LiquiditySide, OmsType, OrderSide, OrderType, PositionSide},
         events::{
             OrderFillVoided,
             order::spec::{OrderCanceledSpec, OrderFillVoidedSpec, OrderFilledSpec},
         },
-        identifiers::{AccountId, ClientOrderId, TradeId, VenueOrderId},
+        identifiers::{AccountId, ClientId, ClientOrderId, TradeId, TraderId, Venue, VenueOrderId},
         instruments::{InstrumentAny, stubs::audusd_sim},
         orders::{builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::PositionFillVoid,
@@ -5171,7 +5214,61 @@ mod tests {
     };
     use rstest::*;
 
-    use super::*;
+    use super::{stubs::StubExecutionClient, *};
+
+    #[rstest]
+    fn execute_action_for_unsupported_client_publishes_correlated_rejection() {
+        set_message_bus(Rc::new(RefCell::new(MessageBus::default())));
+        let clock = Rc::new(RefCell::new(VirtualClock::new()));
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let mut engine = ExecutionEngine::new(clock, cache, None);
+        let client_id = ClientId::from("HYPERLIQUID");
+        let account_id = AccountId::from("HYPERLIQUID-001");
+        engine
+            .register_client(Box::new(StubExecutionClient::new(
+                client_id,
+                account_id,
+                Venue::from("HYPERLIQUID"),
+                OmsType::Netting,
+                None,
+            )))
+            .unwrap();
+
+        let command = ExecuteAction::new(
+            TraderId::from("TRADER-001"),
+            Some(client_id),
+            StrategyId::from("STRATEGY-001"),
+            account_id,
+            "hyperliquid.user_outcome.split",
+            UUID4::from("00000000-0000-4000-8000-000000000001"),
+            UnixNanos::from(1),
+            None,
+            None,
+        );
+        let results = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&results);
+        let topic = switchboard::get_execution_action_result_topic(command.strategy_id);
+        msgbus::subscribe_execution_action_results(
+            topic.as_str().into(),
+            TypedHandler::from(move |result: &ExecutionActionResult| {
+                captured.borrow_mut().push(result.clone());
+            }),
+            None,
+        );
+
+        engine.execute(TradingCommand::ExecuteAction(command.clone()));
+
+        let results = results.borrow();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].command_id, command.command_id);
+        assert_eq!(results[0].status, ExecutionActionStatus::Rejected);
+        assert!(
+            results[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("not supported"))
+        );
+    }
 
     #[rstest]
     fn netting_positions_open_for_report_scopes_positions_by_account() {

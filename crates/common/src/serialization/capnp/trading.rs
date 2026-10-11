@@ -24,8 +24,8 @@ use nautilus_serialization::{
 };
 
 use crate::messages::execution::{
-    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount,
-    QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction, ModifyOrder,
+    QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
 };
 
 /// Populates a `StringMap` builder from `Params` (`IndexMap<String, Value>`).
@@ -310,6 +310,48 @@ impl<'a> ToCapnp<'a> for QueryAccount {
     }
 }
 
+impl<'a> ToCapnp<'a> for ExecuteAction {
+    type Builder = trading_capnp::execute_action::Builder<'a>;
+
+    fn to_capnp(&self, mut builder: Self::Builder) {
+        let trader_id_builder = builder.reborrow().init_trader_id();
+        self.trader_id.to_capnp(trader_id_builder);
+
+        if let Some(client_id) = self.client_id.as_ref() {
+            let client_id_builder = builder.reborrow().init_client_id();
+            client_id.to_capnp(client_id_builder);
+        }
+
+        let strategy_id_builder = builder.reborrow().init_strategy_id();
+        self.strategy_id.to_capnp(strategy_id_builder);
+
+        let account_id_builder = builder.reborrow().init_account_id();
+        self.account_id.to_capnp(account_id_builder);
+        builder.set_action(&self.action);
+
+        let command_id_builder = builder.reborrow().init_command_id();
+        self.command_id.to_capnp(command_id_builder);
+
+        let mut ts_init_builder = builder.reborrow().init_ts_init();
+        ts_init_builder.set_value(*self.ts_init);
+
+        if let Some(params) = self.params.as_ref() {
+            let params_builder = builder.reborrow().init_params();
+            populate_string_map(params_builder, params);
+        }
+
+        if let Some(correlation_id) = self.correlation_id.as_ref() {
+            let correlation_id_builder = builder.reborrow().init_correlation_id();
+            correlation_id.to_capnp(correlation_id_builder);
+        }
+
+        if let Some(causation_id) = self.causation_id.as_ref() {
+            let causation_id_builder = builder.reborrow().init_causation_id();
+            causation_id.to_capnp(causation_id_builder);
+        }
+    }
+}
+
 impl<'a> ToCapnp<'a> for SubmitOrder {
     type Builder = trading_capnp::submit_order::Builder<'a>;
 
@@ -384,6 +426,10 @@ impl<'a> ToCapnp<'a> for TradingCommand {
 
     fn to_capnp(&self, builder: Self::Builder) {
         match self {
+            Self::ExecuteAction(command) => {
+                let action_builder = builder.init_execute_action();
+                command.to_capnp(action_builder);
+            }
             Self::SubmitOrder(command) => {
                 let submit_builder = builder.init_submit_order();
                 command.to_capnp(submit_builder);
@@ -427,7 +473,7 @@ impl<'a> ToCapnp<'a> for TradingCommand {
 #[cfg(test)]
 mod tests {
     use capnp::message::Builder;
-    use nautilus_core::UnixNanos;
+    use nautilus_core::{Params, UnixNanos};
     use nautilus_model::{
         enums::{OrderSide, OrderType},
         identifiers::{
@@ -442,6 +488,7 @@ mod tests {
 
     use super::*;
     use crate::messages::execution::{
+        ExecuteAction,
         cancel::{BatchCancelOrdersBuilder, CancelAllOrdersBuilder, CancelOrderBuilder},
         modify::{BatchModifyOrdersBuilder, ModifyOrderBuilder},
         query::{QueryAccountBuilder, QueryOrderBuilder},
@@ -1095,5 +1142,49 @@ mod tests {
 
         // Verify it's a cancel order variant
         assert!(reader.has_cancel_order());
+    }
+
+    #[rstest]
+    fn test_execute_action_serialization(
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        command_id: UUID4,
+        ts_init: UnixNanos,
+    ) {
+        let mut params = Params::new();
+        params.insert("outcome".to_string(), serde_json::json!(42));
+        let command = TradingCommand::ExecuteAction(ExecuteAction::new(
+            trader_id,
+            Some(ClientId::from("HYPERLIQUID")),
+            strategy_id,
+            AccountId::from("HYPERLIQUID-001"),
+            "hyperliquid.user_outcome.split",
+            command_id,
+            ts_init,
+            Some(params),
+            None,
+        ));
+
+        let mut message = Builder::new_default();
+        {
+            let builder = message.init_root::<trading_capnp::trading_command::Builder>();
+            command.to_capnp(builder);
+        }
+
+        let reader = message
+            .get_root_as_reader::<trading_capnp::trading_command::Reader>()
+            .expect("Valid capnp message");
+        let action = match reader.which().expect("Valid command variant") {
+            trading_capnp::trading_command::Which::ExecuteAction(action) => {
+                action.expect("Valid execute action")
+            }
+            _ => panic!("Expected execute action variant"),
+        };
+
+        assert_eq!(
+            action.get_action().expect("Valid action"),
+            "hyperliquid.user_outcome.split",
+        );
+        assert!(action.has_params());
     }
 }

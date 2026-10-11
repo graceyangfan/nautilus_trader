@@ -1218,6 +1218,9 @@ impl SandboxInner {
         }
 
         match cmd {
+            TradingCommand::ExecuteAction(_) => {
+                log::warn!("Sandbox execution actions are not modeled");
+            }
             TradingCommand::SubmitOrder(cmd) => self.apply_submit_order(cmd)?,
             TradingCommand::SubmitOrderList(cmd) => {
                 // Only a deferred leg has an `OrderSubmitted` out that nothing else would resolve
@@ -1268,6 +1271,7 @@ impl SandboxInner {
         };
 
         match command {
+            TradingCommand::ExecuteAction(_) => {}
             TradingCommand::SubmitOrder(cmd) => reject_submit(
                 cmd.trader_id,
                 cmd.strategy_id,
@@ -1628,6 +1632,7 @@ impl SandboxInner {
         };
 
         match command {
+            TradingCommand::ExecuteAction(_) => DurationNanos::ZERO,
             TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
                 latency_model.get_insert_latency()
             }

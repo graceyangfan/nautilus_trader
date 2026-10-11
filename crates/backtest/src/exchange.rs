@@ -28,7 +28,9 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
-    messages::execution::{ModifyOrder, TradingCommand},
+    messages::execution::{
+        ExecuteAction, ExecutionActionResult, ExecutionActionStatus, ModifyOrder, TradingCommand,
+    },
     msgbus::{self, MessagingSwitchboard, TypedHandler, switchboard},
 };
 use nautilus_core::{
@@ -858,8 +860,28 @@ impl SimulatedExchange {
         test_clock.set_time(ts_now);
     }
 
+    fn reject_execution_action(&self, command: &ExecuteAction, reason: &str) {
+        let result = ExecutionActionResult::new(
+            command,
+            ExecutionActionStatus::Rejected,
+            Some(reason.to_string()),
+            None,
+            self.clock.borrow().timestamp_ns(),
+        );
+        let topic = switchboard::get_execution_action_result_topic(command.strategy_id);
+        msgbus::publish_execution_action_result(topic, &result);
+    }
+
     /// Sends a trading command to the exchange for processing.
     pub fn send(&mut self, command: TradingCommand) {
+        if let TradingCommand::ExecuteAction(action) = &command {
+            self.reject_execution_action(
+                action,
+                "Simulated exchange does not support execution actions",
+            );
+            return;
+        }
+
         if matches!(
             &command,
             TradingCommand::QueryOrder(_) | TradingCommand::QueryAccount(_)
@@ -898,6 +920,7 @@ impl SimulatedExchange {
                 | TradingCommand::CancelAllOrders(_) => {
                     command.ts_init() + latency_model.get_delete_latency()
                 }
+                TradingCommand::ExecuteAction(_) => command.ts_init(),
                 _ => panic!("Cannot handle command: {command:?}"),
             };
 
@@ -1876,6 +1899,15 @@ impl SimulatedExchange {
 
     fn process_trading_command(&mut self, command: TradingCommand) {
         self.inflight_orders.remove(&command);
+
+        if let TradingCommand::ExecuteAction(action) = &command {
+            self.reject_execution_action(
+                action,
+                "Simulated exchange does not support execution actions",
+            );
+            return;
+        }
+
         let instrument_id = command.instrument_id();
         assert!(
             self.matching_engines.contains_key(&instrument_id),

@@ -560,9 +560,38 @@ Settlement is venue-driven; see [Settlement dispatch](#settlement-dispatch).
 
 #### Advanced workflows
 
-The full `userOutcome` action set is reachable directly on
-`HyperliquidHttpClient` (Rust and PyO3) for strategies that need to manage
-side-token inventory off-book:
+Strategies can route HIP-4 split and merge operations through the execution
+lifecycle. The returned command ID correlates the request with the later
+`on_execution_action_result` callback:
+
+```python
+self._split_command_id = self.execute_action(
+    account_id=self.account_id,
+    action="hyperliquid.user_outcome.split",
+    params={"outcome": 50, "amount": "1.0"},
+)
+
+self._merge_command_id = self.execute_action(
+    account_id=self.account_id,
+    action="hyperliquid.user_outcome.merge",
+    params={"outcome": 50, "amount": None},  # Merge the maximum available.
+)
+
+
+def on_execution_action_result(self, result):
+    if result.command_id == self._split_command_id:
+        self.log.info(f"Split delivery status: {result.status}")
+```
+
+`Accepted` confirms only Hyperliquid's `ok/default` post response. `Rejected`
+means the adapter knows that the request was not applied, while `Ambiguous`
+means it may have reached the venue and must not be retried automatically.
+Account and outcome-token state continue to converge through the existing
+account, fill, position, and reconciliation paths; the callback does not
+synthesize orders, fills, or positions.
+
+The full `userOutcome` action set is also reachable directly on
+`HyperliquidHttpClient` (Rust and PyO3) for lower-level tooling:
 
 ```python
 from decimal import Decimal
@@ -589,9 +618,18 @@ await client.submit_negate_outcome(9, 52, Decimal("1.0"))
 | `submit_merge_question` | Close a full multi-outcome basket back to quote atomically                           |
 | `submit_negate_outcome` | Convert No shares of one outcome into Yes shares of every other in the same question |
 
-For directional bets the ordinary `SubmitOrder` path is sufficient; the
-methods above are only needed when you want to create or destroy side-token
-inventory off-book.
+For directional bets the ordinary `SubmitOrder` path is sufficient. Use the
+strategy execution-action path when a strategy needs a correlated split or
+merge delivery result. The direct client remains useful for administrative
+workflows and for `mergeQuestion` or `negateOutcome`, which are not in the
+strategy action allow-list.
+
+:::note
+Sandbox and backtest clients currently reject these actions without changing
+state. The live acknowledgement semantics, state-convergence boundary, and
+second-milestone simulation design are specified in
+[Execution Actions: HIP-4 Split and Merge](../developer_guide/execution_actions.md).
+:::
 
 ### Order constraints
 

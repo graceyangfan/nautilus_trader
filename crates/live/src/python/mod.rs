@@ -32,7 +32,8 @@ use nautilus_common::messages::{
         UnsubscribeMarkPrices, UnsubscribeOptionGreeks, UnsubscribeQuotes, UnsubscribeTrades,
     },
     execution::{
-        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ExecuteAction,
+        ExecutionActionResult, ExecutionActionStatus, GenerateFillReports,
         GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
         ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
     },
@@ -89,6 +90,9 @@ pub fn live(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CancelOrder>()?;
     m.add_class::<CancelAllOrders>()?;
     m.add_class::<BatchCancelOrders>()?;
+    m.add_class::<ExecutionActionStatus>()?;
+    m.add_class::<ExecuteAction>()?;
+    m.add_class::<ExecutionActionResult>()?;
     m.add_class::<QueryAccount>()?;
     m.add_class::<QueryOrder>()?;
     m.add_class::<GenerateOrderStatusReport>()?;

@@ -15,6 +15,7 @@
 
 //! Execution specific messages such as order commands.
 
+pub mod action;
 pub mod cancel;
 pub mod modify;
 pub mod query;
@@ -32,6 +33,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use strum::Display as StrumDisplay;
 
 pub use self::{
+    action::{ExecuteAction, ExecutionActionResult, ExecutionActionStatus},
     cancel::{BatchCancelOrders, CancelAllOrders, CancelOrder},
     modify::{BatchModifyOrders, ModifyOrder},
     query::{QueryAccount, QueryOrder},
@@ -87,6 +89,8 @@ impl Display for ExecutionReport {
 #[serde(untagged)]
 pub enum TradingCommand {
     #[strum(transparent)]
+    ExecuteAction(ExecuteAction),
+    #[strum(transparent)]
     SubmitOrder(SubmitOrder),
     #[strum(transparent)]
     SubmitOrderList(SubmitOrderList),
@@ -108,6 +112,7 @@ pub enum TradingCommand {
 
 #[derive(Deserialize)]
 enum TradingCommandType {
+    ExecuteAction,
     SubmitOrder,
     SubmitOrderList,
     ModifyOrder,
@@ -136,6 +141,9 @@ impl<'de> Deserialize<'de> for TradingCommand {
             .command_type;
 
         match command_type {
+            TradingCommandType::ExecuteAction => serde_json::from_value(value)
+                .map(Self::ExecuteAction)
+                .map_err(D::Error::custom),
             TradingCommandType::SubmitOrder => serde_json::from_value(value)
                 .map(Self::SubmitOrder)
                 .map_err(D::Error::custom),
@@ -171,6 +179,7 @@ impl TradingCommand {
     #[must_use]
     pub const fn client_id(&self) -> Option<ClientId> {
         match self {
+            Self::ExecuteAction(command) => command.client_id,
             Self::SubmitOrder(command) => command.client_id,
             Self::SubmitOrderList(command) => command.client_id,
             Self::ModifyOrder(command) => command.client_id,
@@ -187,10 +196,11 @@ impl TradingCommand {
     ///
     /// # Panics
     ///
-    /// Panics if the command is `QueryAccount` which does not have an instrument ID.
+    /// Panics if the command does not have an instrument ID.
     #[must_use]
     pub const fn instrument_id(&self) -> InstrumentId {
         match self {
+            Self::ExecuteAction(_) => panic!("No instrument ID for command"),
             Self::SubmitOrder(command) => command.instrument_id,
             Self::SubmitOrderList(command) => command.instrument_id,
             Self::ModifyOrder(command) => command.instrument_id,
@@ -206,6 +216,7 @@ impl TradingCommand {
     #[must_use]
     pub const fn ts_init(&self) -> UnixNanos {
         match self {
+            Self::ExecuteAction(command) => command.ts_init,
             Self::SubmitOrder(command) => command.ts_init,
             Self::SubmitOrderList(command) => command.ts_init,
             Self::ModifyOrder(command) => command.ts_init,
@@ -221,6 +232,7 @@ impl TradingCommand {
     #[must_use]
     pub const fn strategy_id(&self) -> Option<StrategyId> {
         match self {
+            Self::ExecuteAction(command) => Some(command.strategy_id),
             Self::SubmitOrder(command) => Some(command.strategy_id),
             Self::SubmitOrderList(command) => Some(command.strategy_id),
             Self::ModifyOrder(command) => Some(command.strategy_id),
@@ -236,6 +248,7 @@ impl TradingCommand {
     #[must_use]
     pub const fn params(&self) -> Option<&Params> {
         match self {
+            Self::ExecuteAction(command) => command.params.as_ref(),
             Self::SubmitOrder(command) => command.params.as_ref(),
             Self::SubmitOrderList(command) => command.params.as_ref(),
             Self::ModifyOrder(command) => command.params.as_ref(),
@@ -335,6 +348,17 @@ mod tests {
         );
 
         vec![
+            TradingCommand::ExecuteAction(ExecuteAction::new(
+                trader_id,
+                client_id,
+                strategy_id,
+                AccountId::from("SIM-001"),
+                "hyperliquid.user_outcome.split",
+                UUID4::from("00000000-0000-4000-8000-000000000010"),
+                ts_init,
+                None,
+                None,
+            )),
             TradingCommand::SubmitOrder(submit_order),
             TradingCommand::SubmitOrderList(submit_order_list),
             TradingCommand::ModifyOrder(modify_order.clone()),
@@ -454,6 +478,7 @@ mod tests {
     fn trading_command_display_delegates_to_inner() {
         for command in trading_commands() {
             let expected = match &command {
+                TradingCommand::ExecuteAction(command) => command.to_string(),
                 TradingCommand::SubmitOrder(command) => command.to_string(),
                 TradingCommand::SubmitOrderList(command) => command.to_string(),
                 TradingCommand::ModifyOrder(command) => command.to_string(),

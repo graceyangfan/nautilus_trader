@@ -176,6 +176,7 @@ struct TradingCommand {
         generatePositionStatusReports @11 :GeneratePositionStatusReports;
         generateExecutionMassStatus @12 :GenerateExecutionMassStatus;
         batchModifyOrders @13 :BatchModifyOrders;
+        executeAction @14 :ExecuteAction;
     }
 }
 
@@ -242,6 +243,19 @@ struct QueryAccount {
     params @4 :Base.StringMap;
     correlationId @5 :Base.UUID4;  # Optional
     causationId @6 :Base.UUID4;  # Optional
+}
+
+struct ExecuteAction {
+    traderId @0 :Identifiers.TraderId;
+    clientId @1 :Identifiers.ClientId;  # Optional
+    strategyId @2 :Identifiers.StrategyId;
+    accountId @3 :Identifiers.AccountId;
+    action @4 :Text;
+    commandId @5 :Base.UUID4;
+    tsInit @6 :Base.UnixNanos;
+    params @7 :Base.StringMap;
+    correlationId @8 :Base.UUID4;  # Optional
+    causationId @9 :Base.UUID4;  # Optional
 }
 
 # Execution report commands
