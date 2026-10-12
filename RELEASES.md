@@ -15,10 +15,14 @@ Released on TBD (UTC).
 - Added tick scheme registration, thanks @faysou
 - Added negative price support for futures, except inverse futures (#5190), thanks @DeLuke84
 - Added `BacktestDataConfig.batch_deltas` for batched book delta replay (#5215), thanks for reporting @nicezic
+- Added WebSocket peer-close callbacks to control automatic reconnection
 - Added Bybit public liquidation custom data for linear and inverse contracts (#5152), thanks @Martingale42
 - Added Databento live bars, book depth, statistics, and imbalance subscriptions (#5201), thanks @faysou
 - Added Derive adapter support for API v3
+- Added Derive order book recovery for missing and stale snapshots
 - Added Interactive Brokers subscription idle events (#5041), thanks @faysou
+- Added Kraken Spot L2 checksum validation and resync on mismatch (#5219), thanks @zhaow-de
+- Added Lighter native transaction batching with automatic splitting for order lists and batch operations
 
 ### Breaking Changes
 
@@ -27,6 +31,7 @@ Released on TBD (UTC).
 - Removed Interactive Brokers `ErrorCategory` and `InteractiveBrokersErrorKind` exports (#5041), thanks @faysou
 - Replaced Interactive Brokers Rust symbology functions with `Symbology` methods (#5041), thanks @faysou
 - Changed Rust `PortfolioGreeks::from(GreeksData)` to apply the contract multiplier
+- Changed Rust `ReconciliationResult` literals; add empty `order_only_fill_keys` (#5114), thanks @zhaow-de
 - Changed Rust `VirtualTimer` and `LiveTimer` to store `interval: TimerInterval` instead of `interval_ns`;
   match `TimerInterval::Fixed` to read fixed intervals
 - Changed Rust `DataEngineConfig` and `LiveDataEngineConfig` struct literals to require `time_bars_time_zone`;
@@ -46,8 +51,19 @@ Released on TBD (UTC).
 - Changed batched `BacktestNode` replay to reject deltas without a closing `F_LAST`; `batch_deltas=False` opts out
 - Changed Rust `Order` to require `non_reopened_voided_qty` (#5133), thanks @abhijeetvichare76
 - Changed Deribit position `leverage` to `Option<Decimal>` (#5240), thanks @abhijeetvichare76
+- Changed Rust `DeriveDataClientConfig` struct literals: add `book_snapshot_timeout_secs` and
+  `book_stale_threshold_secs`, or use `..Default::default()`
+- Changed Rust `DeriveWsMessage` to include `BookSubscription`; update exhaustive matches
 - Changed Interactive Brokers contract and security filters to reject unknown values (#5041), thanks @faysou
 - Changed Interactive Brokers Rust provider loaders; use `load_with_return_async` (#5041), thanks @faysou
+- Changed Rust `KrakenDataClientConfig` literals; add `validate_l2_checksum: true` (#5219), thanks @zhaow-de
+- Changed Rust `OKXAmendAlgoOrderRequest` literals to require `new_trigger_px_type`; use `None` to omit it
+- Removed Polymarket 30-second TWAP support; use `window_seconds=60` (#5296)
+- Renamed Polymarket reference-price types to drop `Rtds`, without aliases (#5296)
+- Renamed Polymarket `base_url_rtds` to `base_url_reference_prices` (#5296)
+- Changed Polymarket reference prices to PolyBolt; configure CLOB L2 credentials (#5296), thanks @yashwardhan-gautam
+- Changed Polymarket crypto reference symbols to lowercase USD pairs such as `btcusd` (#5296)
+- Changed Polymarket reference prices to exact decimals with `source`; equity drops `full_accuracy_value` (#5296)
 
 ### Security
 
@@ -71,6 +87,7 @@ Released on TBD (UTC).
 - Fixed Python indicator constructors aborting the process on invalid periods or oversized capacities
 - Fixed reconciliation rejecting fills on a pending order when a `Filled` report exceeds its quantity
 - Fixed replacement reconciliation losing native fill IDs and duplicating inferred fills
+- Fixed reconciliation losing fills for orders spanning a flat position boundary (#5114), thanks @zhaow-de
 - Fixed calculated margin equity omitting option value (#5252), thanks for reporting @abhijeetvichare76
 - Fixed streaming Parquet promotion failing on `OrderBookDelta.clear()` snapshots (#5268), thanks for reporting @hellow-star
 - Fixed simulated bracket exits rejected as reduce-only before entry fills reached the cache (#5248), thanks @awss1i
@@ -84,27 +101,48 @@ Released on TBD (UTC).
 - Fixed Parquet catalog row order for equal `ts_init` timestamps (#5267), thanks @ragen1337
 - Fixed Bybit stale WebSocket subscriptions blocking subscriptions after reconnect (#5250), thanks @Martingale42
 - Fixed Bybit failed quote subscriptions retaining shared order book references (#5258), thanks @Martingale42
+- Fixed Bybit incomplete position reports causing held positions to reconcile as flat
+- Fixed Databento data client intraday requests failing to resolve price precision
+- Fixed Deribit duplicate fills from order responses and user trade subscriptions
 - Fixed Deribit position reports failing on fractional leverage (#5240), thanks @abhijeetvichare76
+- Fixed Derive fill history marked complete when trades lack trade or venue order IDs
+- Fixed Derive accepting null or empty order book prices and amounts as zero
 - Fixed Hyperliquid account updates retaining balances reported at zero (#5210), thanks @XBeg9
 - Fixed Hyperliquid reduce-only filled order lookups overstating fill quantity (#5222), thanks @XBeg9
 - Fixed Hyperliquid HIP-4 outcome price and size precision (#5266), thanks @vignesh-chaturvedi
+- Fixed Hyperliquid canceled replacements leaving orders open when acceptance updates are missing
+- Fixed Hyperliquid recovery sending corrective reductions for canceled replacement orders
+- Fixed Hyperliquid dropping late fill reports after orders close
+- Fixed Hyperliquid stop-market replacement updates causing order-state panics
+- Fixed Hyperliquid cancel actions to omit explicit `fast: Some(false)` flags
+- Fixed Hyperliquid place and modify requests retaining trailing zeros in signed order values
+- Fixed Hyperliquid order closure after partial-fill rejections
 - Fixed Interactive Brokers account balances and margins remaining stale after connect (#5041), thanks @faysou
 - Fixed Interactive Brokers spread fills arriving before their leg fills (#5041), thanks @faysou
 - Fixed Interactive Brokers execution queries replaying historical fills as live fills (#5041), thanks @faysou
+- Fixed Interactive Brokers order ID reuse after completed orders (#5284), thanks @honvl
 - Fixed Kraken spot and futures wallets retaining balances reported at zero (#5186), thanks @zhaow-de
 - Fixed Kraken futures margin currencies, aggregation, and maintenance requirements (#5199), thanks @zhaow-de
 - Fixed Kraken futures reads silently omitting unresolved live orders and positions (#5217), thanks @zhaow-de
+- Fixed Kraken futures startup reconciliation omitting order history (#5114), thanks @zhaow-de
+- Fixed Kraken futures order-history parsing and filled-order pricing (#5247), thanks @zhaow-de
 - Fixed Lighter `CancelAllOrders` to select cached orders only from the execution account
 - Fixed Lighter batch cancel outcome recovery and overlapping cancellation rejection handling
+- Fixed Lighter single and batch modify failures remaining pending after admission
+- Fixed Lighter transaction nonce send ordering under concurrent preparation
+- Fixed OKX conditional order amendments dropping prices (#5275), thanks for reporting @ProfitChef
 - Fixed Polymarket bounded restarts marking cached closed orders as incomplete
 - Fixed Polymarket bounded restarts omitting confirmed partial fills from resting orders
 - Fixed Polymarket modify canceling a working order when the signed replacement is below the market minimum
+- Fixed Polymarket free balance treating BUY fill spend as available before the venue collateral total reflects it
+- Fixed Polymarket execution disconnect overrunning the node disconnect timeout with an in-flight cancel
 - Fixed Polymarket recovered BUY overfills being rejected instead of raising order quantity
+- Fixed sandbox cached quote and trade replay replenishing consumed liquidity on order submissions
 
 ### Internal Improvements
 
 - Added `BacktestNode` book delta replay benchmark comparing batched and individual dispatch
-- Refined shared pointer cloning in infrastructure, CLI, and event store code (#5236), thanks @mirooon
+- Refined shared pointer cloning in data, infrastructure, CLI, and event store code (#5236, #5289), thanks @mirooon
 - Refined Hyperliquid unified account tests to use JSON fixtures (#5220), thanks @XBeg9
 - Ported the Interactive Brokers adapter to the `ibapi` v5.0.0 API (#5041), thanks @faysou
 - Improved Kraken margin entry average and net-short test coverage (#5214), thanks @zhaow-de
@@ -120,11 +158,13 @@ Released on TBD (UTC).
 - Optimized Python `Portfolio` queries to avoid copying account event history (#5260), thanks @XBeg9
 - Upgraded Rust (MSRV) to 1.99.0
 - Upgraded `cargo-hawk` tool to v0.1.15
-- Upgraded `prek` tool to v0.5.4
+- Upgraded `cargo-nextest` tool to v0.9.148
+- Upgraded `prek` tool to v0.5.5
 - Upgraded Socket CLI tool to v1.5.0
-- Upgraded `uv` tool and pre-commit hook to v0.12.22
+- Upgraded `uv` tool and pre-commit hook to v0.12.24
 - Upgraded `typos` pre-commit hook to v1.51.1
 - Upgraded `databento` crate to v0.63.0
+- Upgraded `datafusion` crate to v55.2.0
 - Upgraded `either` crate to v1.19.0
 - Upgraded `h2` crate to v0.4.20
 - Upgraded `hyper` crate to v1.12.0
@@ -149,8 +189,10 @@ Released on TBD (UTC).
 - Clarified `Portfolio` equity rules for calculated and reported margin accounts
 - Fixed Binance and Hyperliquid custom data examples to unwrap `CustomData` (#5246), thanks @Martingale42
 - Updated Derive integration guide for API v3 setup, margin models, and recovery limits
+- Clarified Hyperliquid modify replacement rules and individual batch results
 - Clarified Kraken cached and external closing-order recovery (#5208), thanks @zhaow-de
 - Clarified Lighter cancel-all scope and batch cancellation failure handling
+- Documented Polymarket PolyBolt reference prices and the RTDS migration (#5296)
 
 ### Deprecations
 

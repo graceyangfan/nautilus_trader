@@ -182,26 +182,52 @@ become approval authority.
 #### Balance calculation
 
 Balance refreshes use the venue-reported pUSD total and derive locked collateral from the
-adapter's local cache of open BUY order reservations for the execution client's account. Each
-reservation uses the cached limit price and remaining quantity. Submitted orders awaiting
-acceptance and orders absent from the execution cache are not included. SELL orders reserve
-outcome tokens rather than pUSD and do not contribute to locked collateral. Locked collateral is
-capped at the reported total, with free balance equal to total minus locked, following the
-[balance model](../concepts/accounting.md#balance-model).
+adapter's local cache of open BUY order reservations for the execution client's account, plus own
+BUY fill notional and commission that the venue total may still include. Each reservation uses the
+cached limit price and remaining quantity. Submitted orders awaiting acceptance and orders absent
+from the execution cache are not included. SELL orders reserve outcome tokens rather than pUSD and
+do not contribute to locked collateral.
+
+The next refresh after a BUY fill is known subtracts that fill's notional plus commission from
+free, together with any other unsettled BUY spend still measured against the same snapshot. The
+cohort releases together when the venue total has fallen, since that snapshot, by at least the
+combined amount, so a drained total is not subtracted again. Until then, locked unsettled spend is
+only the part of the open spend that the decrease has not covered. A refresh whose venue total is
+unchanged keeps the open spend locked. A void removes that fill's spend from locked collateral
+immediately. Later void revisions are cumulative, so only the increase is removed. The voided
+amount still counts toward the decrease required to release other open spend. A void of a fill that
+was never locked does not raise that threshold. When no open spend remains, the next refresh
+releases the voided amount and moves the snapshot.
+A BUY fill first applied from terminal REST evidence, including a confirmed fill report, is not
+locked, because that evidence is admitted only after the trade is confirmed.
+A reconciled BUY fill more than 15 seconds older than that snapshot, or received before any
+snapshot, is not locked. Locked collateral is capped at the reported total, with free balance equal
+to total minus locked, following the [balance model](../concepts/accounting.md#balance-model).
 
 #### Refresh timing
 
-The adapter seeds this cache from the execution cache at connect and updates it as the core
-processes order events, including reconciled events. The initial balance refresh precedes startup
+The adapter seeds reservations from the execution cache at connect and updates reservations and
+unsettled BUY spend as the core processes order events, including reconciled events. A transport
+reconnect keeps unsettled BUY spend. Reset clears it. The initial balance refresh precedes startup
 reconciliation; orders discovered during reconciliation affect balances on the next refresh.
 Refreshes occur at connect, on account queries, after finalized trade updates, and on user
-WebSocket reconnect. Account balances do not change on each order event. Balance refreshes do not
-request open orders.
+WebSocket reconnect. A balance response that arrives after a newer refresh, after an
+execution-client reconnect, or after the client resets, is not applied. A user WebSocket reconnect
+does not discard an in-flight refresh; a newer refresh still wins. Account balances do not change
+on each order event.
+Balance refreshes do not request open orders.
 
 :::warning
 These balances are estimates: HTTP balance responses and order events can reflect different
-points in time. They do not guarantee funds are reserved before submission or account for
-spending on trades awaiting settlement.
+points in time. They do not guarantee funds are reserved before submission. A collateral credit,
+including own SELL settlement, can leave unsettled BUY spend locked after the venue total already
+reflects the drain. That hold is limited to the amount the decrease has not covered. An unrelated
+debit can release that spend before the fill has drained. A void whose amount never leaves the
+venue total can keep that uncovered shortfall locked while other unsettled spend is still open. A
+confirmation still inside the drain window can report terminal REST BUY spend
+as free until a later refresh. A refresh that applies before a queued fill is processed can leave
+that fill locked after the total has already drained. The adapter does not lock matched spend from
+another client on the same funder, or from a fill it has not yet received.
 :::
 
 ## API keys
@@ -615,9 +641,15 @@ Polymarket operates as a prediction market with a more limited set of order type
 :::tip
 For Polymarket live execution, set both the disconnection timeout and post-stop delay to 30
 seconds with `with_timeout_disconnection_secs(30)` and `with_delay_post_stop_secs(30)`. The delay
-allows residual order and cancellation events to arrive before disconnection, while the timeout
-gives each client time to shut down cleanly.
+allows residual order and cancellation events to arrive before disconnection. Execution disconnect
+finishes inside that timeout and does not wait out the HTTP timeout for an in-flight command.
 :::
+
+A cancel that is still in flight when disconnect finishes leaves the order `PENDING_CANCEL`. The
+adapter emits neither `OrderCanceled` nor `OrderCancelRejected`. The venue may or may not have
+applied the cancel. Startup reconciliation on the next run resolves it. A strategy cancel does not,
+because the order is already pending cancel. Other in-flight submit and modify commands stop on the
+same bound, and an unconfirmed one stays unresolved.
 
 ### Order types
 
@@ -1282,7 +1314,7 @@ can differ from the constructed instrument.
 ## Numeric precision
 
 Financial wire values are decoded directly as decimals. Values outside the supported decimal or
-domain-type range fail HTTP decoding or report construction. WebSocket and RTDS handlers log and
+domain-type range fail HTTP decoding or report construction. WebSocket and PolyBolt handlers log and
 skip invalid updates. Report construction does not substitute zero for an invalid price or quantity.
 
 ## Fees
@@ -2028,30 +2060,41 @@ snapshot batches (see [Data client options](#data-client-options)):
   `best_bid_ask` quote ticks. This can change those quote sizes and their unchanged-quote
   suppression, and the carried sizes can affect later `price_change` quotes. Trades are unchanged.
 
-#### RTDS custom data
+#### PolyBolt reference prices
 
-The data client also supports Polymarket's real-time data (RTDS) crypto, crypto TWAP, and equity
-topics. Subscribe through generic custom data with a required, non-empty `symbol` metadata value.
-TWAP subscriptions also require `window_seconds` equal to `30` or `60`:
+The data client also supports Polymarket's PolyBolt reference-price channels: crypto spot
+(`price.crypto`), 60-second Chainlink crypto TWAP (`price.crypto.twap`), and equity, ETF, forex,
+metal, and commodity prices (`price.equity`). PolyBolt replaced the legacy RTDS price topics in
+October 2026.
+
+PolyBolt requires CLOB L2 API credentials. Set `api_key`, `api_secret`, and `passphrase` on
+`PolymarketDataClientConfig`, or export `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and
+`POLYMARKET_PASSPHRASE`. Credentials are optional when no price subscriptions are used. Explicit
+credentials and a complete environment set are validated when the data client is constructed;
+malformed credentials fail construction. A partial environment set is ignored with a warning.
+A price subscription without credentials is rejected with a configuration error.
+
+Subscribe through generic custom data with a required, non-empty `symbol` metadata value. TWAP
+subscriptions also require `window_seconds` equal to `60`, the only window PolyBolt serves:
 
 ```python
 from nautilus_trader.adapters.polymarket import POLYMARKET_CLIENT_ID
-from nautilus_trader.adapters.polymarket import PolymarketRtdsCryptoPrice
-from nautilus_trader.adapters.polymarket import PolymarketRtdsCryptoTwap
-from nautilus_trader.adapters.polymarket import PolymarketRtdsEquityPrice
+from nautilus_trader.adapters.polymarket import PolymarketCryptoPrice
+from nautilus_trader.adapters.polymarket import PolymarketCryptoTwap
+from nautilus_trader.adapters.polymarket import PolymarketEquityPrice
 from nautilus_trader.model import DataType
 
 crypto_type = DataType(
-    PolymarketRtdsCryptoPrice.__name__,
-    metadata={"symbol": "btcusdt"},
+    PolymarketCryptoPrice.__name__,
+    metadata={"symbol": "btcusd"},
 )
 equity_type = DataType(
-    PolymarketRtdsEquityPrice.__name__,
-    metadata={"symbol": "AAPL"},
+    PolymarketEquityPrice.__name__,
+    metadata={"symbol": "aapl"},
 )
 twap_type = DataType(
-    PolymarketRtdsCryptoTwap.__name__,
-    metadata={"symbol": "BTC/USD", "window_seconds": 60},
+    PolymarketCryptoTwap.__name__,
+    metadata={"symbol": "btcusd", "window_seconds": 60},
 )
 
 strategy.subscribe_data(crypto_type, client_id=POLYMARKET_CLIENT_ID)
@@ -2061,25 +2104,108 @@ strategy.subscribe_data(twap_type, client_id=POLYMARKET_CLIENT_ID)
 
 ##### Symbols and values
 
-Symbol matching is case-insensitive, and published symbols are lowercase. Crypto RTDS uses the
-`crypto_prices` topic; equity RTDS uses `equity_prices`. Equity updates prefer
-`full_accuracy_value` when the venue supplies it and fall back to `value` for snapshots or updates
-that omit it. Crypto TWAP uses `crypto_prices_twap_thirty` or
-`crypto_prices_twap_sixty`, requires the frame's `window_s` to match the subscription, and exposes
-the exact signed-E18 `full_accuracy_value` as a Rust `Decimal`. Python receives the exact decimal
-string, which can be converted with `decimal.Decimal`; the display-only `value` is required and
-decimal-like for wire conformance but is never published.
+Symbols are lowercase and USD-quoted, for example `btcusd`, `ethusd`, `aapl`, `eurusd`, or
+`xauusd`; matching is case-insensitive and published symbols are lowercase. The legacy RTDS
+spellings `btcusdt` (Binance, USDT-quoted) and `btc/usd` are rejected at subscription time with a
+hint, because PolyBolt would silently serve nothing for them and `usdt` would change the quote
+currency. Crypto spot now defaults to Chainlink USD prices rather than Binance USDT.
 
-##### TWAP reconnects and replay
+Reference prices use Rust `Decimal` because the venue's exact `full_accuracy_value` can carry up
+to 18 fractional digits, beyond `Price` precision. Python receives the exact
+decimal string, which can be converted with `decimal.Decimal`. Spot channels fall back to the
+venue's display `value` only when the exact field is absent; TWAP never does. Each sample also
+carries `source`, the provider the venue served (`chainlink` or `pyth` for crypto; `pyth`,
+`massive`, or `chainlink` for equities), and `message_timestamp_ms`, the PolyBolt envelope time.
+Equity snapshot points omit venue receipt and carried-forward metadata, so the adapter sets
+`received_at_ms=None` and `is_carried_forward=False`; these defaults do not imply a fresh value.
 
-Polymarket [TWAP subscriptions](https://docs.polymarket.com/market-data/chainlink-twap#stream-behavior)
-start with the next update and provide no snapshot, history, or replay after a disconnect. The
-adapter restores subscriptions after reconnect and resumes with the next update, so the disconnect
-interval remains a data gap. The replay guard survives reconnect, so a redelivery of the last
-observation remains suppressed. The adapter also suppresses older observations. A different value
-for the same observation timestamp is not emitted; it is logged at error level with the topic,
-symbol, timestamp, prior value, and received value. The stream continues with the prior observation
-authoritative, and emission resumes at the next newer observation timestamp.
+##### Subscriptions, snapshots, and reconnects
+
+The feed authenticates once per connection, waits for the venue's `authed` acknowledgement, and
+only then sends one subscription per `(channel, symbol)`. Every new subscription first receives a
+two-minute snapshot, emitted point by point in order, and then live updates. PolyBolt allows 64
+subscriptions per connection; the 65th distinct `(channel, symbol)` is rejected with an error.
+
+After a reconnect the feed re-authenticates and replays the retained subscriptions. The venue
+replays a fresh snapshot that can backfill the disconnect interval within its two-minute history.
+Consumers may receive a burst of historical observations with their original event timestamps
+(`ts_event`) and current initialization timestamps (`ts_init`). Recovery is bounded by the snapshot
+history and replay-admission rules below; it does not guarantee lossless history.
+Points at or before the last emitted timestamp are suppressed, so nothing is emitted twice. For
+TWAP the replay guard also survives reconnect: a redelivery of the last observation is suppressed,
+older observations are suppressed, and a different value for the same observation timestamp is not emitted but is
+logged at error level with the channel, symbol, timestamp, prior value, and received value. The
+stream keeps the prior observation authoritative, and emission resumes at a newer observation in
+a subsequent frame. TWAP snapshot processing stops at the first conflicting or invalid point and
+discards the remaining points in that frame.
+
+If the venue rejects the credentials (`auth_invalid` or `auth_expired`), the feed logs an error,
+stops sending auth frames, and rejects the handshake. A rejection during data-client connection
+fails that connect and tears down the partial session, including its market socket. Credentials
+are resolved once when the data client is built, so reconnecting the same client retries with the
+rejected credentials; recreate the data client with corrected credentials instead. A transient
+`auth_unavailable` is retried after a short delay, including during the data client's own connect,
+so an auth outage never takes the
+market data socket down with it. The venue allows eight auth frames per connection, so a prolonged
+outage moves to a fresh connection before the ninth frame rather than staying rejected, and the
+venue's `auth_attempts` error is handled the same way.
+
+Every envelope carries a dense per-channel `seq` that resets on each connection. A gap,
+regression, or positive `dropped` count triggers a warning and a fresh snapshot: every subscription
+on that channel is unsubscribed and subscribed again. This also applies to a positive `dropped`
+count on the first envelope, before a previous sequence is known. The replay guard above keeps the
+backfill free of duplicates. The live envelope that reveals a gap is still emitted, so the replay
+guard suppresses missing points at or before that symbol's newly emitted timestamp. The fresh
+snapshot can backfill other symbols whose latest timestamp has not advanced past the missing
+points. Sequence tracking resets on every reconnect.
+
+Subscription and unsubscription requests share a quota that admits one frame every 53 ms,
+leaving room under the venue's combined 20-frame-per-second limit. The feed batches recovery for
+all affected channels. Multiple pending gaps on a channel coalesce into one resubscription.
+Gaps detected during an in-flight resubscription, including its quota wait, queue a follow-up
+resubscription for the affected channel.
+Shutdown interrupts the server-drain reconnect delay, recovery retry delays, and quota waits.
+
+The venue's close codes follow their documented recovery policies:
+
+- `4001` (authentication failed) stops automatic reconnects. Recreate the data client with
+  corrected CLOB API credentials.
+- `4002` (slow consumer) uses the shared client's reconnect policy: the first retry after a stable
+  session is immediate; repeated unstable reconnects use exponential backoff and jitter.
+- `4003` (server draining) pauses recovery and reconnects once after a uniform random delay in
+  `[0, 10]` seconds.
+- `4008` (policy violation) logs an error and stops automatic reconnects. The adapter enforces
+  auth and subscription limits, so this close can indicate an adapter fault. Investigate and
+  correct the rejected request or limit violation before explicitly reconnecting the data client.
+
+Other close codes reconnect with the shared client's backoff.
+
+##### Migrating from RTDS
+
+The RTDS price transport and its public types were removed without compatibility aliases. Update
+code and serialized configurations to the new names:
+
+| Previous name               | New name                      |
+| --------------------------- | ----------------------------- |
+| `PolymarketRtdsCryptoPrice` | `PolymarketCryptoPrice`       |
+| `PolymarketRtdsCryptoTwap`  | `PolymarketCryptoTwap`        |
+| `PolymarketRtdsEquityPrice` | `PolymarketEquityPrice`       |
+| `base_url_rtds`             | `base_url_reference_prices`   |
+| `polymarket-rtds-streams`   | `polymarket-polybolt-streams` |
+
+Behavioral changes to account for:
+
+- Reference-price subscriptions now require CLOB L2 credentials (`api_key`, `api_secret`,
+  `passphrase`, or the `POLYMARKET_*` environment variables). Explicit fields are validated
+  strictly; environment variables apply only when all three are set, and a partial set is ignored
+  with a warning so clients that never subscribe to reference prices still start.
+- Crypto symbols are lowercase USD pairs such as `btcusd`; `btcusdt` and `btc/usd` are rejected.
+  Crypto spot defaults to Chainlink USD prices rather than Binance USDT, and every sample carries
+  the serving `source`.
+- The 30-second TWAP window was removed. `window_seconds` must be `60`; `30` is rejected rather
+  than mapped.
+- `value` uses Rust `Decimal` in place of `Price` on crypto and equity samples. Python exposes a
+  decimal string on all three types; equity no longer carries a separate `full_accuracy_value`.
 
 ### Runtime instrument loading
 
@@ -2432,6 +2558,8 @@ Polymarket changes these quotas over time. As of 2026-08-04, the official limits
 
 The WebSocket quotas are not part of the published REST rate-limits table. The adapter enforces
 `ws_max_subscriptions` (default 200) by sharding subscriptions across a pool of market connections.
+The adapter also paces PolyBolt subscription and unsubscription requests under a shared quota; see
+[Subscriptions, snapshots, and reconnects](#subscriptions-snapshots-and-reconnects).
 
 :::warning
 Exceeding the IP-based limits triggers Cloudflare throttling. Requests are queued using sliding
@@ -2472,7 +2600,8 @@ Class/struct: `PolymarketDataClientConfig`.
 | `filters`                              | `[]`       | Rust-only instrument filters applied during loading and discovery.                        |
 | `base_url_http`, `base_url_ws`         | `None`     | Override the CLOB HTTP or WebSocket endpoint.                                             |
 | `base_url_gamma`, `base_url_data_api`  | `None`     | Override the Gamma or Data API endpoint.                                                  |
-| `base_url_rtds`                        | `None`     | Override the RTDS endpoint.                                                               |
+| `base_url_reference_prices`            | `None`     | Override the PolyBolt reference-price endpoint.                                           |
+| `api_key`, `api_secret`, `passphrase`  | `None`     | CLOB L2 credentials for PolyBolt price channels; fall back to `POLYMARKET_*` variables.   |
 | `proxy_url`                            | `None`     | HTTP or HTTPS proxy for every data transport.                                             |
 | `http_timeout_secs`, `ws_timeout_secs` | `60`, `30` | HTTP and WebSocket timeout in seconds.                                                    |
 | `ws_max_subscriptions`                 | `200`      | Per-connection subscription cap; the market pool shards across connections at this bound. |
@@ -2547,7 +2676,7 @@ After such a failure, explicitly disconnect and reconnect the client to restore 
 ### Proxy routing
 
 Set `proxy_url` to apply one HTTP or HTTPS proxy to every transport owned by that client. The data
-client routes CLOB HTTP, Gamma HTTP, Data API HTTP, the market WebSocket pool, and RTDS through the
+client routes CLOB HTTP, Gamma HTTP, Data API HTTP, the market WebSocket pool, and PolyBolt through the
 proxy. The execution client routes authenticated CLOB HTTP, Data API HTTP, and the authenticated
 user WebSocket through it. Configure the same value on both clients when running data and execution
 together.

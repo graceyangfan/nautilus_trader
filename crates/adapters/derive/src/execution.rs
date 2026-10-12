@@ -760,6 +760,7 @@ impl DeriveExecutionClient {
 
         Ok(())
     }
+
     fn select_cancel_orders(
         &self,
         cmd: &CancelAllOrders,
@@ -2992,6 +2993,7 @@ impl DeriveReconciliationContext {
 
         for trade in all_trades {
             if let Some(target) = venue_order_id_filter.as_deref()
+                && !trade.order_id.is_empty()
                 && trade.order_id != target
             {
                 continue;
@@ -3029,7 +3031,7 @@ impl DeriveReconciliationContext {
 
                     reports.push(report);
                 }
-                Ok(None) => {}
+                Ok(None) => records_complete = false,
                 Err(e) if e.is::<CommissionError>() => {
                     return Err(e.context(format!(
                         "failed to construct Derive fill {:?} for order {:?} on {:?}",
@@ -3904,7 +3906,8 @@ fn handle_ws_message(
         DeriveWsMessage::Subscription(payload) => payload,
         DeriveWsMessage::Authenticated
         | DeriveWsMessage::Reconnected
-        | DeriveWsMessage::SessionRecoveryFailed(_) => return,
+        | DeriveWsMessage::SessionRecoveryFailed(_)
+        | DeriveWsMessage::BookSubscription { .. } => return,
     };
 
     let channel = DeriveWsChannel::from(payload.channel.as_str());

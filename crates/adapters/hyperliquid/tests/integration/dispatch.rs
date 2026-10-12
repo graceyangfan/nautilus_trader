@@ -311,7 +311,9 @@ fn test_dispatch_rejected_tracked_emits_rejected_and_cleans_up(#[case] bound: bo
 }
 
 #[rstest]
-fn test_failed_modify_cancels_partially_filled_order() {
+#[case::zero_report_fills("0")]
+#[case::positive_report_fills("0.00014")]
+fn test_failed_modify_cancels_partially_filled_order(#[case] reported_fills: &str) {
     let (emitter, mut rx) = test_emitter();
     let state = WsDispatchState::new();
     let cid = ClientOrderId::new("O-PARTIAL-MODIFY");
@@ -370,18 +372,19 @@ fn test_failed_modify_cancels_partially_filled_order() {
         ("101", OrderStatus::Rejected),
         ("100", OrderStatus::Canceled),
     ] {
-        dispatch_order_event(
-            &make_status_report(
-                Some(cid.as_str()),
-                venue_order_id,
-                status,
-                Some("56730.0"),
-                "0.00020",
-            ),
-            &state,
-            &emitter,
-            UnixNanos::default(),
+        let mut report = make_status_report(
+            Some(cid.as_str()),
+            venue_order_id,
+            status,
+            Some("56730.0"),
+            "0.00020",
         );
+
+        if status == OrderStatus::Rejected {
+            report.filled_qty = Quantity::from(reported_fills);
+        }
+
+        dispatch_order_event(&report, &state, &emitter, UnixNanos::default());
     }
 
     let events = drain_events(&mut rx);
@@ -622,11 +625,12 @@ fn test_dispatch_stale_replay_after_terminal_is_skipped() {
 }
 
 #[rstest]
-fn test_dispatch_fill_for_order_in_filled_orders_is_skipped() {
-    // A late fill arriving for an order whose cid is already recorded in
-    // `filled_orders` (e.g. the terminal canceled/expired/rejected path ran
-    // first) must be suppressed rather than emitted: the context has been
-    // cleaned up and the engine has already observed the terminal event.
+#[case::new_trade(false, DispatchOutcome::External)]
+#[case::duplicate(true, DispatchOutcome::Skip)]
+fn test_dispatch_fill_for_terminal_order(
+    #[case] already_processed: bool,
+    #[case] expected: DispatchOutcome,
+) {
     let (emitter, mut rx) = test_emitter();
     let state = Arc::new(WsDispatchState::new());
     let cid = ClientOrderId::new("O-010a");
@@ -639,9 +643,14 @@ fn test_dispatch_fill_for_order_in_filled_orders_is_skipped() {
         "0.00020",
         "56730.0",
     );
+
+    if already_processed {
+        state.check_and_insert_trade(fill.trade_id);
+    }
+
     let outcome = dispatch_order_fill(&fill, &state, &emitter, UnixNanos::default());
 
-    assert_eq!(outcome, DispatchOutcome::Skip);
+    assert_eq!(outcome, expected);
     assert!(drain_events(&mut rx).is_empty());
 }
 

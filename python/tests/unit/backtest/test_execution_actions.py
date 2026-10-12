@@ -260,9 +260,10 @@ def test_python_strategy_receives_rejection_for_unconfigured_execution_action() 
     """
     Test the public Python action API reaches the backtest callback unchanged.
 
-    The default venue intentionally has no binary-option action profile, so this test asserts the
-    safe pre-mutation rejection path. Configured profile success, account updates, and position
-    events are covered by the HIP-4 Rust integration test.
+    The default venue intentionally has no binary-option action profile, so this test
+    asserts the safe pre-mutation rejection path. Configured profile success, account
+    updates, and position events are covered by the HIP-4 Rust integration test.
+
     """
     engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
     engine.add_venue(
@@ -308,7 +309,7 @@ def test_python_strategy_receives_rejection_for_unconfigured_execution_action() 
 
 def test_python_strategy_executes_hip4_split_and_merge_with_profile() -> None:
     """
-    Test a Python strategy receives position events before accepted split and merge results.
+    Test Python position events precede accepted split and merge results.
     """
     engine = BacktestEngine(BacktestEngineConfig(bypass_logging=True, run_analysis=False))
     engine.add_venue(

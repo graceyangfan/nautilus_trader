@@ -48,37 +48,33 @@ from __future__ import annotations
 
 import os
 
-from nautilus_trader.adapters.hyperliquid import (
-    HyperliquidDataClientConfig,
-    HyperliquidDataClientFactory,
-    HyperliquidEnvironment,
-    HyperliquidExecutionClientConfig,
-    HyperliquidExecutionClientFactory,
-)
+from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientConfig
+from nautilus_trader.adapters.hyperliquid import HyperliquidDataClientFactory
+from nautilus_trader.adapters.hyperliquid import HyperliquidEnvironment
+from nautilus_trader.adapters.hyperliquid import HyperliquidExecutionClientConfig
+from nautilus_trader.adapters.hyperliquid import HyperliquidExecutionClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.config import LiveRiskEngineConfig
-from nautilus_trader.live import (
-    BinaryOptionAction,
-    ExecutionActionResult,
-    ExecutionActionStatus,
-    LiveNode,
-)
-from nautilus_trader.model import (
-    AccountId,
-    BinaryOption,
-    ClientId,
-    InstrumentId,
-    OmsType,
-    OrderFilled,
-    PositionChanged,
-    PositionClosed,
-    PositionOpened,
-    Quantity,
-    StrategyId,
-    TraderId,
-    Venue,
-)
-from nautilus_trader.trading import Strategy, StrategyConfig
+from nautilus_trader.live import BinaryOptionAction
+from nautilus_trader.live import ExecutionActionResult
+from nautilus_trader.live import ExecutionActionStatus
+from nautilus_trader.live import LiveNode
+from nautilus_trader.model import AccountId
+from nautilus_trader.model import BinaryOption
+from nautilus_trader.model import ClientId
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderFilled
+from nautilus_trader.model import PositionChanged
+from nautilus_trader.model import PositionClosed
+from nautilus_trader.model import PositionOpened
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import StrategyId
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import Venue
+from nautilus_trader.trading import Strategy
+from nautilus_trader.trading import StrategyConfig
+
 
 HYPERLIQUID = "HYPERLIQUID"
 VENUE = Venue(HYPERLIQUID)
@@ -250,7 +246,9 @@ class OutcomeActionsTester(Strategy):
         self._log_latency("FILL_RECEIVED", action)
 
         if event.last_qty != self._quantity:
-            log_msg = f"Unexpected HIP-4 fill quantity: expected={self._quantity} actual={event.last_qty}"
+            log_msg = (
+                f"Unexpected HIP-4 fill quantity: expected={self._quantity} actual={event.last_qty}"
+            )
             self.log.warning(log_msg)
             return
 
@@ -259,10 +257,7 @@ class OutcomeActionsTester(Strategy):
             self._submit_merge_when_split_converged()
         else:
             self._merge_filled_legs.add(event.instrument_id)
-            if (
-                self._merge_accepted
-                and self._merge_filled_legs == self._pair_instrument_ids
-            ):
+            if self._merge_accepted and self._merge_filled_legs == self._pair_instrument_ids:
                 self.log.info(
                     "HIP-4 split/merge cycle completed; inspect position callbacks above",
                 )
@@ -332,10 +327,7 @@ class OutcomeActionsTester(Strategy):
                 continue
             if side not in (0, 1) or instrument.expiration_ns <= min_expiration_ns:
                 continue
-            if (
-                self._requested_outcome is not None
-                and outcome != self._requested_outcome
-            ):
+            if self._requested_outcome is not None and outcome != self._requested_outcome:
                 continue
 
             pairs.setdefault(outcome, {})[side] = instrument
@@ -345,9 +337,7 @@ class OutcomeActionsTester(Strategy):
         for outcome, sides in pairs.items():
             yes = sides.get(0)
             no = sides.get(1)
-            if yes is None or no is None:
-                continue
-            if yes.expiration_ns != no.expiration_ns:
+            if yes is None or no is None or yes.expiration_ns != no.expiration_ns:
                 continue
             candidates.append((yes.expiration_ns, outcome, yes.id, no.id))
 
@@ -405,9 +395,7 @@ class OutcomeActionsTester(Strategy):
                 strategy_id=STRATEGY_ID,
                 account_id=self._account_id,
             )
-            log_msg = (
-                f"{source}_POSITIONS instrument={instrument_id} positions={positions}"
-            )
+            log_msg = f"{source}_POSITIONS instrument={instrument_id} positions={positions}"
             self.log.info(log_msg)
 
 
@@ -461,9 +449,7 @@ def main() -> None:
                 account_id=ACCOUNT_ID,
                 client_id=CLIENT_ID,
                 quantity=quantity,
-                requested_outcome=int(requested_outcome)
-                if requested_outcome is not None
-                else None,
+                requested_outcome=int(requested_outcome) if requested_outcome is not None else None,
                 min_remaining_secs=min_remaining_secs,
             ),
         ),
