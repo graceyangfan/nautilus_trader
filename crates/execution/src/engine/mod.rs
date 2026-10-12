@@ -100,7 +100,8 @@ use crate::{
         check_position_reconciliation, fill_precedes_snapshot_reconciled_position,
         generate_external_order_status_events, generate_reconciliation_order_events,
         generate_reconciliation_order_pre_fill_events,
-        generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
+        generate_reconciliation_order_snapshot_events, is_execution_action_fill,
+        is_orderless_action, orderless_action_fill, reconcile_fill_report as reconcile_fill,
     },
 };
 
@@ -1592,7 +1593,7 @@ impl ExecutionEngine {
             return;
         };
 
-        if report.is_orderless_action() {
+        if is_orderless_action(report) {
             let strategy_id = self.resolve_external_strategy(&report.instrument_id);
             if self.should_filter_unclaimed_external_order(strategy_id)
                 || fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), report)
@@ -1601,7 +1602,7 @@ impl ExecutionEngine {
             }
             let trader_id = get_message_bus().borrow().trader_id;
             if let Some(fill) =
-                report.orderless_action_fill(trader_id, strategy_id, instrument.quote_currency())
+                orderless_action_fill(report, trader_id, strategy_id, instrument.quote_currency())
             {
                 self.handle_event(&OrderEventAny::Filled(fill));
             }
@@ -3441,9 +3442,7 @@ impl ExecutionEngine {
     }
 
     fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) -> bool {
-        let is_action = fill.info.as_ref().is_some_and(|info| {
-            info.get(&ustr::Ustr::from("source")) == Some(&ustr::Ustr::from("execution_action"))
-        });
+        let is_action = is_execution_action_fill(fill.info.as_ref());
 
         if is_action {
             let mut report = FillReport::new(

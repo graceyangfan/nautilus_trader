@@ -40,6 +40,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use super::{
     RECONCILIATION_ORDER_TAG,
     ids::{create_synthetic_trade_id, create_synthetic_venue_order_id},
+    orders::is_orderless_action,
     reconciliation_price,
     types::{FillAdjustmentResult, FillSnapshot, ReconciliationResult, VenuePositionSnapshot},
 };
@@ -502,7 +503,7 @@ pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillRe
                 })
     };
 
-    if report.is_orderless_action() {
+    if is_orderless_action(report) {
         // A later merge may close or archive a balance-reconstructed position,
         // its snapshot still proves that earlier conversion fills were included.
         return cache

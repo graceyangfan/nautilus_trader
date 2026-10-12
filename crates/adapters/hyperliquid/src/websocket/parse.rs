@@ -979,8 +979,11 @@ mod tests {
                 "binary_option.merge"
             };
 
-            assert!(rest.is_orderless_action());
-            assert!(ws.is_orderless_action());
+            assert!(rest.client_order_id.unwrap().as_str().contains("-LEG-"));
+            assert_eq!(
+                rest.info.as_ref().unwrap()[&Ustr::from("source")],
+                Ustr::from("execution_action")
+            );
             assert_eq!(rest.trade_id, ws.trade_id);
             assert_eq!(
                 rest.venue_order_id,

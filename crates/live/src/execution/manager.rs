@@ -67,7 +67,8 @@ use nautilus_execution::{
         generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events_with_commission,
         incremental_inferred_fill_price_and_liquidity, inferred_fill_price_and_liquidity,
-        position_prices_match, process_mass_status_for_reconciliation,
+        is_orderless_action, orderless_action_fill, position_prices_match,
+        process_mass_status_for_reconciliation,
         process_mass_status_for_reconciliation_without_synthetic_reports,
         reconcile_order_report_with_commission,
     },
@@ -1196,7 +1197,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            if first_fill.is_orderless_action() {
+            if is_orderless_action(first_fill) {
                 let Some(instrument) = self.get_instrument(&first_fill.instrument_id) else {
                     orders_skipped_no_instrument += 1;
                     continue;
@@ -1211,7 +1212,8 @@ impl ExecutionManager {
                 }
 
                 for report in fills {
-                    if let Some(fill) = report.orderless_action_fill(
+                    if let Some(fill) = orderless_action_fill(
+                        report,
                         self.config.trader_id,
                         strategy_id,
                         instrument.quote_currency(),

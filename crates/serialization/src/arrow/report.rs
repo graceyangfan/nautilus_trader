@@ -291,11 +291,7 @@ mod tests {
 
         let decoded = FillReport::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
-        assert_eq!(decoded, vec![report.clone()]);
-        assert_eq!(
-            decoded[0].is_orderless_action(),
-            report.is_orderless_action()
-        );
+        assert_eq!(decoded, vec![report]);
     }
 
     #[rstest]

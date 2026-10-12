@@ -22,12 +22,8 @@ use serde::{Deserialize, Serialize};
 use ustr::Ustr;
 
 use crate::{
-    enums::{LiquiditySide, OrderSide, OrderType},
-    events::OrderFilled,
-    identifiers::{
-        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
-        VenueOrderId,
-    },
+    enums::{LiquiditySide, OrderSide},
+    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
     types::{Money, Price, Quantity},
 };
 
@@ -116,51 +112,6 @@ impl FillReport {
             venue_position_id,
             info: None,
         }
-    }
-
-    /// Identifies a venue-confirmed execution action leg without a user order.
-    #[must_use]
-    pub fn is_orderless_action(&self) -> bool {
-        self.info.as_ref().is_some_and(|info| {
-            info.get(&Ustr::from("source")) == Some(&Ustr::from("execution_action"))
-        }) && self
-            .client_order_id
-            .is_some_and(|id| id.as_str().contains("-LEG-"))
-    }
-
-    /// Converts an orderless action report using actual venue quantities, prices, and fees.
-    #[must_use]
-    pub fn orderless_action_fill(
-        &self,
-        trader_id: TraderId,
-        strategy_id: StrategyId,
-        currency: crate::types::Currency,
-    ) -> Option<OrderFilled> {
-        if !self.is_orderless_action() {
-            return None;
-        }
-        Some(OrderFilled::new(
-            trader_id,
-            strategy_id,
-            self.instrument_id,
-            self.client_order_id?,
-            self.venue_order_id,
-            self.account_id,
-            self.trade_id,
-            self.order_side,
-            OrderType::Market,
-            self.last_qty,
-            self.last_px,
-            currency,
-            self.liquidity_side,
-            self.report_id,
-            self.ts_event,
-            self.ts_init,
-            true,
-            self.venue_position_id,
-            Some(self.commission),
-            self.info.clone(),
-        ))
     }
 
     /// Checks if the fill has a client order ID.
@@ -323,39 +274,17 @@ mod tests {
     }
 
     #[rstest]
-    #[case("execution_action", "ACTION-1-LEG-YES", true)]
-    #[case("execution_action", "ORDER-1", false)]
-    #[case("order", "ACTION-1-LEG-YES", false)]
-    fn test_orderless_action_report(
-        #[case] source: &str,
-        #[case] client_order_id: &str,
-        #[case] expected: bool,
-    ) {
+    #[case("execution_action", "ACTION-1-LEG-YES")]
+    #[case("execution_action", "ORDER-1")]
+    #[case("order", "ACTION-1-LEG-YES")]
+    fn test_fill_report_info_roundtrip(#[case] source: &str, #[case] client_order_id: &str) {
         let mut report = test_fill_report();
         report.client_order_id = Some(ClientOrderId::from(client_order_id));
         report.info = Some(IndexMap::from([(Ustr::from("source"), Ustr::from(source))]));
 
         let restored: FillReport =
             serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
-        let fill = restored.orderless_action_fill(
-            TraderId::from("TRADER-001"),
-            StrategyId::from("ACTION-001"),
-            Currency::USD(),
-        );
-
         assert_eq!(restored, report);
-        assert_eq!(restored.is_orderless_action(), expected);
-        assert_eq!(fill.is_some(), expected);
-
-        if let Some(fill) = fill {
-            assert_eq!(fill.trade_id, report.trade_id);
-            assert_eq!(fill.venue_order_id, report.venue_order_id);
-            assert_eq!(fill.last_qty, report.last_qty);
-            assert_eq!(fill.last_px, report.last_px);
-            assert_eq!(fill.commission, Some(report.commission));
-            assert_eq!(fill.info, report.info);
-            assert!(fill.reconciliation);
-        }
     }
 
     #[rstest]
