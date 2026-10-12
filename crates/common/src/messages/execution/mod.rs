@@ -529,7 +529,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "unknown variant `UnknownCommand`, expected one of `SubmitOrder`, `SubmitOrderList`, \
+            "unknown variant `UnknownCommand`, expected one of `ExecuteAction`, `SubmitOrder`, `SubmitOrderList`, \
              `ModifyOrder`, `BatchModifyOrders`, `CancelOrder`, `BatchCancelOrders`, \
              `CancelAllOrders`, `QueryOrder`, `QueryAccount`",
         );
@@ -550,7 +550,9 @@ mod tests {
                 assert_eq!(command.strategy_id(), None);
             } else {
                 assert_eq!(command.strategy_id(), Some(strategy_id));
-                assert_eq!(command.instrument_id(), instrument_id);
+                if !matches!(command, TradingCommand::ExecuteAction(_)) {
+                    assert_eq!(command.instrument_id(), instrument_id);
+                }
             }
         }
     }
@@ -577,12 +579,20 @@ mod tests {
     }
 
     #[rstest]
+    #[case::query_account(false)]
+    #[case::execution_action(true)]
     #[should_panic(expected = "No instrument ID for command")]
-    fn trading_command_instrument_id_panics_for_query_account() {
+    fn trading_command_instrument_id_panics_without_single_instrument(#[case] action: bool) {
         let command = trading_commands()
             .into_iter()
-            .find(|command| matches!(command, TradingCommand::QueryAccount(_)))
-            .expect("query account command must be present");
+            .find(|command| {
+                if action {
+                    matches!(command, TradingCommand::ExecuteAction(_))
+                } else {
+                    matches!(command, TradingCommand::QueryAccount(_))
+                }
+            })
+            .expect("command without a single instrument must be present");
 
         let _ = command.instrument_id();
     }

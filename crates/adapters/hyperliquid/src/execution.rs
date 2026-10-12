@@ -251,11 +251,12 @@ impl HyperliquidExecutionClient {
     }
 
     fn validate_order_submission(&self, order: &OrderAny) -> anyhow::Result<()> {
+        validate_order_for_hyperliquid(order)?;
         anyhow::ensure!(
             self.http_client.allows_instrument(order.instrument_id()),
             "Order outside execution product scope"
         );
-        validate_order_for_hyperliquid(order)
+        Ok(())
     }
 
     fn order_request(
@@ -986,7 +987,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
         anyhow::ensure!(
             self.config
                 .product_types
-                .contains(&crate::common::enums::HyperliquidProductType::Outcome),
+                .contains(&HyperliquidProductType::Outcome),
             "Outcome actions outside execution product scope"
         );
         let action = outcome_action_from_command(&cmd)?;
@@ -2824,7 +2825,10 @@ impl HyperliquidExecutionClient {
                                     ExecutionReport::Fill(report) => report.instrument_id,
                                     ExecutionReport::Order(report) => report.instrument_id,
                                 };
-                                if !http_client.allows_instrument(instrument_id) { continue; }
+
+                                if !http_client.allows_instrument(instrument_id) {
+                                    continue;
+                                }
                                 ts_last_report = ts_last_report.max(ts_venue(&report));
 
                                 let staged_parent_fill = match &report {

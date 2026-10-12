@@ -31,6 +31,7 @@ use nautilus_model::{
     identifiers::{AccountId, InstrumentId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
+    position::Position,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{Money, Quantity},
 };
@@ -488,7 +489,7 @@ pub fn check_position_reconciliation(
 /// to the position would count the execution twice.
 #[must_use]
 pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillReport) -> bool {
-    let included_in_snapshot = |position: &nautilus_model::position::Position| {
+    let included_in_snapshot = |position: &Position| {
         report.ts_event < position.ts_opened
             && !position.trade_ids.contains(&report.trade_id)
             && cache
@@ -500,6 +501,7 @@ pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillRe
                     })
                 })
     };
+
     if report.is_orderless_action() {
         // A later merge may close or archive a balance-reconstructed position,
         // its snapshot still proves that earlier conversion fills were included.

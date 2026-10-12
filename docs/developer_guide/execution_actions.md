@@ -178,8 +178,8 @@ merge: Yes -= A; No -= A; quote += A - F_merge
 ```
 
 On success the engine plans and applies two ordinary orderless `OrderFilled` records, one per
-binary leg, through the existing simulated exchange/account/position pipeline. They are not market
-orders and must not create order lifecycle events. Reusing the fill/account machinery preserves the
+binary leg, through the existing simulated exchange/account/position pipeline. They do not create
+orders or synthetic `OrderSubmitted`/`OrderAccepted` events. Reusing the fill/account machinery preserves the
 normal `AccountState`, `PositionOpened`/`PositionChanged`/`PositionClosed`, portfolio, and strategy
 event ordering. Once those mutations are visible, the simulator sends `Accepted` for the command.
 
@@ -204,6 +204,14 @@ state transitions. An opaque adapter-defined command is not a substitute for tha
 ## Evidence limits
 
 Unit and integration tests prove structured request construction, result classification, simulator
-account/position propagation, and local routing. They do not prove a venue accepted a request.
-Testnet recordings of `userOutcome`, private account state, and outcome-token updates remain
-required before claiming Hyperliquid's live split/merge state convergence.
+account/position propagation, and local routing. The Hyperliquid adapter also tests REST and
+WebSocket parsing against a quantity-1 testnet split/merge recording, with transaction hashes
+anonymized. Venue-confirmed conversion fills retain their actual quantities, prices, fees, and
+identifiers and enter the existing orderless leg-fill path. Reconciliation uses external instrument
+claims to route these fills; it does not invent an association with a local action command.
+
+Successful position-report collection also refreshes authoritative account state using the existing
+account query. Live reported accounts do not derive cash from conversion fills. The account and
+position reads are separate snapshots, and an account-refresh failure does not discard valid
+position reports. Short testnet validation does not establish long-term rate-limit behavior or
+ordinary-order latency.

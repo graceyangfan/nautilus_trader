@@ -1008,7 +1008,8 @@ impl HyperliquidHttpClient {
     /// Sets the products routed to this execution client.
     ///
     /// # Errors
-    /// Returns an error for an empty product scope.
+    ///
+    /// Returns an error if the product scope is empty.
     pub fn set_product_types(
         &mut self,
         product_types: Vec<HyperliquidProductType>,
@@ -2995,6 +2996,7 @@ impl HyperliquidHttpClient {
                     HyperliquidProductType::Spot | HyperliquidProductType::Outcome
                 )
             });
+
         if instrument_id.is_some_and(|id| !self.allows_instrument(id))
             || (!fetch_perp && !fetch_spot)
         {
@@ -4001,6 +4003,7 @@ impl HyperliquidHttpClient {
         if !self.product_types.contains(&HyperliquidProductType::Perp) {
             return Ok(vec![None]);
         }
+
         if historical_orders.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
             || fills.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
         {
@@ -4179,6 +4182,52 @@ mod tests {
 
     const TEST_PRIVATE_KEY: &str =
         "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    #[rstest]
+    #[case(None, [true, true, true])]
+    #[case(Some(HyperliquidProductType::Perp), [true, false, false])]
+    #[case(Some(HyperliquidProductType::Spot), [false, true, false])]
+    #[case(Some(HyperliquidProductType::Outcome), [false, false, true])]
+    fn test_execution_product_scope(
+        #[case] product: Option<HyperliquidProductType>,
+        #[case] expected: [bool; 3],
+    ) {
+        let mut client = HyperliquidHttpClient::default();
+
+        if let Some(product) = product {
+            client.set_product_types(vec![product]).unwrap();
+        }
+
+        let instruments = [
+            "BTC-PERP.HYPERLIQUID",
+            "PURR-USDC-SPOT.HYPERLIQUID",
+            "23276-YES-OUTCOME.HYPERLIQUID",
+        ];
+        let coins = ["BTC", "@1", "#232760"];
+
+        for ((instrument, coin), allowed) in instruments.into_iter().zip(coins).zip(expected) {
+            assert_eq!(
+                client.allows_instrument(InstrumentId::from(instrument)),
+                allowed
+            );
+            assert_eq!(client.allows_venue_coin(coin), allowed);
+        }
+    }
+
+    #[rstest]
+    fn test_empty_product_scope_preserves_previous_scope() {
+        let mut client = HyperliquidHttpClient::default();
+        client
+            .set_product_types(vec![HyperliquidProductType::Spot])
+            .unwrap();
+
+        let result = client.set_product_types(vec![]);
+
+        assert!(result.is_err());
+        assert!(client.allows_venue_coin("@1"));
+        assert!(!client.allows_venue_coin("BTC"));
+        assert!(!client.allows_venue_coin("#232760"));
+    }
 
     #[tokio::test]
     async fn test_authenticated_client_rejects_redirects() {

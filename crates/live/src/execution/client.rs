@@ -565,14 +565,15 @@ mod tests {
             Ok(())
         }
         fn execute_action(&self, cmd: ExecuteAction) -> anyhow::Result<()> {
-            assert_eq!(cmd.account_id, self.account_id());
-            assert_eq!(
-                cmd.command_id,
-                UUID4::from("00000000-0000-4000-8000-000000000001")
+            anyhow::ensure!(cmd.account_id == self.account_id(), "Unexpected account ID");
+            anyhow::ensure!(
+                cmd.command_id == UUID4::from("00000000-0000-4000-8000-000000000001"),
+                "Unexpected command ID"
             );
+
             match cmd.action.binary_option() {
                 Some(BinaryOptionAction::Split { quantity, .. }) => {
-                    assert_eq!(*quantity, Quantity::from("1"));
+                    anyhow::ensure!(*quantity == Quantity::from("1"), "Unexpected quantity");
                     Ok(())
                 }
                 _ => anyhow::bail!("adapter action rejected"),

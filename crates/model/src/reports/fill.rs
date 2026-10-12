@@ -323,6 +323,42 @@ mod tests {
     }
 
     #[rstest]
+    #[case("execution_action", "ACTION-1-LEG-YES", true)]
+    #[case("execution_action", "ORDER-1", false)]
+    #[case("order", "ACTION-1-LEG-YES", false)]
+    fn test_orderless_action_report(
+        #[case] source: &str,
+        #[case] client_order_id: &str,
+        #[case] expected: bool,
+    ) {
+        let mut report = test_fill_report();
+        report.client_order_id = Some(ClientOrderId::from(client_order_id));
+        report.info = Some(IndexMap::from([(Ustr::from("source"), Ustr::from(source))]));
+
+        let restored: FillReport =
+            serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        let fill = restored.orderless_action_fill(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("ACTION-001"),
+            Currency::USD(),
+        );
+
+        assert_eq!(restored, report);
+        assert_eq!(restored.is_orderless_action(), expected);
+        assert_eq!(fill.is_some(), expected);
+
+        if let Some(fill) = fill {
+            assert_eq!(fill.trade_id, report.trade_id);
+            assert_eq!(fill.venue_order_id, report.venue_order_id);
+            assert_eq!(fill.last_qty, report.last_qty);
+            assert_eq!(fill.last_px, report.last_px);
+            assert_eq!(fill.commission, Some(report.commission));
+            assert_eq!(fill.info, report.info);
+            assert!(fill.reconciliation);
+        }
+    }
+
+    #[rstest]
     fn test_fill_report_with_different_liquidity_sides() {
         let maker_report = FillReport::new(
             AccountId::from("SIM-001"),

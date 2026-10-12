@@ -1205,9 +1205,11 @@ impl ExecutionManager {
                     .borrow()
                     .get_external_order_claim(&first_fill.instrument_id)
                     .unwrap_or_else(StrategyId::external);
+
                 if self.config.filter_unclaimed_external && strategy_id.is_external() {
                     continue;
                 }
+
                 for report in fills {
                     if let Some(fill) = report.orderless_action_fill(
                         self.config.trader_id,

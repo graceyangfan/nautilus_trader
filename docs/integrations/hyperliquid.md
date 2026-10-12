@@ -601,6 +601,11 @@ Account and outcome-token state continue to converge through the existing
 account, fill, position, and reconciliation paths; the callback does not
 synthesize orders, fills, or positions.
 
+Venue-confirmed `Split Outcome` and `Merge Outcome` fills update positions through the existing
+orderless leg-fill path, without creating synthetic orders. External instrument claims associate
+these fills with a strategy; see `set_external_order_instrument_ids` in the testnet tester. The
+fills preserve venue quantities, prices, and fees rather than deriving them from the action ACK.
+
 The full `userOutcome` action set is also reachable directly on
 `HyperliquidHttpClient` (Rust and PyO3) for lower-level tooling:
 
@@ -1585,6 +1590,13 @@ Hyperliquid's clearinghouse state. Spot positions are reconstructed from held
 balances (long-only); HIP-4 side tokens reconcile against their matching
 `BinaryOption` instruments. See [HIP-3 reconciliation](#open-order-and-position-reconciliation) for
 per-dex open-order and position fan-out.
+
+`HyperliquidExecutionClientConfig.product_types` scopes submissions, execution reports, recovery,
+and position coverage independently of data subscriptions. The default includes `PERP`, `SPOT`,
+and `OUTCOME`; an empty scope is rejected when constructing the client. For outcome-only execution,
+set `product_types=[HyperliquidProductType.OUTCOME]`. Account balances remain unscoped. Successful
+position-report collection also refreshes authoritative account state, so conversion fills do not
+manually deduct cash or charge fees again. These are separate venue snapshots, not an atomic read.
 
 :::note
 Leverage is managed directly through the Hyperliquid web UI or API, not through the adapter.

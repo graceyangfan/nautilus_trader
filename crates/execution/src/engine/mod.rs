@@ -3444,6 +3444,7 @@ impl ExecutionEngine {
         let is_action = fill.info.as_ref().is_some_and(|info| {
             info.get(&ustr::Ustr::from("source")) == Some(&ustr::Ustr::from("execution_action"))
         });
+
         if is_action {
             let mut report = FillReport::new(
                 fill.account_id,
@@ -3454,7 +3455,7 @@ impl ExecutionEngine {
                 fill.last_qty,
                 fill.last_px,
                 fill.commission
-                    .unwrap_or_else(|| Money::new(0.0, fill.currency)),
+                    .unwrap_or_else(|| Money::zero(fill.currency)),
                 fill.liquidity_side,
                 Some(fill.client_order_id),
                 fill.position_id,
@@ -3462,7 +3463,7 @@ impl ExecutionEngine {
                 fill.ts_init,
                 Some(fill.event_id),
             );
-            report.info = fill.info.clone();
+            report.info.clone_from(&fill.info);
             if fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), &report) {
                 return false;
             }
