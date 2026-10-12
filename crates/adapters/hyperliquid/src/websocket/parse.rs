@@ -456,7 +456,7 @@ pub fn parse_ws_fill_report(
     // No client order ID available in fill data directly
     let client_order_id = None;
 
-    Ok(FillReport::new(
+    let mut report = FillReport::new(
         account_id,
         instrument_id,
         venue_order_id,
@@ -471,7 +471,9 @@ pub fn parse_ws_fill_report(
         ts_event,
         ts_init,
         None, // report_id
-    ))
+    );
+    crate::common::parse::annotate_outcome_action_fill(&mut report, &fill.dir, &fill.hash)?;
+    Ok(report)
 }
 
 /// Parses a WebSocket ActiveAssetCtx message into mark price, index price, and funding rate updates.

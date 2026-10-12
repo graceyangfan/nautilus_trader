@@ -994,6 +994,7 @@ pub struct HyperliquidHttpClient {
     normalize_prices: bool,
     market_order_slippage_bps: u32,
     include_builder_attribution: bool,
+    product_types: Vec<HyperliquidProductType>,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -1004,6 +1005,40 @@ impl Default for HyperliquidHttpClient {
 }
 
 impl HyperliquidHttpClient {
+    /// Sets the products routed to this execution client.
+    ///
+    /// # Errors
+    /// Returns an error for an empty product scope.
+    pub fn set_product_types(
+        &mut self,
+        product_types: Vec<HyperliquidProductType>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !product_types.is_empty(),
+            "Execution product_types must not be empty"
+        );
+        self.product_types = product_types;
+        Ok(())
+    }
+
+    /// Returns whether an instrument is covered by this client's product scope.
+    #[must_use]
+    pub fn allows_instrument(&self, instrument_id: InstrumentId) -> bool {
+        HyperliquidProductType::from_symbol(instrument_id.symbol.as_str())
+            .is_ok_and(|product| self.product_types.contains(&product))
+    }
+
+    fn allows_venue_coin(&self, coin: &str) -> bool {
+        let product = HyperliquidProductType::from_symbol(coin).unwrap_or_else(|_| {
+            if coin.starts_with('@') {
+                HyperliquidProductType::Spot
+            } else {
+                HyperliquidProductType::Perp
+            }
+        });
+        self.product_types.contains(&product)
+    }
+
     /// Creates a new [`HyperliquidHttpClient`] for public endpoints only.
     ///
     /// # Errors
@@ -1047,6 +1082,11 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            product_types: vec![
+                HyperliquidProductType::Perp,
+                HyperliquidProductType::Spot,
+                HyperliquidProductType::Outcome,
+            ],
         }
     }
 
@@ -1140,6 +1180,11 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            product_types: vec![
+                HyperliquidProductType::Perp,
+                HyperliquidProductType::Spot,
+                HyperliquidProductType::Outcome,
+            ],
         })
     }
 
@@ -1218,6 +1263,11 @@ impl HyperliquidHttpClient {
                     normalize_prices: true,
                     market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
                     include_builder_attribution: true,
+                    product_types: vec![
+                        HyperliquidProductType::Perp,
+                        HyperliquidProductType::Spot,
+                        HyperliquidProductType::Outcome,
+                    ],
                 })
             }
             None => {
@@ -1262,6 +1312,11 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            product_types: vec![
+                HyperliquidProductType::Perp,
+                HyperliquidProductType::Spot,
+                HyperliquidProductType::Outcome,
+            ],
         })
     }
 
@@ -2435,6 +2490,9 @@ impl HyperliquidHttpClient {
                     }
                 };
 
+                if !self.allows_venue_coin(order.coin.as_str()) {
+                    continue;
+                }
                 let instrument = match self.get_or_create_instrument(&order.coin, None) {
                     Some(instrument) => instrument,
                     // get_or_create_instrument warns with the coin
@@ -2444,7 +2502,9 @@ impl HyperliquidHttpClient {
                     }
                 };
 
-                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                if !self.allows_instrument(instrument.id())
+                    || instrument_id.is_some_and(|filter_id| instrument.id() != filter_id)
+                {
                     continue;
                 }
 
@@ -2508,6 +2568,9 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
 
         for entry in entries {
+            if !self.allows_venue_coin(entry.order.coin.as_str()) {
+                continue;
+            }
             let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
                 // get_or_create_instrument warns with the coin
                 Some(instrument) => instrument,
@@ -2517,7 +2580,9 @@ impl HyperliquidHttpClient {
                 }
             };
 
-            if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+            if !self.allows_instrument(instrument.id())
+                || instrument_id.is_some_and(|filter_id| instrument.id() != filter_id)
+            {
                 continue;
             }
 
@@ -2830,6 +2895,9 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
 
         for fill in fills_response {
+            if !self.allows_venue_coin(fill.coin.as_str()) {
+                continue;
+            }
             // Get instrument from cache or create synthetic for vault tokens
             let instrument = match self.get_or_create_instrument(&fill.coin, None) {
                 Some(inst) => inst,
@@ -2915,11 +2983,25 @@ impl HyperliquidHttpClient {
         let filter_product = instrument_id
             .and_then(|id| HyperliquidProductType::from_symbol(id.symbol.as_str()).ok());
 
-        let fetch_perp = !matches!(
-            filter_product,
-            Some(HyperliquidProductType::Spot | HyperliquidProductType::Outcome)
-        );
-        let fetch_spot = filter_product != Some(HyperliquidProductType::Perp);
+        let fetch_perp = self.product_types.contains(&HyperliquidProductType::Perp)
+            && !matches!(
+                filter_product,
+                Some(HyperliquidProductType::Spot | HyperliquidProductType::Outcome)
+            );
+        let fetch_spot = filter_product != Some(HyperliquidProductType::Perp)
+            && self.product_types.iter().any(|p| {
+                matches!(
+                    p,
+                    HyperliquidProductType::Spot | HyperliquidProductType::Outcome
+                )
+            });
+        if instrument_id.is_some_and(|id| !self.allows_instrument(id))
+            || (!fetch_perp && !fetch_spot)
+        {
+            return Err(Error::bad_request(
+                "Instrument outside execution product scope",
+            ));
+        }
 
         let mut reports = Vec::new();
         let mut complete = true;
@@ -2959,7 +3041,9 @@ impl HyperliquidHttpClient {
                     }
                 };
 
-                if instrument_id.is_some_and(|filter_id| instrument.id() != filter_id) {
+                if !self.allows_instrument(instrument.id())
+                    || instrument_id.is_some_and(|filter_id| instrument.id() != filter_id)
+                {
                     continue;
                 }
 
@@ -3150,6 +3234,9 @@ impl HyperliquidHttpClient {
                 _ => HyperliquidProductType::Spot,
             };
 
+            if !self.product_types.contains(&product_type) {
+                continue;
+            }
             let instrument = match self.get_or_create_instrument(&balance.coin, Some(product_type))
             {
                 Some(inst) => inst,
@@ -3895,6 +3982,9 @@ impl HyperliquidHttpClient {
             return vec![perp_dex_from_symbol(instrument_id.symbol.as_str())];
         }
 
+        if !self.product_types.contains(&HyperliquidProductType::Perp) {
+            return vec![None];
+        }
         let cached = self.instruments.load();
         reconciliation_dexes_from_builders(
             cached
@@ -3908,6 +3998,9 @@ impl HyperliquidHttpClient {
         historical_orders: &[HyperliquidOrderStatusEntry],
         fills: &HyperliquidFills,
     ) -> Result<Vec<Option<Ustr>>> {
+        if !self.product_types.contains(&HyperliquidProductType::Perp) {
+            return Ok(vec![None]);
+        }
         if historical_orders.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
             || fills.len() >= HYPERLIQUID_RECENT_HISTORY_LIMIT
         {

@@ -251,6 +251,10 @@ impl HyperliquidExecutionClient {
     }
 
     fn validate_order_submission(&self, order: &OrderAny) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.http_client.allows_instrument(order.instrument_id()),
+            "Order outside execution product scope"
+        );
         validate_order_for_hyperliquid(order)
     }
 
@@ -259,7 +263,7 @@ impl HyperliquidExecutionClient {
         order: &OrderAny,
         slippage_bps: u32,
     ) -> anyhow::Result<HyperliquidExchangePlaceOrderRequest> {
-        validate_order_for_hyperliquid(order)?;
+        self.validate_order_submission(order)?;
 
         let symbol = order.instrument_id().symbol.inner();
         let asset = self
@@ -502,6 +506,7 @@ impl HyperliquidExecutionClient {
         )
         .context("failed to create Hyperliquid HTTP client")?;
 
+        http_client.set_product_types(config.product_types.clone())?;
         http_client.set_account_id(core.account_id);
         http_client.set_account_address(account_address);
         http_client.set_normalize_prices(config.normalize_prices);
@@ -679,6 +684,7 @@ impl HyperliquidExecutionClient {
         Ok(HyperliquidReportClient {
             http_client: self.http_client.clone(),
             account_address: self.get_account_address()?,
+            emitter: self.emitter.clone(),
         })
     }
 
@@ -972,7 +978,17 @@ impl ExecutionClient for HyperliquidExecutionClient {
         self.stop()
     }
 
+    fn provides_bulk_position_coverage(&self, instrument_id: InstrumentId) -> bool {
+        self.http_client.allows_instrument(instrument_id)
+    }
+
     fn execute_action(&self, cmd: ExecuteAction) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.config
+                .product_types
+                .contains(&crate::common::enums::HyperliquidProductType::Outcome),
+            "Outcome actions outside execution product scope"
+        );
         let action = outcome_action_from_command(&cmd)?;
         let task_spawner = self.pending_tasks.spawner().map_err(|e| {
             anyhow::anyhow!("Cannot execute Hyperliquid action after shutdown began: {e}")
@@ -2405,6 +2421,7 @@ impl ExecutionClient for HyperliquidExecutionClient {
 struct HyperliquidReportClient {
     http_client: HyperliquidHttpClient,
     account_address: String,
+    emitter: ExecutionEventEmitter,
 }
 
 impl HyperliquidReportClient {
@@ -2552,6 +2569,18 @@ impl HyperliquidReportClient {
             .request_position_status_reports(account_address, cmd.instrument_id)
             .await
             .context("failed to generate position status reports")?;
+
+        // Reported accounts do not calculate balances from fills. Refresh the
+        // authoritative account snapshot alongside periodic position reconciliation.
+        // A failed account refresh must not discard a valid position snapshot.
+        match self
+            .http_client
+            .request_account_state(account_address)
+            .await
+        {
+            Ok(state) => self.emitter.send_account_state(state),
+            Err(e) => log::warn!("Failed to refresh account during position reconciliation: {e}"),
+        }
 
         log::debug!("Generated {} position status reports", reports.len());
         Ok(reports)
@@ -2791,6 +2820,11 @@ impl HyperliquidExecutionClient {
                     Some(msg) => match msg {
                         NautilusWsMessage::ExecutionReports(reports) => {
                             for report in reports {
+                                let instrument_id = match &report {
+                                    ExecutionReport::Fill(report) => report.instrument_id,
+                                    ExecutionReport::Order(report) => report.instrument_id,
+                                };
+                                if !http_client.allows_instrument(instrument_id) { continue; }
                                 ts_last_report = ts_last_report.max(ts_venue(&report));
 
                                 let staged_parent_fill = match &report {

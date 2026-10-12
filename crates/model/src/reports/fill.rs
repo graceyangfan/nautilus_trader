@@ -15,13 +15,19 @@
 
 use std::fmt::Display;
 
+use indexmap::IndexMap;
 use nautilus_core::{UUID4, UnixNanos};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use ustr::Ustr;
 
 use crate::{
-    enums::{LiquiditySide, OrderSide},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
+    enums::{LiquiditySide, OrderSide, OrderType},
+    events::OrderFilled,
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TradeId, TraderId,
+        VenueOrderId,
+    },
     types::{Money, Price, Quantity},
 };
 
@@ -67,6 +73,9 @@ pub struct FillReport {
     pub client_order_id: Option<ClientOrderId>,
     /// The position ID (assigned by the venue).
     pub venue_position_id: Option<PositionId>,
+    /// Venue execution provenance, including orderless execution actions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<IndexMap<Ustr, Ustr>>,
 }
 
 impl FillReport {
@@ -105,7 +114,53 @@ impl FillReport {
             ts_init,
             client_order_id,
             venue_position_id,
+            info: None,
         }
+    }
+
+    /// Identifies a venue-confirmed execution action leg without a user order.
+    #[must_use]
+    pub fn is_orderless_action(&self) -> bool {
+        self.info.as_ref().is_some_and(|info| {
+            info.get(&Ustr::from("source")) == Some(&Ustr::from("execution_action"))
+        }) && self
+            .client_order_id
+            .is_some_and(|id| id.as_str().contains("-LEG-"))
+    }
+
+    /// Converts an orderless action report using actual venue quantities, prices, and fees.
+    #[must_use]
+    pub fn orderless_action_fill(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        currency: crate::types::Currency,
+    ) -> Option<OrderFilled> {
+        if !self.is_orderless_action() {
+            return None;
+        }
+        Some(OrderFilled::new(
+            trader_id,
+            strategy_id,
+            self.instrument_id,
+            self.client_order_id?,
+            self.venue_order_id,
+            self.account_id,
+            self.trade_id,
+            self.order_side,
+            OrderType::Market,
+            self.last_qty,
+            self.last_px,
+            currency,
+            self.liquidity_side,
+            self.report_id,
+            self.ts_event,
+            self.ts_init,
+            true,
+            self.venue_position_id,
+            Some(self.commission),
+            self.info.clone(),
+        ))
     }
 
     /// Checks if the fill has a client order ID.

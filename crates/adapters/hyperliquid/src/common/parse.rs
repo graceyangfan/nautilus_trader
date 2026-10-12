@@ -2877,3 +2877,70 @@ mod tests {
         assert_eq!(request.price, expected);
     }
 }
+
+/// Attaches provenance only when the venue identifies a binary conversion fill.
+/// ACKs are deliberately not used as evidence of inventory creation.
+pub fn annotate_outcome_action_fill(
+    report: &mut nautilus_model::reports::FillReport,
+    direction: &super::enums::HyperliquidFillDirection,
+    hash: &str,
+) -> anyhow::Result<()> {
+    use super::enums::{HyperliquidFillDirection, HyperliquidProductType};
+    use nautilus_model::{
+        enums::{LiquiditySide, OrderSide},
+        identifiers::ClientOrderId,
+    };
+    use ustr::Ustr;
+    let (action, side, label) = match direction {
+        HyperliquidFillDirection::SplitOutcome => {
+            ("binary_option.split", OrderSide::Buy, "Split Outcome")
+        }
+        HyperliquidFillDirection::MergeOutcome => {
+            ("binary_option.merge", OrderSide::Sell, "Merge Outcome")
+        }
+        _ => return Ok(()),
+    };
+    anyhow::ensure!(
+        HyperliquidProductType::from_symbol(report.instrument_id.symbol.as_str())?
+            == HyperliquidProductType::Outcome,
+        "Conversion fill must reference an outcome instrument"
+    );
+    anyhow::ensure!(
+        report.order_side == side,
+        "Conversion fill direction and side disagree"
+    );
+    let leg = if report
+        .instrument_id
+        .symbol
+        .as_str()
+        .ends_with("-YES-OUTCOME")
+    {
+        "YES"
+    } else if report
+        .instrument_id
+        .symbol
+        .as_str()
+        .ends_with("-NO-OUTCOME")
+    {
+        "NO"
+    } else {
+        anyhow::bail!("Outcome conversion leg cannot be identified");
+    };
+    report.client_order_id = Some(ClientOrderId::new_checked(format!(
+        "HL-ACTION-{}-LEG-{leg}",
+        report.venue_order_id
+    ))?);
+    report.liquidity_side = LiquiditySide::NoLiquiditySide;
+    report.info = Some(Default::default());
+    let info = report.info.as_mut().expect("info initialized");
+    for (key, value) in [
+        ("source", "execution_action"),
+        ("action", action),
+        ("leg", if leg == "YES" { "yes" } else { "no" }),
+        ("transaction_hash", hash),
+        ("venue_fill_direction", label),
+    ] {
+        info.insert(Ustr::from(key), Ustr::from(value));
+    }
+    Ok(())
+}

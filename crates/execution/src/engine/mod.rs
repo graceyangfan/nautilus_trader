@@ -1592,6 +1592,22 @@ impl ExecutionEngine {
             return;
         };
 
+        if report.is_orderless_action() {
+            let strategy_id = self.resolve_external_strategy(&report.instrument_id);
+            if self.should_filter_unclaimed_external_order(strategy_id)
+                || fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), report)
+            {
+                return;
+            }
+            let trader_id = get_message_bus().borrow().trader_id;
+            if let Some(fill) =
+                report.orderless_action_fill(trader_id, strategy_id, instrument.quote_currency())
+            {
+                self.handle_event(&OrderEventAny::Filled(fill));
+            }
+            return;
+        }
+
         let order = match order {
             Some(order) => order,
             None => {
@@ -3425,6 +3441,33 @@ impl ExecutionEngine {
     }
 
     fn handle_leg_fill_without_order(&mut self, mut fill: OrderFilled) -> bool {
+        let is_action = fill.info.as_ref().is_some_and(|info| {
+            info.get(&ustr::Ustr::from("source")) == Some(&ustr::Ustr::from("execution_action"))
+        });
+        if is_action {
+            let mut report = FillReport::new(
+                fill.account_id,
+                fill.instrument_id,
+                fill.venue_order_id,
+                fill.trade_id,
+                fill.order_side,
+                fill.last_qty,
+                fill.last_px,
+                fill.commission
+                    .unwrap_or_else(|| Money::new(0.0, fill.currency)),
+                fill.liquidity_side,
+                Some(fill.client_order_id),
+                fill.position_id,
+                fill.ts_event,
+                fill.ts_init,
+                Some(fill.event_id),
+            );
+            report.info = fill.info.clone();
+            if fill_precedes_snapshot_reconciled_position(&self.cache.borrow(), &report) {
+                return false;
+            }
+        }
+
         let instrument =
             if let Some(instrument) = self.cache.borrow().instrument(&fill.instrument_id) {
                 instrument.clone()
@@ -3449,7 +3492,14 @@ impl ExecutionEngine {
             return false;
         }
 
-        let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id);
+        let duplicate_position_fill = self.position_contains_trade_id(position_id, fill.trade_id)
+            || (is_action
+                && self
+                    .cache
+                    .borrow()
+                    .position_snapshots(Some(&position_id), Some(&fill.account_id))
+                    .iter()
+                    .any(|position| position.trade_ids.contains(&fill.trade_id)));
 
         let event = OrderEventAny::Filled(fill.clone());
 

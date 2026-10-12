@@ -1196,6 +1196,31 @@ impl ExecutionManager {
                 continue;
             }
 
+            if first_fill.is_orderless_action() {
+                let Some(instrument) = self.get_instrument(&first_fill.instrument_id) else {
+                    orders_skipped_no_instrument += 1;
+                    continue;
+                };
+                let strategy_id = exec_engine
+                    .borrow()
+                    .get_external_order_claim(&first_fill.instrument_id)
+                    .unwrap_or_else(StrategyId::external);
+                if self.config.filter_unclaimed_external && strategy_id.is_external() {
+                    continue;
+                }
+                for report in fills {
+                    if let Some(fill) = report.orderless_action_fill(
+                        self.config.trader_id,
+                        strategy_id,
+                        instrument.quote_currency(),
+                    ) {
+                        fills_applied += 1;
+                        events.push(OrderEventAny::Filled(fill));
+                    }
+                }
+                continue;
+            }
+
             let order = first_fill
                 .client_order_id
                 .as_ref()
