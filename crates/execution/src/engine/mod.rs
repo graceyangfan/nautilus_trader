@@ -3262,13 +3262,6 @@ impl ExecutionEngine {
                 let mut fill = fill.clone();
                 fill.position_id = Some(position_id);
 
-                if let Err(e) =
-                    self.validate_quantity_commission_for_order(&order_before_fill, &fill)
-                {
-                    log::error!("Cannot apply quantity commission: {e}");
-                    return false;
-                }
-
                 let restatement = is_fill_price_restatement(&order_before_fill, &fill);
                 let validation = if apply_position {
                     self.validate_fill_for_order(&order_before_fill, &fill)
@@ -3277,6 +3270,15 @@ impl ExecutionEngine {
                 };
 
                 if validation.is_err() {
+                    return false;
+                }
+
+                if let Err(e) = self.validate_quantity_commission_for_order(
+                    &order_before_fill,
+                    &fill,
+                    restatement,
+                ) {
+                    log::error!("Cannot apply quantity commission: {e}");
                     return false;
                 }
 
@@ -3949,11 +3951,13 @@ impl ExecutionEngine {
         &self,
         order: &OrderAny,
         fill: &OrderFilled,
+        restatement: bool,
     ) -> anyhow::Result<()> {
-        let previous_quantity_fee = order.events().iter().any(|event| {
-            matches!(event, OrderEventAny::Filled(previous)
-                if previous.trade_id == fill.trade_id && previous.quantity_commission.is_some())
-        });
+        let previous_quantity_fee = restatement
+            && order.events().iter().any(|event| {
+                matches!(event, OrderEventAny::Filled(previous)
+                    if previous.trade_id == fill.trade_id && previous.quantity_commission.is_some())
+            });
 
         let cache = self.cache.borrow();
         let quantity_fee_position = fill
@@ -3974,10 +3978,7 @@ impl ExecutionEngine {
             account.account_type() == AccountType::Cash && !account.calculated_account_state(),
             "quantity fee prototype requires a reported cash account"
         );
-        anyhow::ensure!(
-            !is_fill_price_restatement(order, fill),
-            "quantity fee restatements are unsupported"
-        );
+        anyhow::ensure!(!restatement, "quantity fee restatements are unsupported");
         let position_id = fill
             .position_id
             .ok_or_else(|| anyhow::anyhow!("quantity fee position identity missing"))?;

@@ -24988,3 +24988,186 @@ fn test_execution_command_logging(
     assert_eq!(take_reconciliation_logs(), expected);
     assert_eq!(*calls.borrow(), vec![(client_id, operation)]);
 }
+
+#[rstest]
+fn test_quantity_fee_reopen_filters_duplicates_before_inventory_validation() {
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = ExecutionEngineConfig {
+        carry_replay_events_on_reopen: true,
+        ..Default::default()
+    };
+    let mut engine = ExecutionEngine::new(clock, cache, Some(config));
+    let account_id = AccountId::test_default();
+    let instrument = audusd_sim();
+    register_stub_client(&mut engine, account_id, &instrument, OmsType::Netting);
+    let strategy_id = StrategyId::test_default();
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id));
+    let observed = Rc::new(RefCell::new(Vec::new()));
+    let handler = TypedHandler::from({
+        let observed = observed.clone();
+        move |event: &PositionEvent| observed.borrow_mut().push(event.clone())
+    });
+    let topic = switchboard::get_event_position_topic(strategy_id);
+    msgbus::subscribe_position_events(topic.into(), handler.clone(), None);
+    let mut fills = Vec::new();
+
+    for (id, side, quantity, fee) in [
+        ("Q-OPEN", OrderSide::Buy, 100, Some(dec!(2))),
+        ("Q-CLOSE", OrderSide::Sell, 98, None),
+        ("Q-REOPEN", OrderSide::Buy, 10, Some(dec!(1))),
+    ] {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .strategy_id(strategy_id)
+            .instrument_id(instrument.id)
+            .client_order_id(ClientOrderId::from(id))
+            .side(side)
+            .quantity(Quantity::from(quantity))
+            .build();
+        engine
+            .cache()
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+        engine.process(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from(id),
+        ));
+        let mut fill = OrderFilledSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(strategy_id)
+            .account_id(account_id)
+            .instrument_id(instrument.id)
+            .client_order_id(order.client_order_id())
+            .venue_order_id(VenueOrderId::from(id))
+            .trade_id(TradeId::from(id))
+            .order_side(side)
+            .order_type(OrderType::Market)
+            .last_qty(order.quantity())
+            .last_px(Price::from("1.00000"))
+            .currency(Currency::USD())
+            .commission(Money::zero(Currency::USD()))
+            .build();
+        fill.quantity_commission = fee;
+        engine.process(&OrderEventAny::Filled(fill.clone()));
+        fills.push(fill);
+    }
+    assert_eq!(observed.borrow().len(), 3);
+    let before =
+        serde_json::to_string(&*engine.cache().borrow().position(&position_id).unwrap()).unwrap();
+    capture_reconciliation_logs();
+    engine.process(&OrderEventAny::Filled(fills[1].clone()));
+    assert_eq!(
+        take_reconciliation_logs(),
+        vec![(
+            Level::Warn,
+            "Duplicate fill: Q-CLOSE trade_id=Q-CLOSE already applied, skipping".to_string()
+        )]
+    );
+    assert_eq!(observed.borrow().len(), 3);
+    assert_eq!(
+        serde_json::to_string(&*engine.cache().borrow().position(&position_id).unwrap()).unwrap(),
+        before
+    );
+
+    let invalid = OrderTestBuilder::new(OrderType::Market)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("Q-OVERSELL"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(98))
+        .build();
+    engine
+        .cache()
+        .borrow_mut()
+        .add_order(invalid.clone(), None, None, false)
+        .unwrap();
+    engine.process(&TestOrderEventStubs::submitted(&invalid, account_id));
+    engine.process(&TestOrderEventStubs::accepted(
+        &invalid,
+        account_id,
+        VenueOrderId::from("Q-OVERSELL"),
+    ));
+    let mut oversized = fills[1].clone();
+    oversized.event_id = UUID4::new();
+    oversized.client_order_id = invalid.client_order_id();
+    oversized.venue_order_id = VenueOrderId::from("Q-OVERSELL");
+    oversized.trade_id = TradeId::from("Q-OVERSELL");
+    engine.process(&OrderEventAny::Filled(oversized));
+    assert_eq!(
+        engine
+            .cache()
+            .borrow()
+            .order(&invalid.client_order_id())
+            .unwrap()
+            .status(),
+        OrderStatus::Accepted
+    );
+    assert_eq!(
+        engine
+            .cache()
+            .borrow()
+            .order(&invalid.client_order_id())
+            .unwrap()
+            .filled_qty(),
+        Quantity::from(0)
+    );
+    assert_eq!(observed.borrow().len(), 3);
+
+    let exit = OrderTestBuilder::new(OrderType::Market)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("Q-EXIT"))
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from(9))
+        .build();
+    add_order_and_process_fill(
+        &mut engine,
+        &exit,
+        &instrument,
+        account_id,
+        "Q-EXIT",
+        "Q-EXIT",
+    );
+    assert!(
+        engine
+            .cache()
+            .borrow()
+            .position(&position_id)
+            .unwrap()
+            .is_closed()
+    );
+    assert_eq!(observed.borrow().len(), 4);
+
+    for stripped_fee in [false, true] {
+        let mut restatement = fills[2].clone();
+        restatement.event_id = UUID4::new();
+        restatement.last_px = Price::from("1.10000");
+
+        if stripped_fee {
+            restatement.quantity_commission = None;
+        }
+        engine.process(&OrderEventAny::Filled(restatement));
+        assert_eq!(
+            engine
+                .cache()
+                .borrow()
+                .order(&ClientOrderId::from("Q-REOPEN"))
+                .unwrap()
+                .avg_px(),
+            Some(dec!(1))
+        );
+        assert!(
+            engine
+                .cache()
+                .borrow()
+                .position(&position_id)
+                .unwrap()
+                .is_closed()
+        );
+        assert_eq!(observed.borrow().len(), 4);
+    }
+    msgbus::unsubscribe_position_events(topic.into(), &handler);
+}

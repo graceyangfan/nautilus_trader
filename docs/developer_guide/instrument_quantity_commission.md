@@ -11,8 +11,10 @@ of the existing instrument ID. It is mutually exclusive with a nonzero `Money` c
 Existing constructors default to `None`; old JSON without the field remains readable.
 Adding a public field still changes Rust struct literals and ABI.
 
-The execution engine validates the supported account and inventory before changing the
-order. The position applies gross execution and the inventory deduction together, then
+The execution engine classifies duplicate fills and price restatements using its existing
+rules before validating account and inventory support for a new change. Validation still
+precedes order mutation. A historical duplicate is not checked against the inventory of a
+later position episode. The position applies gross execution and the inventory deduction together, then
 finalizes quantity and lifecycle state. The engine publishes the ordinary order and
 position events only after these changes are visible in Cache.
 
@@ -42,6 +44,21 @@ Remaining inventory retains its moving-average price. A BUY of 1 at 100 with a
 at 110 with no further fee closes with 8.9 realized PnL, matching the cash difference.
 This convention does not debit reported cash a second time or redefine existing
 multi-currency base commission PnL.
+
+## Accounting compatibility
+
+This new cost convention is not a reinterpretation of existing `Money` commissions.
+A CurrencyPair BUY of 1 at 100 with a 0.01 base-currency `Money` fee and SELL of 0.99 at
+110 retains the existing quote realized PnL of 9.9 and separately reports the base fee.
+The inventory-unit prototype reports 8.9 in quote realized PnL by expensing the fee's
+acquisition cost. These metrics are not interchangeable all-in reports. Existing Money
+fees must not be migrated to the new field just to make their quote PnL equal.
+
+The prototype's conservative quantity projection remains limited to inventory-fee
+positions; it does not establish a universal precision contract for all adjustments or
+positions. Generalizing the cost presentation, calculated accounts, and numeric ownership
+requires separate agreement and validation. Duplicate classification does not widen any
+of those supported scopes.
 
 ## Supported scope and explicit exclusions
 
@@ -81,8 +98,10 @@ prototype cache is unsupported; normal fill application does not scan history to
 Model tests cover inventory, disposal cost, closure metadata, JSON reconstruction,
 duplicate application, and unchanged state on conflicting fee input. Additional tests
 accumulate 100 subprecision fees, restore mid-stream, retain snapshot totals, purge fills,
-and reset episodes. Cap'n Proto tests
-retain an exact 18-decimal fee value; this tests serialization rather than inventory precision.
+and reset episodes. Historical duplicates after reopening a smaller position are ignored,
+including after JSON reconstruction and with a different event ID. Engine tests also retain
+atomic oversell rejection, subsequent valid closure, and unsupported price restatement rejection.
+Cap'n Proto tests retain an exact 18-decimal fee value; this tests serialization rather than inventory precision.
 
 The downstream Predict harness additionally tests multiple execution prices,
 maker/taker mixtures, gross order completion with immediate net Cache observations,

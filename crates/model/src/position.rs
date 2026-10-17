@@ -580,8 +580,6 @@ impl Position {
             return Ok(());
         }
 
-        let quantity_commission_totals = self.prepare_quantity_commission(fill)?;
-
         if record_replay
             && (self.side == PositionSide::Flat || !self.trade_ids.contains(&fill.trade_id))
             && self.is_duplicate_replay_fill(fill)
@@ -593,6 +591,8 @@ impl Position {
             );
             return Ok(());
         }
+
+        let quantity_commission_totals = self.prepare_quantity_commission(fill)?;
 
         if fill.ts_event < self.ts_opened {
             log::warn!(
@@ -9672,6 +9672,41 @@ mod quantity_commission_tests {
         position.try_apply(&reopen).unwrap();
         assert_eq!(position.quantity_commission_totals, None);
         assert_eq!(position.quantity.as_decimal(), Decimal::ONE);
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn historical_sell_duplicate_does_not_validate_against_reopened_inventory(
+        #[case] new_event_id: bool,
+    ) {
+        let (instrument, opening) = buy();
+        let mut position = Position::new_checked(&instrument, opening.clone()).unwrap();
+        let mut close = opening.clone();
+        close.event_id = UUID4::new();
+        close.trade_id = TradeId::from("OLD-CLOSE");
+        close.client_order_id = ClientOrderId::from("OLD-CLOSE");
+        close.order_side = OrderSide::Sell;
+        close.last_qty = position.quantity;
+        close.quantity_commission = None;
+        position.try_apply(&close).unwrap();
+        let mut reopen = opening;
+        reopen.event_id = UUID4::new();
+        reopen.trade_id = TradeId::from("NEW-OPEN");
+        reopen.client_order_id = ClientOrderId::from("NEW-OPEN");
+        reopen.last_qty = Quantity::from("0.1");
+        reopen.quantity_commission = Some(Decimal::new(1, 3));
+        position.try_apply(&reopen).unwrap();
+        let mut restored: Position =
+            serde_json::from_str(&serde_json::to_string(&position).unwrap()).unwrap();
+        let before = serde_json::to_string(&restored).unwrap();
+
+        if new_event_id {
+            close.event_id = UUID4::new();
+        }
+        restored.try_apply(&close).unwrap();
+        assert_eq!(serde_json::to_string(&restored).unwrap(), before);
+        assert_eq!(restored.quantity.as_decimal(), Decimal::new(99, 3));
     }
 
     #[rstest]
