@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     enums::{OrderSide, PositionSide},
     identifiers::{AccountId, ClientOrderId, InstrumentId, PositionId, StrategyId, TraderId},
-    position::{Position, QuantityCommissionTotals},
+    position::Position,
     types::{Currency, Money, Quantity},
 };
 
@@ -76,9 +76,6 @@ pub struct PositionSnapshot {
     pub unrealized_pnl: Option<Money>,
     /// The commissions for the position.
     pub commissions: Vec<Money>,
-    /// Inventory-unit fees and their settlement-currency acquisition cost.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quantity_commission_totals: Option<QuantityCommissionTotals>,
     /// The open duration for the position (nanoseconds).
     pub duration_ns: Option<DurationNanos>,
     /// UNIX timestamp (nanoseconds) when the position opened.
@@ -119,8 +116,7 @@ impl PositionSnapshot {
             realized_pnl: position.realized_pnl,
             unrealized_pnl,
             commissions: position.commissions.values().copied().collect(), // TODO: Optimize
-            quantity_commission_totals: position.quantity_commission_totals,
-            duration_ns: Some(position.duration_ns), // TODO: Standardize
+            duration_ns: Some(position.duration_ns),                       // TODO: Standardize
             ts_opened: position.ts_opened,
             ts_closed: position.ts_closed,
             ts_init: position.ts_init,
@@ -179,7 +175,6 @@ mod tests {
             realized_pnl: Some(Money::new(100.0, Currency::USD())),
             unrealized_pnl: Some(Money::new(50.0, Currency::USD())),
             commissions: vec![Money::new(2.0, Currency::USD())],
-            quantity_commission_totals: None,
             duration_ns: Some(DurationNanos::from_hours(1)),
             ts_opened: UnixNanos::from(1_000_000_000),
             ts_closed: Some(UnixNanos::from(4_600_000_000)),

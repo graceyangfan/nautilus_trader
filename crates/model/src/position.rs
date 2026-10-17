@@ -60,26 +60,9 @@ pub struct QuantityCommissionTotals {
 }
 
 impl QuantityCommissionTotals {
-    /// Returns fees conservatively projected to instrument quantity precision.
-    #[must_use]
-    pub fn projected_quantity(&self, precision: u8) -> Decimal {
+    fn projected_quantity(&self, precision: u8) -> Decimal {
         self.quantity
             .round_dp_with_strategy(u32::from(precision), RoundingStrategy::ToPositiveInfinity)
-    }
-
-    /// Returns inventory withheld by projection, less than one quantity quantum.
-    #[must_use]
-    pub fn quantity_residual(&self, precision: u8) -> Decimal {
-        self.projected_quantity(precision) - self.quantity
-    }
-
-    /// Returns the fee cost not represented at settlement currency precision.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the cumulative cost exceeds the Money range.
-    pub fn cost_residual(&self, currency: Currency) -> CorrectnessResult<Decimal> {
-        Ok(self.cost - Money::from_decimal(self.cost, currency)?.as_decimal())
     }
 }
 
@@ -9615,18 +9598,18 @@ mod quantity_commission_tests {
         );
         assert_eq!(totals.cost, totals.quantity);
         assert!(
-            totals.quantity_residual(position.size_precision)
+            (totals.projected_quantity(position.size_precision) - totals.quantity)
                 < Decimal::new(1, u32::from(position.size_precision))
         );
         assert!(
-            totals
-                .cost_residual(position.settlement_currency)
-                .unwrap()
-                .abs()
+            (totals.cost
+                - Money::from_decimal(totals.cost, position.settlement_currency)
+                    .unwrap()
+                    .as_decimal())
+            .abs()
                 <= Decimal::new(5, 9)
         );
         let snapshot = crate::events::PositionSnapshot::from_replay_state(&position, None);
-        assert_eq!(snapshot.quantity_commission_totals, Some(totals));
         assert_eq!(
             position.clone_without_events().quantity_commission_totals,
             Some(totals)

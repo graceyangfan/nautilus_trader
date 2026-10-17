@@ -82,10 +82,13 @@ PnL retains existing moving-average floating-point and per-fill Money rounding. 
 mixed-price BUY/SELL/re-entry probe differs from cash by one settlement-currency quantum;
 this change does not introduce a second PnL algorithm to eliminate that existing boundary.
 
-Rust order `quantity_commissions()` reports inventory-unit fees separately from the
-existing Money map. Position and PositionSnapshot include the cumulative quantity and cost;
-JSON and Arrow snapshots retain these totals. Residual methods take instrument/currency
-precision explicitly. Episode reset and purge/replay rebuild the same native state.
+Inventory-unit fees remain available on the original fill events; consumers can aggregate
+those events without extending the Order trait. Position retains the cumulative quantity
+and cost required for incremental application. Its complete state is preserved through the
+existing snapshot `replay_state`, including Arrow snapshot round trips; no separate snapshot
+fee field or Arrow column is added. Projection is an internal operation; residual diagnostics
+can be derived from the totals using existing Decimal and Money conversions without adding
+public helper APIs. Episode reset and purge/replay rebuild the same native state.
 
 Python/PyO3/FFI access and correction semantics remain follow-ups before an upstream-ready
 implementation. Existing persisted currency-valued fee history must not be mixed with the

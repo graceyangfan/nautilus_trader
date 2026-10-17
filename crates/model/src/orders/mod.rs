@@ -373,17 +373,6 @@ pub trait Order: 'static + Send {
 
     fn commissions(&self) -> &IndexMap<Currency, Money>;
 
-    /// Returns cumulative fees charged in this instrument's inventory units.
-    fn quantity_commissions(&self) -> Decimal {
-        self.events()
-            .into_iter()
-            .filter_map(|event| match event {
-                OrderEventAny::Filled(fill) => fill.quantity_commission,
-                _ => None,
-            })
-            .sum()
-    }
-
     /// Applies the `event` to the order.
     ///
     /// # Errors
