@@ -9503,6 +9503,50 @@ mod quantity_commission_tests {
         (instrument, fill)
     }
 
+    #[cfg(feature = "high-precision")]
+    #[rstest]
+    fn inventory_fee_projection_survives_zero_fee_buy_and_quote_fee_close() {
+        let mut spot = currency_pair_btcusdt();
+        spot.size_precision = 16;
+        spot.size_increment = Quantity::from("0.0000000000000001");
+        let instrument: InstrumentAny = spot.into();
+        let (_, mut first) = buy();
+        first.last_qty = Quantity::from("1.0000000000000000");
+        first.quantity_commission = Some(Decimal::new(1, 18));
+        let mut position = Position::new_checked(&instrument, first.clone()).unwrap();
+        assert_eq!(
+            position.quantity.as_decimal(),
+            Decimal::from_str_exact("0.9999999999999999").unwrap()
+        );
+        let mut maker = first.clone();
+        maker.event_id = UUID4::new();
+        maker.trade_id = TradeId::from("ZERO-FEE-BUY");
+        maker.last_qty = Quantity::from("0.1000000000000000");
+        maker.quantity_commission = None;
+        position.try_apply(&maker).unwrap();
+        let net = Quantity::from("1.0999999999999999");
+        assert_eq!(position.quantity, net);
+        position = serde_json::from_str(&serde_json::to_string(&position).unwrap()).unwrap();
+        let before = serde_json::to_string(&position).unwrap();
+        position.try_apply(&maker).unwrap();
+        assert_eq!(serde_json::to_string(&position).unwrap(), before);
+        let mut close = first;
+        close.event_id = UUID4::new();
+        close.trade_id = TradeId::from("QUOTE-FEE-CLOSE");
+        close.order_side = OrderSide::Sell;
+        close.last_qty = net;
+        close.quantity_commission = None;
+        close.commission = Some(Money::from("0.01 USDT"));
+        position.try_apply(&close).unwrap();
+        assert!(position.is_closed());
+        assert!(position.ts_closed.is_some());
+        assert_eq!(position.realized_pnl, Some(Money::from("-0.01 USDT")));
+        assert_eq!(
+            position.quantity_commission_total,
+            Some(Decimal::new(1, 18))
+        );
+    }
+
     #[rstest]
     fn inventory_fee_preserves_existing_base_commission_pnl_convention() {
         let (instrument, mut quantity_fill) = buy();

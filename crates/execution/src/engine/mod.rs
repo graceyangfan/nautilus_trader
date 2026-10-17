@@ -3273,11 +3273,13 @@ impl ExecutionEngine {
                     return false;
                 }
 
-                if let Err(e) = self.validate_quantity_commission_for_order(
-                    &order_before_fill,
-                    &fill,
-                    restatement,
-                ) {
+                if apply_position
+                    && let Err(e) = self.validate_quantity_commission_for_order(
+                        &order_before_fill,
+                        &fill,
+                        restatement,
+                    )
+                {
                     log::error!("Cannot apply quantity commission: {e}");
                     return false;
                 }

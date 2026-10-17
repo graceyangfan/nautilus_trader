@@ -12,7 +12,9 @@ Existing constructors default to `None`; old JSON without the field remains read
 Adding a public field still changes Rust struct literals and ABI.
 
 The execution engine classifies duplicates and price restatements using existing rules
-before validating support for a new change. Validation precedes order mutation. A historical
+before validating support for a new position change. Order-only reconciliation projections
+skip inventory preflight: their fills are already represented by the retained position,
+and projecting history must not validate a historical SELL against current holdings. Validation precedes order mutation. A historical
 duplicate is not checked against the inventory of a later position episode. Position applies
 the gross execution and inventory deduction together, then finalizes quantity and lifecycle.
 The engine publishes ordinary order and position events after Cache contains the result.

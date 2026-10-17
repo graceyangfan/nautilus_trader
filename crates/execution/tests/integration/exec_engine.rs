@@ -25171,3 +25171,116 @@ fn test_quantity_fee_reopen_filters_duplicates_before_inventory_validation() {
     }
     msgbus::unsubscribe_position_events(topic.into(), &handler);
 }
+
+#[rstest]
+#[case::historical_sell(OrderSide::Sell, None)]
+#[case::historical_buy(OrderSide::Buy, Some(dec!(2)))]
+fn test_quantity_fee_order_projection_preserves_current_inventory(
+    #[case] side: OrderSide,
+    #[case] fee: Option<Decimal>,
+) {
+    *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let mut engine = ExecutionEngine::new(clock, cache, None);
+    let instrument = audusd_sim();
+    let account_id = AccountId::test_default();
+    register_stub_client(&mut engine, account_id, &instrument, OmsType::Netting);
+    let strategy_id = StrategyId::test_default();
+    let position_id = PositionId::new(format!("{}-{strategy_id}", instrument.id));
+    let mut opening = OrderFilledSpec::builder()
+        .strategy_id(strategy_id)
+        .account_id(account_id)
+        .instrument_id(instrument.id)
+        .position_id(position_id)
+        .last_qty(Quantity::from(10))
+        .last_px(Price::from("1.00000"))
+        .currency(Currency::USD())
+        .commission(Money::zero(Currency::USD()))
+        .build();
+    opening.quantity_commission = Some(dec!(1));
+    let position = Position::new_checked(&instrument.clone().into(), opening).unwrap();
+    engine
+        .cache()
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+    let before = serde_json::to_string(&position).unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .strategy_id(strategy_id)
+        .instrument_id(instrument.id)
+        .client_order_id(ClientOrderId::from("Q-HISTORY"))
+        .side(side)
+        .quantity(Quantity::from(100))
+        .build();
+    engine
+        .cache()
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    engine.process(&TestOrderEventStubs::submitted(&order, account_id));
+    engine.process(&TestOrderEventStubs::accepted(
+        &order,
+        account_id,
+        VenueOrderId::from("Q-HISTORY"),
+    ));
+    let mut historical = OrderFilledSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(strategy_id)
+        .account_id(account_id)
+        .instrument_id(instrument.id)
+        .client_order_id(order.client_order_id())
+        .venue_order_id(VenueOrderId::from("Q-HISTORY"))
+        .trade_id(TradeId::from("Q-HISTORY"))
+        .order_side(side)
+        .order_type(OrderType::Market)
+        .last_qty(order.quantity())
+        .last_px(Price::from("1.00000"))
+        .currency(Currency::USD())
+        .commission(Money::zero(Currency::USD()))
+        .build();
+    historical.quantity_commission = fee;
+    let order_events = Rc::new(RefCell::new(Vec::new()));
+    let order_handler = TypedHandler::from({
+        let events = order_events.clone();
+        move |event: &OrderEventAny| events.borrow_mut().push(event.clone())
+    });
+    let order_topic = switchboard::get_event_order_topic(strategy_id);
+    msgbus::subscribe_order_events(order_topic.into(), order_handler.clone(), None);
+    let position_events = Rc::new(RefCell::new(Vec::new()));
+    let position_handler = TypedHandler::from({
+        let events = position_events.clone();
+        move |event: &PositionEvent| events.borrow_mut().push(event.clone())
+    });
+    let position_topic = switchboard::get_event_position_topic(strategy_id);
+    msgbus::subscribe_position_events(position_topic.into(), position_handler.clone(), None);
+    let portfolio_events = Rc::new(RefCell::new(Vec::<OrderEventAny>::new()));
+    msgbus::register_order_event_endpoint(
+        MessagingSwitchboard::portfolio_update_order(),
+        TypedIntoHandler::from({
+            let events = portfolio_events.clone();
+            move |event: OrderEventAny| events.borrow_mut().push(event)
+        }),
+    );
+    engine.project_reconciliation_fill(&historical);
+    // A repeated historical report must not publish a second fill or alter inventory.
+    engine.project_reconciliation_fill(&historical);
+    let cache = engine.cache().borrow();
+    let projected = cache.order(&order.client_order_id()).unwrap();
+    assert_eq!(projected.status(), OrderStatus::Filled);
+    assert_eq!(projected.filled_qty(), Quantity::from(100));
+    assert_eq!(projected.avg_px(), Some(dec!(1)));
+    assert_eq!(
+        serde_json::to_string(&*cache.position(&position_id).unwrap()).unwrap(),
+        before
+    );
+    assert_eq!(order_events.borrow().len(), 1);
+    assert!(
+        matches!(&order_events.borrow()[0], OrderEventAny::Filled(fill)
+        if fill.quantity_commission == fee && fill.last_qty == Quantity::from(100))
+    );
+    assert!(position_events.borrow().is_empty());
+    assert!(portfolio_events.borrow().is_empty());
+    msgbus::unsubscribe_order_events(order_topic.into(), &order_handler);
+    msgbus::unsubscribe_position_events(position_topic.into(), &position_handler);
+}
