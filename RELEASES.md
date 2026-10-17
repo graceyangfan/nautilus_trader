@@ -20,6 +20,7 @@ Released on TBD (UTC).
 - Fixed risk denials for released orders and cleanup of their contingent orders
 - Fixed Hyperliquid leverage and isolated-margin request serialization and signing
 - Fixed Polymarket loading, request caching, and execution lookup cleanup for open markets past `endDate`
+- Fixed Polymarket market order reconciliation panics after delayed FOK status checks
 - Fixed Polymarket taker rates derived from CLOB `base_fee` when Gamma rates are missing or zero
 
 ### Internal Improvements
@@ -38,6 +39,7 @@ Released on TBD (UTC).
 - Upgraded `proptest` crate to v1.12.0
 - Upgraded `kaleido` package to v1.5.0
 - Upgraded `ty` package (dev) to v0.0.85
+- Upgraded `sockudo-ws` crate to v3.1.0
 
 ### Documentation Updates
 
