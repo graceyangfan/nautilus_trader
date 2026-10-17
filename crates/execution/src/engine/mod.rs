@@ -3964,7 +3964,7 @@ impl ExecutionEngine {
             .position_id
             .and_then(|id| cache.position(&id))
             .is_some_and(|position| {
-                !position.is_closed() && position.quantity_commission_totals.is_some()
+                !position.is_closed() && position.quantity_commission_total.is_some()
             });
 
         if fill.quantity_commission.is_none() && !previous_quantity_fee && !quantity_fee_position {

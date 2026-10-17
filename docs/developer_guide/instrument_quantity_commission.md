@@ -11,103 +11,81 @@ of the existing instrument ID. It is mutually exclusive with a nonzero `Money` c
 Existing constructors default to `None`; old JSON without the field remains readable.
 Adding a public field still changes Rust struct literals and ABI.
 
-The execution engine classifies duplicate fills and price restatements using its existing
-rules before validating account and inventory support for a new change. Validation still
-precedes order mutation. A historical duplicate is not checked against the inventory of a
-later position episode. The position applies gross execution and the inventory deduction together, then
-finalizes quantity and lifecycle state. The engine publishes the ordinary order and
-position events only after these changes are visible in Cache.
+The execution engine classifies duplicates and price restatements using existing rules
+before validating support for a new change. Validation precedes order mutation. A historical
+duplicate is not checked against the inventory of a later position episode. Position applies
+the gross execution and inventory deduction together, then finalizes quantity and lifecycle.
+The engine publishes ordinary order and position events after Cache contains the result.
 
-The deduction reuses the internal commission adjustment used for CurrencyPair base
-fees. It is derived from the original fill, not recorded as a second replay input.
-Existing currency commission behavior is unchanged. No BinaryOption-specific branch,
-adapter position ledger, synthetic SELL, or recovery timer is introduced.
+The deduction reuses the internal commission adjustment used for CurrencyPair base fees.
+It is derived from the original fill, not recorded as a second replay input. There is no
+BinaryOption-specific branch, adapter position ledger, synthetic SELL or recovery timer.
 
-## Cost convention
+## Existing commission and PnL convention
 
-The new path removes fee inventory at the position's moving-average acquisition cost:
+Inventory deduction does not add a new settlement-currency realized PnL expense. Like the
+existing CurrencyPair base commission path, its internal Commission adjustment has no
+`pnl_change`. Quote-currency commission continues to affect realized PnL through existing
+logic. The new field does not replace currency commission or migrate old base-fee events.
 
-```text
-quantity change = -fee quantity
-realized PnL change = -fee quantity * current average acquisition price
-```
+For example, BUY 1 at 100 with an inventory fee of 0.01 leaves 0.99 and quote realized
+PnL of zero. Selling 0.99 at 110 gives quote realized PnL of 9.9, matching the existing
+base-currency commission path. Cash difference is 8.9. The inventory fee remains separately
+identifiable; quote realized PnL alone is not an all-in cash return. Consumers must not
+interpret 9.9 as a fee-inclusive return or charge the reported cash account again.
 
-The position retains cumulative raw quantity and cost in one optional
-`QuantityCommissionTotals`. Quantity fees are projected upward to instrument precision;
-only the change in that cumulative projection is deducted on each fill. Fee cost likewise
-uses the change in cumulative `Money` projection. This preserves fee tails across executions
-instead of rounding each fee independently. Quantity and cost residuals are derived from
-the totals, with no separately mutable carry fields.
+This prototype does not introduce inventory-fee valuation, moving-average fee-cost totals,
+or a second cost/PnL algorithm. An earlier experiment expensed acquisition cost into quote
+realized PnL; that policy has been removed to keep the existing Native convention.
 
-Remaining inventory retains its moving-average price. A BUY of 1 at 100 with a
-0.01-inventory fee leaves 0.99 and realizes -1 in settlement currency. Selling 0.99
-at 110 with no further fee closes with 8.9 realized PnL, matching the cash difference.
-This convention does not debit reported cash a second time or redefine existing
-multi-currency base commission PnL.
+## Precision and persistence
 
-## Accounting compatibility
+Position retains one optional Decimal `quantity_commission_total`: actual inventory fees
+in the current episode. It does not retain a separate fee-cost field or residual ledger.
+Fees are cumulatively projected upward to instrument precision; only the change in that
+projection is deducted on each execution. This prevents repeated subprecision fees from
+being discarded. Remaining subquantum inventory is conservatively unavailable, not proof
+that the venue holds exactly zero.
 
-This new cost convention is not a reinterpretation of existing `Money` commissions.
-A CurrencyPair BUY of 1 at 100 with a 0.01 base-currency `Money` fee and SELL of 0.99 at
-110 retains the existing quote realized PnL of 9.9 and separately reports the base fee.
-The inventory-unit prototype reports 8.9 in quote realized PnL by expensing the fee's
-acquisition cost. These metrics are not interchangeable all-in reports. Existing Money
-fees must not be migrated to the new field just to make their quote PnL equal.
+The canonical projected quantity remains necessary for this limited path: subsequent
+zero-fee and quote-fee fills must not reintroduce inventory through floating-point round
+trips. Other positions retain existing quantity handling. This is not a universal Native
+rounding policy or an 18-decimal rewrite of Position, Portfolio or PnL.
 
-The prototype's conservative quantity projection remains limited to inventory-fee
-positions; it does not establish a universal precision contract for all adjustments or
-positions. Generalizing the cost presentation, calculated accounts, and numeric ownership
-requires separate agreement and validation. Duplicate classification does not widen any
-of those supported scopes.
+Original fill events retain fee facts. Existing Position snapshot `replay_state`, including
+Arrow round trips, retains the single cumulative value. No new Order aggregation method,
+PositionSnapshot summary field or Arrow snapshot column is required. Episode reset and
+purge/replay rebuild Native state. Test diagnostics derive residuals with Decimal.
 
 ## Supported scope and explicit exclusions
 
 - Reported cash accounts, long linear inventory, unit multiplier.
-- Positive Decimal fees, including 18-decimal tails, with conservative cumulative quantity projection.
-- Native gross order completion, partial executions, duplicate replay, and net position lifecycle.
-- JSON, Arrow order events, and Cap'n Proto order events retain the new field.
+- Positive Decimal inventory fees, including 18-decimal tails.
+- Native gross order completion, partial executions, duplicate replay and net lifecycle.
+- JSON, Arrow order events and Cap'n Proto order events retain the new field.
 
-Inverse products, shorts/flips, calculated accounts, price restatements, fill voids,
-are rejected before application. An opening net balance below one native quantity quantum
-is also rejected rather than publishing a zero-size PositionOpened. Fee totals are checked
-before order/position mutation.
-Native quantity remains at the instrument precision (16 for the Predict execution harness).
-This is exact 18-decimal evidence with cumulative projection, not an 18-decimal rewrite of
-Position, Portfolio, or PnL. Gross projection stays with the adapter's existing protocol
-normalization. A remaining fraction below the native quantum is visible in the residual;
-it is not proof that a venue inventory balance is exactly zero. Its marked value must be
-included when comparing raw venue equity with projected native inventory.
+Inverse products, shorts/flips, calculated accounts, price restatements and fill voids
+remain unsupported by this prototype and are rejected before application. An opening net
+balance below one instrument quantity quantum is rejected rather than emitting a zero-size
+PositionOpened. These restrictions are implementation boundaries, not the definition of an
+inventory fee. Removing fee-cost bookkeeping does not establish general account support.
 
-PnL retains existing moving-average floating-point and per-fill Money rounding. The
-mixed-price BUY/SELL/re-entry probe differs from cash by one settlement-currency quantum;
-this change does not introduce a second PnL algorithm to eliminate that existing boundary.
-
-Inventory-unit fees remain available on the original fill events; consumers can aggregate
-those events without extending the Order trait. Position retains the cumulative quantity
-and cost required for incremental application. Its complete state is preserved through the
-existing snapshot `replay_state`, including Arrow snapshot round trips; no separate snapshot
-fee field or Arrow column is added. Projection is an internal operation; residual diagnostics
-can be derived from the totals using existing Decimal and Money conversions without adding
-public helper APIs. Episode reset and purge/replay rebuild the same native state.
-
-Python/PyO3/FFI access and correction semantics remain follow-ups before an upstream-ready
-implementation. Existing persisted currency-valued fee history must not be mixed with the
-new representation. An earlier quantity-fee prototype position without totals must be
-rebuilt from its original fill events before further fills. Migrating that unpublished
-prototype cache is unsupported; normal fill application does not scan history to detect it.
+Native quantity remains at instrument precision (16 in the Predict harness). PnL retains
+existing moving-average floating-point and Money rounding. Python/PyO3/FFI access and
+correction semantics remain follow-ups before an upstream-ready implementation. Earlier
+unpublished prototype snapshots with `quantity_commission_totals` must be rebuilt from
+original fills; automatic migration of that experimental format is unsupported.
 
 ## Validation
 
-Model tests cover inventory, disposal cost, closure metadata, JSON reconstruction,
-duplicate application, and unchanged state on conflicting fee input. Additional tests
-accumulate 100 subprecision fees, restore mid-stream, retain snapshot totals, purge fills,
-and reset episodes. Historical duplicates after reopening a smaller position are ignored,
-including after JSON reconstruction and with a different event ID. Engine tests also retain
-atomic oversell rejection, subsequent valid closure, and unsupported price restatement rejection.
-Cap'n Proto tests retain an exact 18-decimal fee value; this tests serialization rather than inventory precision.
+A differential regression compares the new inventory fee with the existing CurrencyPair
+base commission path, including net quantity, quote realized PnL and closure. The previous
+implementation fails this regression by adding an extra realized PnL expense.
 
-The downstream Predict harness additionally tests multiple execution prices,
-maker/taker mixtures, gross order completion with immediate net Cache observations,
-quote-fee SELL exits, reconciliation, and a Rust Strategy + LiveNode wallet reconnect.
-The harness uses retained exchange JSON and synthetic loopback services; no live order
-is required and no new live acceptance is claimed.
+Model tests cover 100 subprecision fees, JSON restore, snapshot state, purge/replay, episode
+reset, conflicting fees, unrepresentable net inventory and late historical duplicates.
+Engine tests cover duplicate ordering, atomic oversell rejection and subsequent closure.
+The separate Predict harness checks report ingestion, immediate net Cache observations,
+partial executions, quote-fee SELL and Rust Strategy + LiveNode maker-TP/cancel/taker exits.
+Offline JSON distinguishes Native quote realized PnL from cash difference and does not
+claim that separately denominated fees have already been valued in the former.
