@@ -3262,6 +3262,13 @@ impl ExecutionEngine {
                 let mut fill = fill.clone();
                 fill.position_id = Some(position_id);
 
+                if let Err(e) =
+                    self.validate_quantity_commission_for_order(&order_before_fill, &fill)
+                {
+                    log::error!("Cannot apply quantity commission: {e}");
+                    return false;
+                }
+
                 let restatement = is_fill_price_restatement(&order_before_fill, &fill);
                 let validation = if apply_position {
                     self.validate_fill_for_order(&order_before_fill, &fill)
@@ -3322,6 +3329,14 @@ impl ExecutionEngine {
                         }
                         _ => None,
                     });
+
+                if original_fill
+                    .as_ref()
+                    .is_some_and(|fill| fill.quantity_commission.is_some())
+                {
+                    log::error!("Quantity commission fill voids are unsupported by this prototype");
+                    return false;
+                }
 
                 if voided.position_id.is_none() {
                     voided.position_id = original_fill.as_ref().and_then(|fill| fill.position_id);
@@ -3926,6 +3941,48 @@ impl ExecutionEngine {
         }
 
         position_id
+    }
+
+    // Validate before mutating the order: a rejected inventory fee must not leave
+    // gross order state ahead of the position. Legacy currency fees retain their path.
+    fn validate_quantity_commission_for_order(
+        &self,
+        order: &OrderAny,
+        fill: &OrderFilled,
+    ) -> anyhow::Result<()> {
+        let previous_quantity_fee = order.events().iter().any(|event| {
+            matches!(event, OrderEventAny::Filled(previous)
+                if previous.trade_id == fill.trade_id && previous.quantity_commission.is_some())
+        });
+
+        if fill.quantity_commission.is_none() && !previous_quantity_fee {
+            return Ok(());
+        }
+
+        let cache = self.cache.borrow();
+        let account = cache
+            .account(&fill.account_id)
+            .ok_or_else(|| anyhow::anyhow!("quantity fee account missing"))?;
+        anyhow::ensure!(
+            account.account_type() == AccountType::Cash && !account.calculated_account_state(),
+            "quantity fee prototype requires a reported cash account"
+        );
+        anyhow::ensure!(
+            !is_fill_price_restatement(order, fill),
+            "quantity fee restatements are unsupported"
+        );
+        let position_id = fill
+            .position_id
+            .ok_or_else(|| anyhow::anyhow!("quantity fee position identity missing"))?;
+        if let Some(position) = cache.position(&position_id).filter(|p| !p.is_closed()) {
+            position.check_quantity_commission(fill)?;
+        } else {
+            let instrument = cache
+                .instrument(&fill.instrument_id)
+                .ok_or_else(|| anyhow::anyhow!("quantity fee instrument missing"))?;
+            Position::new_checked(instrument, fill.clone())?;
+        }
+        Ok(())
     }
 
     fn validate_fill_for_order(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {

@@ -268,6 +268,7 @@ const ORDER_FILLED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::boolean("reconciliation", false),
     JsonFieldSpec::utf8("position_id", true),
     JsonFieldSpec::utf8("commission", true),
+    JsonFieldSpec::utf8("quantity_commission", true),
     JsonFieldSpec::utf8_json("info", true),
 ];
 

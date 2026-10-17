@@ -529,9 +529,18 @@ impl Position {
         }
 
         if self.is_price_restatement(fill) {
+            check_predicate_true(
+                fill.quantity_commission.is_none()
+                    && !self.events.iter().any(|previous| {
+                        previous.trade_id == fill.trade_id && previous.quantity_commission.is_some()
+                    }),
+                "quantity commission restatements are unsupported by this prototype",
+            )?;
             self.apply_price_restatement(fill, record_replay);
             return Ok(());
         }
+
+        self.check_quantity_commission(fill)?;
 
         if record_replay
             && (self.side == PositionSide::Flat || !self.trade_ids.contains(&fill.trade_id))
@@ -590,11 +599,16 @@ impl Position {
 
         // For CurrencyPair instruments, create adjustment event when commission is in base currency
         if self.is_currency_pair
+            && fill.quantity_commission.is_none()
             && let Some(commission) = fill.commission
             && let Some(base_currency) = self.base_currency
             && commission.currency == base_currency
         {
-            self.apply_base_commission_adjustment(fill, commission);
+            self.apply_inventory_commission_adjustment(fill, commission.as_decimal(), None);
+        }
+
+        if let Some(amount) = fill.quantity_commission {
+            self.apply_quantity_commission(fill, amount);
         }
 
         // size_precision is valid from instrument
@@ -1336,6 +1350,12 @@ impl Position {
         commission_voided: Option<Money>,
     ) -> anyhow::Result<Option<Money>> {
         let fragments = self.fill_fragments(event.client_order_id, event.trade_id);
+        anyhow::ensure!(
+            fragments
+                .iter()
+                .all(|fill| fill.quantity_commission.is_none()),
+            "quantity commission fill voids are not supported by this prototype"
+        );
 
         let fragment_qty = fragments
             .iter()
@@ -1554,7 +1574,7 @@ impl Position {
 
         if is_base_commission {
             let previous_side = self.side;
-            self.apply_base_commission_adjustment(fill, commission);
+            self.apply_inventory_commission_adjustment(fill, commission.as_decimal(), None);
             self.finalize_surviving_base_commission(fill, previous_side);
         } else {
             self.ts_last = fill.ts_event;
@@ -1587,7 +1607,12 @@ impl Position {
         }
     }
 
-    fn apply_base_commission_adjustment(&mut self, fill: &OrderFilled, commission: Money) {
+    fn apply_inventory_commission_adjustment(
+        &mut self,
+        fill: &OrderFilled,
+        amount: Decimal,
+        pnl: Option<Money>,
+    ) {
         let mut adjustment_id = fill.event_id.as_bytes();
         adjustment_id[15] ^= 0x01;
         self.apply_adjustment_state(
@@ -1598,8 +1623,8 @@ impl Position {
                 self.id,
                 self.account_id,
                 PositionAdjustmentType::Commission,
-                Some(-commission.as_decimal()),
-                None,
+                Some(-amount),
+                pnl,
                 Some(fill.client_order_id.inner()),
                 UUID4::from_bytes(adjustment_id),
                 fill.ts_event,
@@ -1607,6 +1632,52 @@ impl Position {
             ),
             false,
         );
+    }
+
+    /// Validates the opt-in inventory-fee prototype before any fill state is changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fee units, currency fees, precision, or inventory are unsupported.
+    pub fn check_quantity_commission(&self, fill: &OrderFilled) -> CorrectnessResult<()> {
+        let Some(amount) = fill.quantity_commission else {
+            return Ok(());
+        };
+        check_predicate_true(
+            amount > Decimal::ZERO && amount < fill.last_qty.as_decimal(),
+            "quantity commission must be positive and smaller than gross fill quantity",
+        )?;
+        check_predicate_true(
+            fill.commission.is_none_or(|fee| fee.is_zero()),
+            "quantity commission and nonzero currency commission are mutually exclusive",
+        )?;
+        check_predicate_true(
+            !self.is_inverse,
+            "quantity commission does not support inverse instruments",
+        )?;
+        check_predicate_true(
+            self.multiplier.as_decimal() == Decimal::ONE,
+            "quantity commission prototype requires unit inventory multiplier",
+        )?;
+        check_predicate_true(
+            amount.round_dp(u32::from(self.size_precision)) == amount,
+            "quantity commission exceeds instrument quantity precision",
+        )?;
+        check_predicate_true(
+            self.signed_qty >= 0.0
+                && (fill.order_side == OrderSide::Buy
+                    || self.quantity.as_decimal() >= fill.last_qty.as_decimal() + amount),
+            "quantity commission requires long inventory without a position flip",
+        )
+    }
+
+    /// Removes inventory at its moving-average cost inside the original fill application.
+    fn apply_quantity_commission(&mut self, fill: &OrderFilled, amount: Decimal) {
+        let pnl = Money::new(
+            -amount.to_f64().expect("validated fee") * self.avg_px_open,
+            self.settlement_currency,
+        );
+        self.apply_inventory_commission_adjustment(fill, amount, Some(pnl));
     }
 
     fn latest_fill_voids(&self) -> Vec<&PositionFillVoid> {
@@ -9341,5 +9412,64 @@ mod tests {
             .maybe_position_id(fill.position_id)
             .maybe_commission_voided(commission_voided)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod quantity_commission_tests {
+    use rstest::rstest;
+
+    use super::*;
+    use crate::{events::order::spec::OrderFilledSpec, instruments::stubs::currency_pair_btcusdt};
+
+    fn buy() -> (InstrumentAny, OrderFilled) {
+        let instrument: InstrumentAny = currency_pair_btcusdt().into();
+        let mut fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(PositionId::from("P-QUANTITY-FEE"))
+            .last_qty(Quantity::from("1"))
+            .last_px(Price::from("100"))
+            .currency(Currency::USDT())
+            .commission(Money::zero(Currency::USDT()))
+            .build();
+        fill.quantity_commission = Some(Decimal::new(1, 2));
+        (instrument, fill)
+    }
+
+    #[rstest]
+    fn quantity_fee_is_derived_once_and_cost_survives_replay() {
+        let (instrument, fill) = buy();
+        let mut position = Position::new_checked(&instrument, fill.clone()).unwrap();
+        assert_eq!(position.quantity.as_decimal(), Decimal::new(99, 2));
+        assert_eq!(position.realized_pnl.unwrap(), Money::from("-1 USDT"));
+        let serialized = serde_json::to_string(&position).unwrap();
+        position = serde_json::from_str(&serialized).unwrap();
+        position.try_apply(&fill).unwrap();
+        assert_eq!(serde_json::to_string(&position).unwrap(), serialized);
+        let mut sell = fill;
+        sell.order_side = OrderSide::Sell;
+        sell.last_qty = position.quantity;
+        sell.last_px = Price::from("110");
+        sell.quantity_commission = None;
+        sell.event_id = UUID4::new();
+        sell.trade_id = TradeId::from("EXIT-QUANTITY-FEE");
+        sell.client_order_id = ClientOrderId::from("EXIT-QUANTITY-FEE");
+        position.try_apply(&sell).unwrap();
+        assert!(position.is_closed());
+        assert!(position.ts_closed.is_some());
+        assert_eq!(position.realized_pnl.unwrap(), Money::from("8.9 USDT"));
+    }
+
+    #[rstest]
+    fn conflicting_quantity_and_currency_fees_leave_position_unchanged() {
+        let (instrument, fill) = buy();
+        let mut position = Position::new_checked(&instrument, fill.clone()).unwrap();
+        let before = serde_json::to_string(&position).unwrap();
+        let mut invalid = fill;
+        invalid.trade_id = TradeId::from("INVALID-QUANTITY-FEE");
+        invalid.event_id = UUID4::new();
+        invalid.commission = Some(Money::from("1 USDT"));
+        assert!(position.try_apply(&invalid).is_err());
+        assert_eq!(serde_json::to_string(&position).unwrap(), before);
     }
 }

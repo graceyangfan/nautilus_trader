@@ -5234,7 +5234,7 @@ impl ExecutionManager {
 
         let ts_now = self.clock.borrow().timestamp_ns();
 
-        let event = OrderFilled::new(
+        let mut event = OrderFilled::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -5257,6 +5257,7 @@ impl ExecutionManager {
             None,
         );
 
+        event.quantity_commission = fill.quantity_commission;
         Some((event, fill_key))
     }
 }
@@ -5280,6 +5281,7 @@ fn position_fill_report_totals(
                     && fill.order_side == report.order_side
                     && fill.last_px == report.last_px
                     && fill.liquidity_side == report.liquidity_side
+                    && fill.quantity_commission == report.quantity_commission
                     && client_order_id.is_none_or(|id| fill.client_order_id == id) =>
             {
                 Some(fill)

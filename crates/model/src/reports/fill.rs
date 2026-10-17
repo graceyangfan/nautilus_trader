@@ -53,6 +53,9 @@ pub struct FillReport {
     pub last_px: Price,
     /// The commission generated from the fill.
     pub commission: Money,
+    /// Fee charged in inventory units of this instrument; currency commission must be zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity_commission: Option<Decimal>,
     /// The liquidity side of the execution.
     pub liquidity_side: LiquiditySide,
     /// The cumulative or chunk average execution price when provided by the venue.
@@ -98,6 +101,7 @@ impl FillReport {
             last_qty,
             last_px,
             commission,
+            quantity_commission: None,
             liquidity_side,
             avg_px: None,
             report_id: report_id.unwrap_or_default(),

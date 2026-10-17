@@ -3674,6 +3674,10 @@ impl<'a> ToCapnp<'a> for OrderFilled {
         self.commission
             .write_capnp(|| builder.reborrow().init_commission());
 
+        if let Some(amount) = self.quantity_commission {
+            builder.set_quantity_commission(amount.to_string().as_str());
+        }
+
         if let Some(info) = &self.info {
             write_string_map(info, builder.reborrow().init_info());
         }
@@ -3742,6 +3746,17 @@ impl<'a> FromCapnp<'a> for OrderFilled {
             None
         };
 
+        let quantity_commission = if reader.has_quantity_commission() {
+            Some(
+                reader
+                    .get_quantity_commission()?
+                    .to_str()?
+                    .parse::<Decimal>()?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             trader_id,
             strategy_id,
@@ -3762,6 +3777,7 @@ impl<'a> FromCapnp<'a> for OrderFilled {
             reconciliation,
             position_id,
             commission,
+            quantity_commission,
             info,
             causation_id: None,
         })
@@ -5284,6 +5300,18 @@ mod tests {
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[rstest]
+    fn order_filled_quantity_commission_capnp_roundtrip(mut order_filled: OrderFilled) {
+        order_filled.commission = None;
+        order_filled.quantity_commission = Some(dec!(0.640000000000000001));
+        assert_capnp_roundtrip!(
+            order_filled,
+            order_capnp::order_filled::Builder,
+            order_capnp::order_filled::Reader,
+            OrderFilled
         );
     }
 
