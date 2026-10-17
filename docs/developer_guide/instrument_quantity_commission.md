@@ -30,6 +30,13 @@ quantity change = -fee quantity
 realized PnL change = -fee quantity * current average acquisition price
 ```
 
+The position retains cumulative raw quantity and cost in one optional
+`QuantityCommissionTotals`. Quantity fees are projected upward to instrument precision;
+only the change in that cumulative projection is deducted on each fill. Fee cost likewise
+uses the change in cumulative `Money` projection. This preserves fee tails across executions
+instead of rounding each fee independently. Quantity and cost residuals are derived from
+the totals, with no separately mutable carry fields.
+
 Remaining inventory retains its moving-average price. A BUY of 1 at 100 with a
 0.01-inventory fee leaves 0.99 and realizes -1 in settlement currency. Selling 0.99
 at 110 with no further fee closes with 8.9 realized PnL, matching the cash difference.
@@ -39,23 +46,42 @@ multi-currency base commission PnL.
 ## Supported scope and explicit exclusions
 
 - Reported cash accounts, long linear inventory, unit multiplier.
-- Positive fees exactly representable at instrument quantity precision.
+- Positive Decimal fees, including 18-decimal tails, with conservative cumulative quantity projection.
 - Native gross order completion, partial executions, duplicate replay, and net position lifecycle.
 - JSON, Arrow order events, and Cap'n Proto order events retain the new field.
 
 Inverse products, shorts/flips, calculated accounts, price restatements, fill voids,
-and fees exceeding supported quantity precision are rejected before application.
-Decimal retention alone does not implement 18-decimal inventory or residual allocation.
+are rejected before application. An opening net balance below one native quantity quantum
+is also rejected rather than publishing a zero-size PositionOpened. Fee totals are checked
+before order/position mutation.
+Native quantity remains at the instrument precision (16 for the Predict execution harness).
+This is exact 18-decimal evidence with cumulative projection, not an 18-decimal rewrite of
+Position, Portfolio, or PnL. Gross projection stays with the adapter's existing protocol
+normalization. A remaining fraction below the native quantum is visible in the residual;
+it is not proof that a venue inventory balance is exactly zero. Its marked value must be
+included when comparing raw venue equity with projected native inventory.
 
-Python/PyO3/FFI access, complete fee summaries and position snapshot reporting, and
-correction semantics remain follow-ups before any upstream-ready implementation.
-The existing `commissions()` Money map is not a complete summary of quantity fees.
-Existing persisted currency-valued fee history must not be mixed with the new representation.
+PnL retains existing moving-average floating-point and per-fill Money rounding. The
+mixed-price BUY/SELL/re-entry probe differs from cash by one settlement-currency quantum;
+this change does not introduce a second PnL algorithm to eliminate that existing boundary.
+
+Rust order `quantity_commissions()` reports inventory-unit fees separately from the
+existing Money map. Position and PositionSnapshot include the cumulative quantity and cost;
+JSON and Arrow snapshots retain these totals. Residual methods take instrument/currency
+precision explicitly. Episode reset and purge/replay rebuild the same native state.
+
+Python/PyO3/FFI access and correction semantics remain follow-ups before an upstream-ready
+implementation. Existing persisted currency-valued fee history must not be mixed with the
+new representation. An earlier quantity-fee prototype position without totals must be
+rebuilt from its original fill events before further fills. Migrating that unpublished
+prototype cache is unsupported; normal fill application does not scan history to detect it.
 
 ## Validation
 
 Model tests cover inventory, disposal cost, closure metadata, JSON reconstruction,
-duplicate application, and unchanged state on conflicting fee input. Cap'n Proto tests
+duplicate application, and unchanged state on conflicting fee input. Additional tests
+accumulate 100 subprecision fees, restore mid-stream, retain snapshot totals, purge fills,
+and reset episodes. Cap'n Proto tests
 retain an exact 18-decimal fee value; this tests serialization rather than inventory precision.
 
 The downstream Predict harness additionally tests multiple execution prices,

@@ -3955,11 +3955,18 @@ impl ExecutionEngine {
                 if previous.trade_id == fill.trade_id && previous.quantity_commission.is_some())
         });
 
-        if fill.quantity_commission.is_none() && !previous_quantity_fee {
+        let cache = self.cache.borrow();
+        let quantity_fee_position = fill
+            .position_id
+            .and_then(|id| cache.position(&id))
+            .is_some_and(|position| {
+                !position.is_closed() && position.quantity_commission_totals.is_some()
+            });
+
+        if fill.quantity_commission.is_none() && !previous_quantity_fee && !quantity_fee_position {
             return Ok(());
         }
 
-        let cache = self.cache.borrow();
         let account = cache
             .account(&fill.account_id)
             .ok_or_else(|| anyhow::anyhow!("quantity fee account missing"))?;

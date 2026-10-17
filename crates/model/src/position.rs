@@ -32,7 +32,7 @@ use nautilus_core::{
         check_predicate_true,
     },
 };
-use rust_decimal::{Decimal, prelude::ToPrimitive};
+use rust_decimal::{Decimal, RoundingStrategy, prelude::ToPrimitive};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -48,6 +48,40 @@ use crate::{
     instruments::{Instrument, InstrumentAny},
     types::{Currency, Money, Price, Quantity, fixed::check_float_precision},
 };
+
+/// Cumulative fees in inventory units of the position's instrument.
+///
+/// Cost is expressed in the position's settlement currency, using Native moving-average cost.
+/// Projection residuals are derived from these totals rather than accumulated separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuantityCommissionTotals {
+    pub quantity: Decimal,
+    pub cost: Decimal,
+}
+
+impl QuantityCommissionTotals {
+    /// Returns fees conservatively projected to instrument quantity precision.
+    #[must_use]
+    pub fn projected_quantity(&self, precision: u8) -> Decimal {
+        self.quantity
+            .round_dp_with_strategy(u32::from(precision), RoundingStrategy::ToPositiveInfinity)
+    }
+
+    /// Returns inventory withheld by projection, less than one quantity quantum.
+    #[must_use]
+    pub fn quantity_residual(&self, precision: u8) -> Decimal {
+        self.projected_quantity(precision) - self.quantity
+    }
+
+    /// Returns the fee cost not represented at settlement currency precision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cumulative cost exceeds the Money range.
+    pub fn cost_residual(&self, currency: Currency) -> CorrectnessResult<Decimal> {
+        Ok(self.cost - Money::from_decimal(self.cost, currency)?.as_decimal())
+    }
+}
 
 /// Represents a position in a market.
 ///
@@ -109,6 +143,9 @@ pub struct Position {
     /// Total sell quantity in the current position episode.
     pub sell_qty: Quantity,
     pub commissions: IndexMap<Currency, Money>,
+    /// Exact cumulative inventory fees and their Native acquisition cost for this episode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity_commission_totals: Option<QuantityCommissionTotals>,
 }
 
 #[expect(clippy::large_enum_variant)]
@@ -167,6 +204,7 @@ impl Position {
             buy_qty: Quantity::zero(instrument.size_precision()),
             sell_qty: Quantity::zero(instrument.size_precision()),
             commissions: IndexMap::<Currency, Money>::new(),
+            quantity_commission_totals: None,
             trader_id: fill.trader_id,
             strategy_id: fill.strategy_id,
             instrument_id: fill.instrument_id,
@@ -252,6 +290,7 @@ impl Position {
             buy_qty: self.buy_qty,
             sell_qty: self.sell_qty,
             commissions: self.commissions.clone(),
+            quantity_commission_totals: self.quantity_commission_totals,
         }
     }
 
@@ -323,6 +362,7 @@ impl Position {
             self.buy_qty = Quantity::zero(self.size_precision);
             self.sell_qty = Quantity::zero(self.size_precision);
             self.commissions.clear();
+            self.quantity_commission_totals = None;
             self.signed_qty = 0.0;
             self.quantity = Quantity::zero(self.size_precision);
             self.side = PositionSide::Flat;
@@ -540,7 +580,7 @@ impl Position {
             return Ok(());
         }
 
-        self.check_quantity_commission(fill)?;
+        let quantity_commission_totals = self.prepare_quantity_commission(fill)?;
 
         if record_replay
             && (self.side == PositionSide::Flat || !self.trade_ids.contains(&fill.trade_id))
@@ -607,12 +647,17 @@ impl Position {
             self.apply_inventory_commission_adjustment(fill, commission.as_decimal(), None);
         }
 
-        if let Some(amount) = fill.quantity_commission {
-            self.apply_quantity_commission(fill, amount);
+        if let Some((totals, quantity)) = quantity_commission_totals {
+            if fill.quantity_commission.is_some() {
+                self.apply_quantity_commission(fill, totals);
+            }
+            self.quantity = quantity;
+            self.signed_qty = quantity.as_f64();
+        } else {
+            // size_precision is valid from instrument
+            self.quantity = Quantity::new(self.signed_qty.abs(), self.size_precision);
         }
 
-        // size_precision is valid from instrument
-        self.quantity = Quantity::new(self.signed_qty.abs(), self.size_precision);
         if self.quantity > self.peak_qty {
             self.peak_qty = self.quantity;
         }
@@ -645,6 +690,7 @@ impl Position {
         self.buy_qty = Quantity::zero(self.size_precision);
         self.sell_qty = Quantity::zero(self.size_precision);
         self.commissions.clear();
+        self.quantity_commission_totals = None;
         self.opening_order_id = fill.client_order_id;
         self.closing_order_id = None;
         self.peak_qty = Quantity::zero(self.size_precision);
@@ -1634,50 +1680,117 @@ impl Position {
         );
     }
 
-    /// Validates the opt-in inventory-fee prototype before any fill state is changed.
+    /// Validates inventory fees before any fill state is changed.
     ///
     /// # Errors
     ///
-    /// Returns an error if fee units, currency fees, precision, or inventory are unsupported.
+    /// Returns an error if fee units, currency fees, or inventory are unsupported.
     pub fn check_quantity_commission(&self, fill: &OrderFilled) -> CorrectnessResult<()> {
-        let Some(amount) = fill.quantity_commission else {
-            return Ok(());
-        };
-        check_predicate_true(
-            amount > Decimal::ZERO && amount < fill.last_qty.as_decimal(),
-            "quantity commission must be positive and smaller than gross fill quantity",
-        )?;
-        check_predicate_true(
-            fill.commission.is_none_or(|fee| fee.is_zero()),
-            "quantity commission and nonzero currency commission are mutually exclusive",
-        )?;
-        check_predicate_true(
-            !self.is_inverse,
-            "quantity commission does not support inverse instruments",
-        )?;
-        check_predicate_true(
-            self.multiplier.as_decimal() == Decimal::ONE,
-            "quantity commission prototype requires unit inventory multiplier",
-        )?;
-        check_predicate_true(
-            amount.round_dp(u32::from(self.size_precision)) == amount,
-            "quantity commission exceeds instrument quantity precision",
-        )?;
-        check_predicate_true(
-            self.signed_qty >= 0.0
-                && (fill.order_side == OrderSide::Buy
-                    || self.quantity.as_decimal() >= fill.last_qty.as_decimal() + amount),
-            "quantity commission requires long inventory without a position flip",
-        )
+        self.prepare_quantity_commission(fill).map(|_| ())
     }
 
-    /// Removes inventory at its moving-average cost inside the original fill application.
-    fn apply_quantity_commission(&mut self, fill: &OrderFilled, amount: Decimal) {
-        let pnl = Money::new(
-            -amount.to_f64().expect("validated fee") * self.avg_px_open,
-            self.settlement_currency,
-        );
-        self.apply_inventory_commission_adjustment(fill, amount, Some(pnl));
+    fn base_commission_quantity(&self, fill: &OrderFilled) -> Decimal {
+        fill.commission
+            .filter(|fee| self.is_currency_pair && Some(fee.currency) == self.base_currency)
+            .map_or(Decimal::ZERO, |fee| fee.as_decimal())
+    }
+
+    fn prepare_quantity_commission(
+        &self,
+        fill: &OrderFilled,
+    ) -> CorrectnessResult<Option<(QuantityCommissionTotals, Quantity)>> {
+        let current = self
+            .quantity_commission_totals
+            .filter(|_| self.side != PositionSide::Flat);
+
+        if fill.quantity_commission.is_none() && current.is_none() {
+            return Ok(None);
+        }
+        check_predicate_true(
+            !self.is_inverse && self.multiplier.as_decimal() == Decimal::ONE,
+            "quantity commission requires linear unit inventory",
+        )?;
+        check_predicate_true(
+            self.signed_qty >= 0.0,
+            "quantity commission requires long inventory without a position flip",
+        )?;
+        let mut totals = current.unwrap_or_default();
+
+        if let Some(amount) = fill.quantity_commission {
+            check_predicate_true(
+                amount > Decimal::ZERO && amount < fill.last_qty.as_decimal(),
+                "quantity commission must be positive and smaller than gross fill quantity",
+            )?;
+            check_predicate_true(
+                fill.commission.is_none_or(|fee| fee.is_zero()),
+                "quantity commission and nonzero currency commission are mutually exclusive",
+            )?;
+            let average = if fill.order_side == OrderSide::Buy {
+                if self.side == PositionSide::Long {
+                    self.calculate_avg_px_open_px(fill.last_px.as_f64(), fill.last_qty.as_f64())
+                } else {
+                    fill.last_px.as_f64()
+                }
+            } else {
+                self.avg_px_open
+            };
+            let cost = Decimal::try_from(average)
+                .ok()
+                .and_then(|price| amount.checked_mul(price));
+            let quantity = totals.quantity.checked_add(amount);
+            let cost = cost.and_then(|cost| totals.cost.checked_add(cost));
+            check_predicate_true(
+                quantity.is_some() && cost.is_some(),
+                "inventory fee totals overflow",
+            )?;
+            totals.quantity = quantity.expect("validated fee quantity");
+            totals.cost = cost.expect("validated fee cost");
+            Money::from_decimal(totals.cost, self.settlement_currency)?;
+        }
+        let old_projection = current.map_or(Decimal::ZERO, |fees| {
+            fees.projected_quantity(self.size_precision)
+        });
+        let gross_change = if fill.order_side == OrderSide::Buy {
+            fill.last_qty.as_decimal()
+        } else {
+            -fill.last_qty.as_decimal()
+        };
+        let prior_quantity = if self.side == PositionSide::Flat {
+            Decimal::ZERO
+        } else {
+            self.quantity.as_decimal()
+        };
+        let quantity = prior_quantity + gross_change
+            - self.base_commission_quantity(fill)
+            - (totals.projected_quantity(self.size_precision) - old_projection);
+        check_predicate_true(
+            quantity >= Decimal::ZERO,
+            "quantity commission requires sufficient inventory without a position flip",
+        )?;
+        let quantity = Quantity::from_decimal_dp(
+            quantity.round_dp_with_strategy(
+                u32::from(self.size_precision),
+                RoundingStrategy::ToNegativeInfinity,
+            ),
+            self.size_precision,
+        )?;
+        check_predicate_true(
+            self.side != PositionSide::Flat || quantity.non_zero(),
+            "net opening inventory is below the instrument quantity quantum",
+        )?;
+        Ok(Some((totals, quantity)))
+    }
+
+    fn apply_quantity_commission(&mut self, fill: &OrderFilled, totals: QuantityCommissionTotals) {
+        let prior = self.quantity_commission_totals.unwrap_or_default();
+        let quantity = totals.projected_quantity(self.size_precision)
+            - prior.projected_quantity(self.size_precision);
+        let pnl = Money::from_decimal(prior.cost, self.settlement_currency)
+            .expect("validated prior fee cost")
+            - Money::from_decimal(totals.cost, self.settlement_currency)
+                .expect("validated fee cost");
+        self.quantity_commission_totals = Some(totals);
+        self.apply_inventory_commission_adjustment(fill, quantity, Some(pnl));
     }
 
     fn latest_fill_voids(&self) -> Vec<&PositionFillVoid> {
@@ -1698,6 +1811,7 @@ impl Position {
         self.buy_qty = Quantity::zero(self.size_precision);
         self.sell_qty = Quantity::zero(self.size_precision);
         self.commissions.clear();
+        self.quantity_commission_totals = None;
         self.signed_qty = 0.0;
         self.quantity = Quantity::zero(self.size_precision);
         self.peak_qty = Quantity::zero(self.size_precision);
@@ -2158,10 +2272,17 @@ impl Position {
 
     /// Returns the signed quantity as a `Decimal`.
     ///
-    /// Uses the raw `signed_qty` field to preserve full precision, as the `quantity`
-    /// field may have reduced precision based on the instrument's `size_precision`.
+    /// Inventory-fee positions use their canonical projected quantity. Other positions retain
+    /// the legacy `signed_qty` conversion, which can contain additional precision.
     #[must_use]
     pub fn signed_decimal_qty(&self) -> Decimal {
+        if self.quantity_commission_totals.is_some() {
+            return if self.side == PositionSide::Short {
+                -self.quantity.as_decimal()
+            } else {
+                self.quantity.as_decimal()
+            };
+        }
         Decimal::try_from(self.signed_qty).unwrap_or(Decimal::ZERO)
     }
 
@@ -9458,6 +9579,112 @@ mod quantity_commission_tests {
         assert!(position.is_closed());
         assert!(position.ts_closed.is_some());
         assert_eq!(position.realized_pnl.unwrap(), Money::from("8.9 USDT"));
+    }
+
+    #[rstest]
+    fn subprecision_fees_accumulate_once_across_restore_and_snapshot() {
+        let (instrument, mut fill) = buy();
+        fill.last_px = Price::from("1");
+        fill.quantity_commission = Some(Decimal::from_str_exact("0.000000004900000001").unwrap());
+        let mut position = Position::new_checked(&instrument, fill.clone()).unwrap();
+        for index in 1..100 {
+            fill.event_id = UUID4::new();
+            fill.trade_id = TradeId::from(format!("ACCUMULATED-{index}"));
+            position.try_apply(&fill).unwrap();
+
+            if index == 49 {
+                position =
+                    serde_json::from_str(&serde_json::to_string(&position).unwrap()).unwrap();
+            }
+            let before = serde_json::to_string(&position).unwrap();
+            position.try_apply(&fill).unwrap();
+            assert_eq!(serde_json::to_string(&position).unwrap(), before);
+        }
+        let totals = position.quantity_commission_totals.unwrap();
+        assert_eq!(
+            totals.quantity,
+            Decimal::from_str_exact("0.000000490000000100").unwrap()
+        );
+        assert_eq!(
+            position.quantity.as_decimal(),
+            Decimal::from_str_exact("99.999999").unwrap()
+        );
+        assert_eq!(
+            position.realized_pnl.unwrap(),
+            Money::from("-0.00000049 USDT")
+        );
+        assert_eq!(totals.cost, totals.quantity);
+        assert!(
+            totals.quantity_residual(position.size_precision)
+                < Decimal::new(1, u32::from(position.size_precision))
+        );
+        assert!(
+            totals
+                .cost_residual(position.settlement_currency)
+                .unwrap()
+                .abs()
+                <= Decimal::new(5, 9)
+        );
+        let snapshot = crate::events::PositionSnapshot::from_replay_state(&position, None);
+        assert_eq!(snapshot.quantity_commission_totals, Some(totals));
+        assert_eq!(
+            position.clone_without_events().quantity_commission_totals,
+            Some(totals)
+        );
+        let mut restored: Position =
+            serde_json::from_value(snapshot.replay_state.unwrap()).unwrap();
+        restored.try_apply(&fill).unwrap();
+        assert_eq!(restored.quantity_commission_totals, Some(totals));
+    }
+
+    #[rstest]
+    fn quantity_fee_totals_rebuild_on_purge_and_reset_on_a_new_episode() {
+        let (instrument, mut first) = buy();
+        first.client_order_id = ClientOrderId::from("PURGED-FEE");
+        let mut position = Position::new_checked(&instrument, first).unwrap();
+        let (_, mut second) = buy();
+        second.client_order_id = ClientOrderId::from("RETAINED-FEE");
+        second.trade_id = TradeId::from("RETAINED-FEE");
+        second.last_px = Price::from("200");
+        second.quantity_commission = Some(Decimal::new(2, 2));
+        position.try_apply(&second).unwrap();
+        position.purge_events_for_order(ClientOrderId::from("PURGED-FEE"));
+        assert_eq!(position.quantity.as_decimal(), Decimal::new(98, 2));
+        assert_eq!(
+            position.quantity_commission_totals.unwrap(),
+            QuantityCommissionTotals {
+                quantity: Decimal::new(2, 2),
+                cost: Decimal::from(4),
+            }
+        );
+        let mut close = second.clone();
+        close.event_id = UUID4::new();
+        close.trade_id = TradeId::from("CLOSE-FEE");
+        close.order_side = OrderSide::Sell;
+        close.last_qty = position.quantity;
+        close.quantity_commission = None;
+        position.try_apply(&close).unwrap();
+        assert!(position.is_closed());
+        let mut reopen = second;
+        reopen.event_id = UUID4::new();
+        reopen.trade_id = TradeId::from("REOPEN-ZERO-FEE");
+        reopen.quantity_commission = None;
+        position.try_apply(&reopen).unwrap();
+        assert_eq!(position.quantity_commission_totals, None);
+        assert_eq!(position.quantity.as_decimal(), Decimal::ONE);
+    }
+
+    #[rstest]
+    fn unrepresentable_net_opening_inventory_is_rejected() {
+        let (instrument, mut fill) = buy();
+        fill.last_qty = Quantity::from("0.000001");
+        fill.quantity_commission = Some(Decimal::new(1, 18));
+        assert!(
+            Position::new_checked(&instrument, fill)
+                .unwrap_err()
+                .to_string()
+                .contains("quantity quantum")
+        );
     }
 
     #[rstest]
