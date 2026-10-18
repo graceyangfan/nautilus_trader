@@ -68,6 +68,7 @@ def _make_fill(
     currency: object = None,
     event_id: object = None,
     ts_event: object = 0,
+    quantity_commission: Decimal | None = None,
 ) -> object:
     if instrument is None:
         instrument = AUDUSD_SIM
@@ -95,6 +96,7 @@ def _make_fill(
         reconciliation=False,
         position_id=None if position_id is None else PositionId(position_id),
         commission=Money.from_str(commission),
+        quantity_commission=quantity_commission,
     )
 
 
@@ -306,6 +308,10 @@ def test_position_to_dict(long_position: object) -> None:
     assert d["quantity"] == "100000"
     assert d["avg_px_open"] == 1.00001
     assert d["realized_pnl"] == "-2.00 USD"
+    assert long_position.quantity_commission_total is None
+    assert long_position.quantity_commission_cost is None
+    assert "quantity_commission_total" not in d
+    assert "quantity_commission_cost" not in d
 
 
 def test_position_partial_fill_long() -> None:
@@ -758,3 +764,31 @@ def _inverse_perpetual() -> object:
         ts_event=0,
         ts_init=0,
     )
+
+
+@pytest.mark.parametrize("quantity_commission", [Decimal(2), Decimal(-1)])
+def test_quantity_commission_position_boundary(quantity_commission: Decimal) -> None:
+    """
+    Preserve inventory cost through fill serialization and reject invalid units.
+    """
+    fill = _make_fill(
+        last_qty=100,
+        last_px="1.00000",
+        commission="0 USD",
+        quantity_commission=quantity_commission,
+    )
+    restored = OrderFilled.from_dict(fill.to_dict())
+
+    if quantity_commission < 0:
+        with pytest.raises(ValueError, match="quantity commission"):
+            Position(AUDUSD_SIM, restored)
+        return
+
+    position = Position(AUDUSD_SIM, restored)
+    assert position.quantity == Quantity.from_int(98)
+    assert position.quantity_commission_total == Decimal(2)
+    assert position.quantity_commission_cost == Decimal(2)
+    assert position.realized_pnl == Money.from_str("-2 USD")
+    data = position.to_dict()
+    assert data["quantity_commission_total"] == "2"
+    assert Decimal(data["quantity_commission_cost"]) == Decimal(2)

@@ -295,6 +295,7 @@ struct OrderFilled {
     positionId @17 :Identifiers.PositionId;
     commission @18 :Types.Money;
     info @19 :Base.StringMap;
+    quantityCommission @20 :Text; # Exact Decimal inventory units; absent for legacy currency fees.
 }
 
 # OrderFillVoided - cumulative correction of a previously applied fill

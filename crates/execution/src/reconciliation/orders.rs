@@ -828,7 +828,7 @@ pub fn reconcile_fill_report(
         report.trade_id,
     );
 
-    Some(OrderEventAny::Filled(OrderFilled::new(
+    let mut fill = OrderFilled::new(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -849,7 +849,9 @@ pub fn reconcile_fill_report(
         report.venue_position_id,
         Some(report.commission),
         None,
-    )))
+    );
+    fill.quantity_commission = report.quantity_commission;
+    Some(OrderEventAny::Filled(fill))
 }
 
 /// Checks if the order should be updated based on quantity, price, or trigger price

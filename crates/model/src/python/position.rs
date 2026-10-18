@@ -352,6 +352,20 @@ impl Position {
             .map_err(nautilus_core::python::to_pyvalue_err)
     }
 
+    /// Cumulative fees in this instrument's inventory units for the current episode.
+    #[getter]
+    #[pyo3(name = "quantity_commission_total")]
+    const fn py_quantity_commission_total(&self) -> Option<Decimal> {
+        self.quantity_commission_total
+    }
+
+    /// Cumulative removed inventory cost in settlement units, before Money projection.
+    #[getter]
+    #[pyo3(name = "quantity_commission_cost")]
+    const fn py_quantity_commission_cost(&self) -> Option<Decimal> {
+        self.quantity_commission_cost
+    }
+
     /// Returns the cumulative commissions for the position as a vector.
     #[pyo3(name = "commissions")]
     fn py_commissions(&self) -> Vec<Money> {
@@ -507,6 +521,13 @@ impl Position {
         dict.set_item("venue_order_ids", venue_order_ids_list)?;
         let trade_ids_list = PyList::new(py, self.trade_ids().iter().map(ToString::to_string))?;
         dict.set_item("trade_ids", trade_ids_list)?;
+        if let Some(value) = self.quantity_commission_total {
+            dict.set_item("quantity_commission_total", value.to_string())?;
+        }
+
+        if let Some(value) = self.quantity_commission_cost {
+            dict.set_item("quantity_commission_cost", value.to_string())?;
+        }
         dict.set_item("buy_qty", self.buy_qty.to_string())?;
         dict.set_item("sell_qty", self.sell_qty.to_string())?;
         dict.set_item("commissions", commissions_from_vec(py, self.commissions())?)?;

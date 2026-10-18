@@ -149,6 +149,7 @@ impl AdmittedLeg {
             last_qty: self.last_qty,
             last_px: self.last_px,
             commission: self.commission.clone(),
+            quantity_commission: None,
             liquidity_side: self.liquidity_side,
             avg_px: None,
             report_id: UUID4::new(),

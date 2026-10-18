@@ -48,6 +48,7 @@ impl FillReport {
         venue_position_id=None,
         avg_px=None,
         report_id=None,
+        quantity_commission=None,
     ))]
     fn py_new(
         account_id: AccountId,
@@ -65,6 +66,7 @@ impl FillReport {
         venue_position_id: Option<PositionId>,
         avg_px: Option<rust_decimal::Decimal>,
         report_id: Option<UUID4>,
+        quantity_commission: Option<rust_decimal::Decimal>,
     ) -> Self {
         let mut report = Self::new(
             account_id,
@@ -83,6 +85,7 @@ impl FillReport {
             report_id,
         );
         report.avg_px = avg_px;
+        report.quantity_commission = quantity_commission;
         report
     }
 
@@ -148,6 +151,13 @@ impl FillReport {
     #[pyo3(name = "commission")]
     const fn py_commission(&self) -> Money {
         self.commission
+    }
+
+    /// Fee denominated in this instrument's inventory units, separate from gross quantity.
+    #[getter]
+    #[pyo3(name = "quantity_commission")]
+    const fn py_quantity_commission(&self) -> Option<rust_decimal::Decimal> {
+        self.quantity_commission
     }
 
     #[getter]
@@ -220,6 +230,9 @@ impl FillReport {
         dict.set_item("last_qty", self.last_qty.to_string())?;
         dict.set_item("last_px", self.last_px.to_string())?;
         dict.set_item("commission", self.commission.to_string())?;
+        if let Some(value) = self.quantity_commission {
+            dict.set_item("quantity_commission", value.to_string())?;
+        }
         dict.set_item("liquidity_side", self.liquidity_side.to_string())?;
         match &self.avg_px {
             Some(avg_px) => dict.set_item("avg_px", avg_px)?,

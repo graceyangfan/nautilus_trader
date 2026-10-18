@@ -84,6 +84,9 @@ pub struct OrderFilled {
     pub position_id: Option<PositionId>,
     /// The commission generated from this execution.
     pub commission: Option<Money>,
+    /// Fee charged in inventory units of this instrument, exclusive of a nonzero currency fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity_commission: Option<Decimal>,
     /// Additional fill metadata (venue/adapter specific).
     pub info: Option<IndexMap<Ustr, Ustr>>,
     /// The causation ID associated with the event.
@@ -137,6 +140,7 @@ impl OrderFilled {
             reconciliation,
             position_id,
             commission,
+            quantity_commission: None,
             info,
             causation_id: None,
         }
@@ -165,6 +169,10 @@ impl OrderFilled {
         opening_position_id: Option<PositionId>,
         opening_event_id: UUID4,
     ) -> anyhow::Result<(Self, Self)> {
+        anyhow::ensure!(
+            self.quantity_commission.is_none(),
+            "quantity commission does not support position flips"
+        );
         anyhow::ensure!(closing_qty.non_zero(), "closing quantity was zero");
         anyhow::ensure!(
             closing_qty < self.last_qty,
