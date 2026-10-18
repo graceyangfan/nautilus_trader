@@ -1134,6 +1134,7 @@ mod tests {
             buy_qty: Quantity::default(),
             sell_qty: Quantity::default(),
             commissions: IndexMap::new(),
+            quantity_commission_total: None,
         }
     }
 

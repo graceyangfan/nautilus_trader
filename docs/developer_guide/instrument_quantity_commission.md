@@ -14,8 +14,9 @@ Adding a public field still changes Rust struct literals and ABI.
 The execution engine classifies duplicates and price restatements using existing rules
 before validating support for a new position change. Order-only reconciliation projections
 skip inventory preflight: their fills are already represented by the retained position,
-and projecting history must not validate a historical SELL against current holdings. Validation precedes order mutation. A historical
-duplicate is not checked against the inventory of a later position episode. Position applies
+and projecting history must not validate a historical SELL against current holdings.
+Validation precedes order mutation; historical duplicates are not checked against the
+inventory of a later position episode. Position applies
 the gross execution and inventory deduction together, then finalizes quantity and lifecycle.
 The engine publishes ordinary order and position events after Cache contains the result.
 
@@ -37,8 +38,7 @@ identifiable; quote realized PnL alone is not an all-in cash return. Consumers m
 interpret 9.9 as a fee-inclusive return or charge the reported cash account again.
 
 This prototype does not introduce inventory-fee valuation, moving-average fee-cost totals,
-or a second cost/PnL algorithm. An earlier experiment expensed acquisition cost into quote
-realized PnL; that policy has been removed to keep the existing Native convention.
+or a second cost/PnL algorithm.
 
 ## Precision and persistence
 
