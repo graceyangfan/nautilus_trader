@@ -69,7 +69,7 @@ use nautilus_model::{
     accounts::{Account, AccountAny},
     data::{
         Bar, BarType, FundingRateUpdate, GreeksData, IndexPriceUpdate, InstrumentClose,
-        InstrumentStatus, MarkPriceUpdate, QuoteTick, TradeTick, YieldCurveData,
+        InstrumentStatus, MarkPriceUpdate, QuoteTick, TradeTick, YieldCurve,
         option_chain::OptionGreeks,
     },
     enums::{
@@ -129,7 +129,7 @@ pub struct Cache {
     bars: AHashMap<BarType, BoundedVecDeque<Bar>>,
     greeks: AHashMap<InstrumentId, GreeksData>,
     option_greeks: AHashMap<InstrumentId, OptionGreeks>,
-    yield_curves: AHashMap<String, YieldCurveData>,
+    yield_curves: AHashMap<String, YieldCurve>,
     external_order_claims: AHashMap<InstrumentId, StrategyId>,
     client_accounts: AHashMap<ClientId, AccountId>,
     client_routes: AHashMap<Venue, ClientId>,
@@ -137,6 +137,7 @@ pub struct Cache {
     external_clients: AHashSet<ClientId>,
     accounts: AHashMap<AccountId, SharedCell<AccountAny>>,
     orders: AHashMap<ClientOrderId, SharedCell<OrderAny>>,
+    orders_dispatched: AHashSet<ClientOrderId>,
     order_lists: AHashMap<OrderListId, OrderList>,
     positions: AHashMap<PositionId, SharedCell<Position>>,
     position_snapshots: AHashMap<PositionId, Vec<PositionSnapshotFrame>>,
@@ -175,6 +176,7 @@ impl Debug for Cache {
             .field("external_clients", &self.external_clients)
             .field("accounts", &self.accounts)
             .field("orders", &self.orders)
+            .field("orders_dispatched", &self.orders_dispatched)
             .field("order_lists", &self.order_lists)
             .field("positions", &self.positions)
             .field("position_snapshots", &self.position_snapshots)
@@ -247,6 +249,7 @@ impl Cache {
             external_clients: AHashSet::new(),
             accounts: AHashMap::new(),
             orders: AHashMap::new(),
+            orders_dispatched: AHashSet::new(),
             order_lists: AHashMap::new(),
             positions: AHashMap::new(),
             position_snapshots: AHashMap::new(),
@@ -1893,11 +1896,11 @@ impl Cache {
 
     /// Purges the instrument with the `instrument_id` from the cache (if found).
     ///
-    /// All cache-owned data keyed by the instrument is removed: the instrument record,
+    /// The instrument record and its market data are removed:
     /// any synthetic with the same id, order book and own-order-book state, quote/trade
     /// histories, mark/index/funding price histories, instrument status and close, bars
-    /// for any `BarType` referencing the instrument, and the `instrument_orders` /
-    /// `instrument_positions` index entries.
+    /// for any `BarType` referencing the instrument. Order and position indexes remain
+    /// while their records are retained, preserving historical queries and realized PnL.
     ///
     /// For safety, an instrument is prevented from being purged while any associated
     /// order is non-terminal (anything not in `orders_closed`, including
@@ -1980,9 +1983,6 @@ impl Cache {
             self.defi.pool_profilers.remove(&instrument_id);
         }
 
-        self.index.instrument_orders.remove(&instrument_id);
-        self.index.instrument_positions.remove(&instrument_id);
-
         log::info!("Purged instrument {instrument_id}");
     }
 
@@ -2000,8 +2000,8 @@ impl Cache {
     /// This still refuses to purge when any associated position is non-closed. Intended
     /// for actors which own an instrument-expiration lifecycle and have already invalidated
     /// any remaining order state externally, but may still observe order-terminal events
-    /// arriving later than the cleanup decision. During that window, the order objects may
-    /// still exist even though `instrument_orders` is removed from the cache index.
+    /// arriving later than the cleanup decision. Order objects and their indexes remain
+    /// available even after the instrument record is removed.
     pub fn purge_instrument_skip_order_guard(&mut self, instrument_id: InstrumentId) {
         self.purge_instrument_inner(instrument_id, true);
     }
@@ -2065,6 +2065,7 @@ impl Cache {
         self.bars.clear();
         self.accounts.clear();
         self.orders.clear();
+        self.orders_dispatched.clear();
         self.order_lists.clear();
         self.positions.clear();
         self.position_snapshots.clear();
@@ -2530,9 +2531,13 @@ impl Cache {
     ///
     /// # Errors
     ///
-    /// Returns an error if persisting the yield curve data to the backing database fails.
-    pub fn add_yield_curve(&mut self, yield_curve: YieldCurveData) -> anyhow::Result<()> {
-        log::debug!("Adding `YieldCurveData` {}", yield_curve.curve_name);
+    /// Returns an error if:
+    /// - The yield curve fails [`YieldCurve::validate`].
+    /// - Persisting the yield curve data to the backing database fails.
+    pub fn add_yield_curve(&mut self, yield_curve: YieldCurve) -> anyhow::Result<()> {
+        yield_curve.validate()?;
+
+        log::debug!("Adding `YieldCurve` {}", yield_curve.curve_name);
 
         if self.config.save_market_data
             && let Some(_database) = &mut self.database
@@ -5028,6 +5033,27 @@ impl Cache {
             }
             None => Vec::new(),
         }
+    }
+
+    /// Records execution client handoffs until their first status transitions.
+    ///
+    /// Records are process-local and may refer to uncached external orders.
+    pub fn mark_orders_dispatched(
+        &mut self,
+        client_order_ids: impl IntoIterator<Item = ClientOrderId>,
+    ) {
+        self.orders_dispatched.extend(client_order_ids);
+    }
+
+    /// Removes the execution dispatch record for an order.
+    pub fn clear_order_dispatch(&mut self, client_order_id: &ClientOrderId) {
+        self.orders_dispatched.remove(client_order_id);
+    }
+
+    /// Returns whether an order was dispatched and awaits its first status transition.
+    #[must_use]
+    pub fn is_order_dispatched(&self, client_order_id: &ClientOrderId) -> bool {
+        self.orders_dispatched.contains(client_order_id)
     }
 
     /// Returns whether an order with the `client_order_id` exists.

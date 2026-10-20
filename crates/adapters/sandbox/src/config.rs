@@ -163,6 +163,29 @@ pub struct SandboxExecutionClientConfig {
 }
 
 impl SandboxExecutionClientConfig {
+    /// Validates the account and OMS requirements for binary-option actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an enabled action profile uses an incompatible account or OMS.
+    pub(crate) fn validate_binary_option_action_profile(&self) -> anyhow::Result<()> {
+        if self.binary_option_action_profile.is_some() {
+            anyhow::ensure!(
+                self.account_type == AccountType::Cash,
+                "Sandbox binary_option_action_profile requires account_type=Cash"
+            );
+            anyhow::ensure!(
+                self.oms_type == OmsType::Netting,
+                "Sandbox binary_option_action_profile requires oms_type=Netting"
+            );
+            anyhow::ensure!(
+                !self.frozen_account,
+                "Sandbox binary_option_action_profile requires frozen_account=false"
+            );
+        }
+        Ok(())
+    }
+
     /// Creates an [`OrderMatchingEngineConfig`] from this sandbox config.
     #[must_use]
     pub fn to_matching_engine_config(&self) -> OrderMatchingEngineConfig {

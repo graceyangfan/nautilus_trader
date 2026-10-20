@@ -65,9 +65,10 @@ use nautilus_model::{
         TimeInForce, TriggerType,
     },
     events::{
-        OrderEventAny, OrderInitialized,
+        OrderEventAny, OrderInitialized, OrderUpdated,
         order::spec::{
-            OrderAcceptedSpec, OrderSubmittedSpec, OrderTriggeredSpec, OrderUpdatedSpec,
+            OrderAcceptedSpec, OrderPendingUpdateSpec, OrderSubmittedSpec, OrderTriggeredSpec,
+            OrderUpdatedSpec,
         },
     },
     identifiers::{
@@ -1804,7 +1805,7 @@ fn test_dispatch_positions_channel_emits_position_report() {
             assert_eq!(report.quantity, Quantity::from("0.500"));
             assert_eq!(
                 report.venue_position_id,
-                Some(PositionId::new("12345-LONG"))
+                Some(PositionId::new("BTC-USDT-SWAP.OKX-LONG"))
             );
         }
         other => panic!("Expected position report, was {other:?}"),
@@ -3017,12 +3018,17 @@ async fn create_query_order_test_client() -> (
 }
 
 fn create_exec_test_router() -> Router {
-    Router::new().route(
-        "/api/v5/account/balance",
-        get(|_headers: HeaderMap| async {
-            axum::Json(load_test_data("http_get_account_balance.json")).into_response()
-        }),
-    )
+    Router::new()
+        .route(
+            "/api/v5/account/config",
+            get(|| async { Json(load_test_data("http_get_account_configuration.json")) }),
+        )
+        .route(
+            "/api/v5/account/balance",
+            get(|_headers: HeaderMap| async {
+                axum::Json(load_test_data("http_get_account_balance.json")).into_response()
+            }),
+        )
 }
 
 #[derive(Clone, Default)]
@@ -3088,6 +3094,14 @@ async fn handle_exec_ws_socket(mut socket: WebSocket, state: Arc<WsTeardownState
 async fn start_exec_session_failure_server() -> (SocketAddr, Arc<WsTeardownState>) {
     let ws_state = Arc::new(WsTeardownState::default());
     let router = Router::new()
+        .route(
+            "/api/v5/account/config",
+            get(|| async { Json(load_test_data("http_get_account_configuration.json")) }),
+        )
+        .route(
+            "/api/v5/account/positions",
+            get(|| async { Json(json!({"code": "0", "msg": "", "data": []})) }),
+        )
         .route(
             "/ws/v5/private",
             get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws_state)),
@@ -4071,6 +4085,7 @@ async fn test_generate_order_status_reports_honors_open_only(
     )
     .with_price(Price::from("103500"));
     expected_pending.avg_px = Some(dec!(0));
+    expected_pending.venue_position_id = Some(PositionId::from("BTC-USDT-SWAP.OKX-LONG"));
     assert_eq!(pending, &expected_pending);
 
     if !open_only {
@@ -4093,6 +4108,7 @@ async fn test_generate_order_status_reports_honors_open_only(
             Some(historical.report_id),
         );
         expected_historical.avg_px = Some(dec!(103698.9));
+        expected_historical.venue_position_id = Some(PositionId::from("BTC-USDT-SWAP.OKX-LONG"));
         assert_eq!(historical, &expected_historical);
     }
 }
@@ -7097,7 +7113,12 @@ impl BootstrapServer {
             ..Default::default()
         });
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
+
         let router = create_exec_test_router()
+            .route(
+                "/api/v5/account/positions",
+                get(|| async { Json(json!({"code": "0", "msg": "", "data": []})) }),
+            )
             .route(
                 "/ws/v5/private",
                 get(handle_exec_ws_upgrade).with_state(Arc::clone(&ws)),
@@ -7699,4 +7720,144 @@ fn test_dispatch_fill_claims_trade_id() {
 
     assert_eq!(events.len(), 1);
     assert!(state.contains_trade(&trade_id));
+}
+
+#[rstest]
+#[case::client_id(false, false)]
+#[case::venue_id(true, false)]
+#[case::with_fill(false, true)]
+#[case::venue_id_with_fill(true, true)]
+#[tokio::test]
+async fn test_imported_order_first_amend_confirmation(
+    #[case] empty_client_id: bool,
+    #[case] with_fill: bool,
+) {
+    let mut server = BootstrapServer::start().await;
+    let (mut client, mut rx, cache) = server.client(true, false);
+    let mut connect = Box::pin(client.connect());
+    for scope in 0..2 {
+        let request = server.next_request(&mut connect).await;
+        request.respond(bootstrap_response(true, scope));
+    }
+
+    finish_bootstrap_connect(connect, &mut rx, &cache)
+        .await
+        .unwrap();
+    let cid = ClientOrderId::from("OIMPORTED001");
+    let vid = VenueOrderId::from("2497956918703120384");
+    let mut order = OrderTestBuilder::new(OrderType::Limit)
+        .trader_id(TraderId::from("TESTER-001"))
+        .strategy_id(StrategyId::from("IMPORT-001"))
+        .instrument_id(InstrumentId::from("BTC-USDT-SWAP.OKX"))
+        .client_order_id(cid)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1"))
+        .price(Price::from("50000.0"))
+        .build();
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, Some(*OKX_CLIENT_ID), false)
+        .unwrap();
+    client.register_external_order(
+        cid,
+        vid,
+        order.instrument_id(),
+        order.strategy_id(),
+        UnixNanos::default(),
+    );
+    order
+        .apply(TestOrderEventStubs::submitted(&order, client.account_id()))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            client.account_id(),
+            vid,
+        ))
+        .unwrap();
+    let pending = OrderPendingUpdateSpec::builder()
+        .trader_id(order.trader_id())
+        .strategy_id(order.strategy_id())
+        .instrument_id(order.instrument_id())
+        .client_order_id(cid)
+        .account_id(client.account_id())
+        .venue_order_id(vid)
+        .build();
+    order.apply(OrderEventAny::PendingUpdate(pending)).unwrap();
+    let mut message = load_test_data("ws_orders.json");
+    let msg = &mut message["data"][0];
+    msg["clOrdId"] = json!(if empty_client_id { "" } else { "OIMPORTED001" });
+    msg["ordType"] = json!("limit");
+    msg["sz"] = json!("3");
+    msg["px"] = json!("50100.0");
+    msg["state"] = json!(if with_fill {
+        "partially_filled"
+    } else {
+        "live"
+    });
+    msg["accFillSz"] = json!(if with_fill { "2" } else { "0" });
+    msg["fillSz"] = json!(if with_fill { "2" } else { "0" });
+    msg["fillPx"] = json!(if with_fill { "50100.0" } else { "" });
+    msg["tradeId"] = json!(if with_fill { "1518905529" } else { "" });
+    msg["fee"] = json!("0");
+    server.ws.messages.as_ref().unwrap().send(message).unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ExecutionEvent::Order(OrderEventAny::Updated(updated)) = first else {
+        panic!("expected imported amendment first, was {first:?}");
+    };
+
+    let expected = OrderUpdated::new(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        cid,
+        Quantity::from("3"),
+        updated.event_id,
+        UnixNanos::from(1_746_947_317_402_000_000),
+        updated.ts_init,
+        false,
+        Some(vid),
+        Some(client.account_id()),
+        Some(Price::from("50100.0")),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(updated, expected);
+    order.apply(OrderEventAny::Updated(updated)).unwrap();
+
+    if with_fill {
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let ExecutionEvent::Order(OrderEventAny::Filled(fill)) = event else {
+            panic!("expected fill after amendment, was {event:?}");
+        };
+
+        assert_eq!(fill.last_qty, Quantity::from("2"));
+        order.apply(OrderEventAny::Filled(fill)).unwrap();
+    }
+
+    client.disconnect().await.unwrap();
+    assert!(rx.try_recv().is_err());
+    assert_eq!(
+        order.status(),
+        if with_fill {
+            OrderStatus::PartiallyFilled
+        } else {
+            OrderStatus::Accepted
+        }
+    );
+    assert_eq!(order.quantity(), Quantity::from("3"));
+    assert_eq!(order.price(), Some(Price::from("50100.0")));
+    assert_eq!(
+        order.filled_qty(),
+        Quantity::from(if with_fill { "2" } else { "0" })
+    );
 }

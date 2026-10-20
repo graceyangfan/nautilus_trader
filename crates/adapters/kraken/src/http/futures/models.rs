@@ -260,8 +260,23 @@ pub struct FuturesOpenOrder {
     pub last_update_time: String,
     #[serde(default)]
     pub trigger_signal: Option<KrakenTriggerSignal>,
-    #[serde(rename = "cli_ord_id", default)]
+    /// The client order ID under the key the open-orders API documents.
+    #[serde(rename = "cliOrdId", default)]
     pub cli_ord_id: Option<String>,
+    /// The client order ID under the snake-case key the WebSocket feeds use, read as well since the
+    /// key the REST response carries is not verified against the live venue.
+    #[serde(rename = "cli_ord_id", default)]
+    pub cli_ord_id_snake_case: Option<String>,
+}
+
+impl FuturesOpenOrder {
+    /// The client order ID under whichever key the response carries.
+    #[must_use]
+    pub fn client_order_id(&self) -> Option<&str> {
+        self.cli_ord_id
+            .as_deref()
+            .or(self.cli_ord_id_snake_case.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +389,12 @@ pub struct FuturesOrderEventsResponse {
     pub continuation_token: Option<String>,
     /// Rows the projection could not represent, which leave the set incomplete.
     pub skipped_rows: usize,
+    /// The order of each skipped row that names one; a row of an undocumented kind names none.
+    pub skipped_order_ids: Vec<String>,
+    /// The earliest event time on the page in milliseconds, over every element including the
+    /// skipped ones. The venue returns history newest first, so with a continuation token this is
+    /// how far back the page reaches.
+    pub oldest_event_ms: Option<i64>,
 }
 
 // Futures Order History Models
@@ -593,6 +614,8 @@ impl FuturesOrderHistoryResponse {
         };
 
         let mut skipped_rows = 0usize;
+        let mut skipped_order_ids = Vec::new();
+        let oldest_event_ms = elements.iter().map(|element| element.timestamp).min();
         let order_events = elements
             .into_iter()
             .filter_map(|element| {
@@ -643,6 +666,7 @@ impl FuturesOrderHistoryResponse {
                         order.tradeable
                     );
                     skipped_rows += 1;
+                    skipped_order_ids.push(order.uid);
                     return None;
                 };
 
@@ -657,6 +681,7 @@ impl FuturesOrderHistoryResponse {
                             order.tradeable
                         );
                         skipped_rows += 1;
+                        skipped_order_ids.push(order.uid);
                         return None;
                     }
                 };
@@ -678,6 +703,7 @@ impl FuturesOrderHistoryResponse {
                             order.tradeable
                         );
                         skipped_rows += 1;
+                        skipped_order_ids.push(order.uid);
                         return None;
                     }
                     Some(kind) => kind,
@@ -735,6 +761,8 @@ impl FuturesOrderHistoryResponse {
             order_events,
             continuation_token: self.continuation_token,
             skipped_rows,
+            skipped_order_ids,
+            oldest_event_ms,
         })
     }
 }
@@ -756,12 +784,27 @@ pub struct FuturesFill {
     #[serde(with = "decimal")]
     pub price: Decimal,
     pub fill_type: KrakenFillType,
-    #[serde(rename = "cli_ord_id", default)]
+    /// The client order ID under the key the fills API documents.
+    #[serde(rename = "cliOrdId", default)]
     pub cli_ord_id: Option<String>,
+    /// The client order ID under the snake-case key the WebSocket feeds use, read as well since the
+    /// key the REST response carries is not verified against the live venue.
+    #[serde(rename = "cli_ord_id", default)]
+    pub cli_ord_id_snake_case: Option<String>,
     #[serde(rename = "fee_paid", default, with = "optional_decimal")]
     pub fee_paid: Option<Decimal>,
     #[serde(rename = "fee_currency", default)]
     pub fee_currency: Option<String>,
+}
+
+impl FuturesFill {
+    /// The client order ID under whichever key the response carries.
+    #[must_use]
+    pub fn client_order_id(&self) -> Option<&str> {
+        self.cli_ord_id
+            .as_deref()
+            .or(self.cli_ord_id_snake_case.as_deref())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1375,6 +1418,30 @@ mod tests {
         assert_eq!(unprotected.maker_protection_millis, None);
     }
 
+    /// The open-orders and fills APIs document the client order ID as `cliOrdId`. The snake-case
+    /// key is read as well, and a body carrying both reads the documented one rather than failing.
+    #[rstest]
+    #[case::documented_key(r#","cliOrdId":"doc-1""#, Some("doc-1"))]
+    #[case::snake_case_key(r#","cli_ord_id":"snake-1""#, Some("snake-1"))]
+    #[case::both_keys(r#","cliOrdId":"doc-1","cli_ord_id":"snake-1""#, Some("doc-1"))]
+    #[case::neither_key("", None)]
+    fn test_futures_open_order_and_fill_read_either_client_order_id_key(
+        #[case] keys: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let order: FuturesOpenOrder = serde_json::from_str(&format!(
+            r#"{{"order_id":"o1","symbol":"PI_XBTUSD","side":"buy","orderType":"lmt","limitPrice":1.0,"unfilledSize":1.0,"receivedTime":"2023-04-07T14:15:30.250Z","status":"untouched","filledSize":0.0,"reduceOnly":false,"lastUpdateTime":"2023-04-07T14:15:30.250Z"{keys}}}"#
+        ))
+        .unwrap();
+        let fill: FuturesFill = serde_json::from_str(&format!(
+            r#"{{"fill_id":"f1","symbol":"PI_XBTUSD","side":"buy","order_id":"o1","fillTime":"2023-04-07T15:20:45.500Z","size":1,"price":1.0,"fillType":"taker"{keys}}}"#
+        ))
+        .unwrap();
+
+        assert_eq!(order.client_order_id(), expected);
+        assert_eq!(fill.client_order_id(), expected);
+    }
+
     #[rstest]
     fn test_parse_futures_fills() {
         let data = load_test_data("http_futures_fills.json");
@@ -1616,6 +1683,52 @@ mod tests {
             response.skipped_rows, 2,
             "the Unknown type and the undocumented kind count; the not-found event does not"
         );
+    }
+
+    /// A page reaches back to its oldest event whatever the projection keeps, so the oldest time
+    /// counts a not-found or undocumented element as well as a kept one.
+    #[rstest]
+    #[case::not_found(r#"{"OrderNotFound":{"orderId":"gone"}}"#)]
+    #[case::undocumented(r#"{"OrderSomethingNew":{"order":{"uid":"x"}}}"#)]
+    fn test_parse_futures_order_events_oldest_time_counts_every_element(#[case] oldest: &str) {
+        let kept = r#"{"OrderPlaced":{"order":{"uid":"o1","tradeable":"PF_XBTUSD","direction":"Buy","quantity":"1","filled":"0","limitPrice":"70000","orderType":"Limit","clientId":"","reduceOnly":false,"timestamp":1680876930250,"lastUpdateTimestamp":1680876930250},"reason":"new_user_order"}}"#;
+        let data = format!(
+            r#"{{"elements":[{{"uid":"e2","timestamp":1680876931000,"event":{kept}}},{{"uid":"e1","timestamp":1680876930000,"event":{oldest}}}]}}"#
+        );
+
+        let response = order_history_events_from(&data);
+
+        assert_eq!(response.order_events.len(), 1);
+        assert_eq!(response.oldest_event_ms, Some(1_680_876_930_000));
+    }
+
+    /// A row skipped for a timestamp before the epoch names the order it carries, so a lookup
+    /// cannot rule that order out.
+    #[rstest]
+    fn test_parse_futures_order_events_names_the_order_of_a_pre_epoch_row() {
+        let data = r#"{"elements":[{"uid":"e1","timestamp":1680876930250,"event":{"OrderPlaced":{"order":{"uid":"o-pre","tradeable":"PF_XBTUSD","direction":"Buy","quantity":"1","filled":"0","limitPrice":"70000","orderType":"Limit","clientId":"","reduceOnly":false,"timestamp":-1,"lastUpdateTimestamp":-1},"reason":"new_user_order"}}}]}"#;
+
+        let response = order_history_events_from(data);
+
+        assert!(response.order_events.is_empty());
+        assert_eq!(response.skipped_rows, 1);
+        assert_eq!(response.skipped_order_ids, vec!["o-pre".to_string()]);
+    }
+
+    /// A page reaches back to its oldest event whatever the projection keeps, so a skipped row
+    /// counts toward the oldest time. A skipped row names its order when it carries one; an
+    /// undocumented kind names none.
+    #[rstest]
+    fn test_parse_futures_order_events_reports_what_the_page_covers() {
+        let response = order_history_events("http_futures_order_events_unknown.json");
+
+        assert_eq!(
+            response.oldest_event_ms,
+            Some(1_779_062_400_000),
+            "the oldest element is the skipped Unknown-type row"
+        );
+        assert_eq!(response.skipped_order_ids, vec!["abc".to_string()]);
+        assert_eq!(response.skipped_rows, 2);
     }
 
     /// `Unknown` is how the venue reports a source type it could not decode, so neither it nor a

@@ -120,6 +120,7 @@ pub(super) use crate::{
 pub(super) const MODIFY_TRAILING_OFFSET_PARAM: &str = "trailing_offset";
 
 pub(super) const DENIAL_CLIENT_NOT_READY: &str = "IB_CLIENT_NOT_READY";
+pub(super) const DENIAL_ORDER_INVALID: &str = "ORDER_INVALID";
 pub(super) const DENIAL_ORDER_LIST_INVALID: &str = "ORDER_LIST_INVALID";
 pub(super) const DENIAL_ORDER_LIST_SIBLING_SUBMIT_FAILED: &str = "ORDER_LIST_SIBLING_SUBMIT_FAILED";
 pub(super) const DENIAL_POST_ONLY_UNSUPPORTED: &str = "UNSUPPORTED_POST_ONLY";
@@ -193,6 +194,9 @@ pub(super) struct OrderTrackerState {
     /// Fills held for untracked orders while their details resolve; a key marks a resolution
     /// in flight.
     pub(super) fills_held: AHashMap<IbOrderSelector, Vec<FillReport>>,
+    /// Orders whose submission is under way but not yet tracked (while their price magnifier
+    /// loads, say). A cancel takes an order from here, and its submission then stops before IB.
+    pub(super) awaiting_submission: AHashMap<ClientOrderId, AwaitingSubmission>,
 }
 
 impl OrderTrackerState {
@@ -270,6 +274,7 @@ impl OrderTracker {
                 active_orders: AHashMap::new(),
                 terminal_orders: FifoCacheMap::new(),
                 fills_held: AHashMap::new(),
+                awaiting_submission: AHashMap::new(),
             })),
         }
     }
@@ -306,6 +311,15 @@ pub(super) enum OrderCorrelation {
     Untracked {
         client_order_id: Option<ClientOrderId>,
     },
+}
+
+/// An order submitted to the client that has not yet reached IB order tracking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct AwaitingSubmission {
+    pub(super) trader_id: TraderId,
+    pub(super) strategy_id: StrategyId,
+    pub(super) instrument_id: InstrumentId,
+    pub(super) order_side: OrderSide,
 }
 
 #[derive(Clone, Debug)]
@@ -589,7 +603,23 @@ impl InteractiveBrokersExecutionClient {
         cmd: SubmitOrderList,
         orders: Vec<OrderAny>,
     ) -> anyhow::Result<()> {
+        self.seed_instruments_from_cache(orders.iter().map(|order| order.instrument_id()));
         let client = self.ib_client.as_ref().context("IB client not connected")?;
+        self.seed_price_magnifiers_from_cache(orders.iter().map(OrderAny::instrument_id));
+
+        for order in &orders {
+            Self::register_awaiting_submission(
+                order.client_order_id(),
+                AwaitingSubmission {
+                    trader_id: order.trader_id(),
+                    strategy_id: cmd.strategy_id,
+                    instrument_id: order.instrument_id(),
+                    order_side: order.order_side(),
+                },
+                &self.orders,
+            )?;
+        }
+        let client_order_ids: Vec<_> = orders.iter().map(OrderAny::client_order_id).collect();
 
         let order_tracker = self.orders.clone();
         let next_order_id = Arc::clone(&self.next_order_id);
@@ -601,6 +631,7 @@ impl InteractiveBrokersExecutionClient {
         let strategy_id = cmd.strategy_id;
         let client_clone = client.as_arc().clone();
         let order_submit_lock = Arc::clone(&self.order_submit_lock);
+        let request_timeout_secs = self.config.request_timeout;
 
         let future = async move {
             if let Err(e) = Self::handle_submit_order_list_async(
@@ -616,6 +647,7 @@ impl InteractiveBrokersExecutionClient {
                 ib_account,
                 strategy_id,
                 &order_submit_lock,
+                request_timeout_secs,
             )
             .await
             {
@@ -623,11 +655,30 @@ impl InteractiveBrokersExecutionClient {
             }
         };
 
-        self.pending_tasks
-            .spawn(future)
-            .context("failed to register IB execution command task")?;
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            let mut state = self.orders.lock()?;
+            for client_order_id in client_order_ids {
+                state.take_awaiting_submission(client_order_id);
+            }
+            return Err(e).context("failed to register IB execution command task");
+        }
 
         Ok(())
+    }
+
+    // The provider is seeded from the cache when the client is created, so an instrument loaded
+    // later (by a data client, say) reaches the cache with its price magnifier but not the
+    // provider. The command handlers request any magnifier still missing from IB.
+    pub(super) fn seed_price_magnifiers_from_cache(
+        &self,
+        instrument_ids: impl IntoIterator<Item = InstrumentId>,
+    ) {
+        let cache = self.core.cache();
+
+        for instrument_id in instrument_ids {
+            self.instrument_provider
+                .seed_price_magnifier_from_cache(&cache, &instrument_id);
+        }
     }
 
     pub(super) fn reserve_next_local_order_id(
@@ -643,18 +694,27 @@ impl InteractiveBrokersExecutionClient {
         Ok(order_id)
     }
 
-    fn apply_client_order_id_floor(next_id: i32, client_id: i32) -> i32 {
+    // IB refuses every order ID below the client's next valid ID (error 103). When that ID lies
+    // above the client's partition no ID in it can be used, so this fails instead of mapping
+    fn apply_client_order_id_floor(next_id: i32, client_id: i32) -> anyhow::Result<i32> {
         let client_slot = client_id.unsigned_abs() % 1000;
         if client_slot == 0 {
-            return next_id;
+            return Ok(next_id);
         }
 
         let order_id_floor = (client_slot as i32) * ORDER_ID_PARTITION_SIZE;
         let order_id_ceiling = order_id_floor + ORDER_ID_PARTITION_SIZE;
-        if next_id > order_id_floor && next_id < order_id_ceiling {
-            next_id
+        anyhow::ensure!(
+            next_id < order_id_ceiling,
+            "IB next valid order ID {next_id} for client_id {client_id} is above its partition ({} to {}), so IB would refuse every order with error 103; use another client_id",
+            order_id_floor + 1,
+            order_id_ceiling - 1,
+        );
+
+        if next_id > order_id_floor {
+            Ok(next_id)
         } else {
-            order_id_floor + next_id.rem_euclid(ORDER_ID_PARTITION_SIZE).max(1)
+            Ok(order_id_floor + next_id.rem_euclid(ORDER_ID_PARTITION_SIZE).max(1))
         }
     }
 
@@ -668,14 +728,20 @@ impl InteractiveBrokersExecutionClient {
         order_id > order_id_floor && order_id < order_id_floor + ORDER_ID_PARTITION_SIZE
     }
 
-    // IB refuses an order ID at or below one the same client already used (error 103). Its next
-    // valid ID can belong to another client's partition and then says nothing about this
-    // client's IDs, so the start also clears the highest ID this client has in orders IB lists
-    fn initial_order_id(next_id: i32, client_id: i32, highest_used_order_id: Option<i32>) -> i32 {
-        let client_scoped_next_id = Self::apply_client_order_id_floor(next_id, client_id);
-        highest_used_order_id.map_or(client_scoped_next_id, |order_id| {
-            client_scoped_next_id.max(order_id.saturating_add(1))
-        })
+    // IB refuses an order ID at or below one the same client already used (error 103). A next
+    // valid ID below the client's partition says nothing about this client's IDs, so the start
+    // also clears the highest ID this client has in orders IB lists
+    fn initial_order_id(
+        next_id: i32,
+        client_id: i32,
+        highest_used_order_id: Option<i32>,
+    ) -> anyhow::Result<i32> {
+        let client_scoped_next_id = Self::apply_client_order_id_floor(next_id, client_id)?;
+        Ok(
+            highest_used_order_id.map_or(client_scoped_next_id, |order_id| {
+                client_scoped_next_id.max(order_id.saturating_add(1))
+            }),
+        )
     }
 
     /// Gets the next valid order ID from IB.
@@ -982,7 +1048,21 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
+        self.seed_instruments_from_cache([cmd.instrument_id]);
+        self.seed_price_magnifiers_from_cache([cmd.instrument_id]);
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
+        let client_order_id = cmd.order_init.client_order_id;
+        Self::register_awaiting_submission(
+            client_order_id,
+            AwaitingSubmission {
+                trader_id: cmd.order_init.trader_id,
+                strategy_id: cmd.strategy_id,
+                instrument_id: cmd.instrument_id,
+                order_side: cmd.order_init.order_side,
+            },
+            &self.orders,
+        )?;
 
         let orders = self.orders.clone();
         let next_order_id = Arc::clone(&self.next_order_id);
@@ -995,6 +1075,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
 
         let account_id = self.core.account_id;
         let ib_account = self.ib_account;
+        let request_timeout_secs = self.config.request_timeout;
 
         let future = async move {
             if let Err(e) = Self::handle_submit_order_async(
@@ -1008,6 +1089,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
                 account_id,
                 ib_account,
                 &order_submit_lock,
+                request_timeout_secs,
             )
             .await
             {
@@ -1015,9 +1097,12 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             }
         };
 
-        self.pending_tasks
-            .spawn(future)
-            .context("failed to register IB execution command task")?;
+        if let Err(e) = self.pending_tasks.spawn(future) {
+            self.orders
+                .lock()?
+                .take_awaiting_submission(client_order_id);
+            return Err(e).context("failed to register IB execution command task");
+        }
 
         Ok(())
     }
@@ -1103,7 +1188,7 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             next_id,
             self.config.client_id,
             highest_open_order_id.max(highest_completed_order_id),
-        );
+        )?;
 
         if starting_order_id == next_id {
             tracing::debug!(
@@ -1365,16 +1450,17 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             .build()
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        let (mut order_reports, fill_reports, mut position_reports) = tokio::try_join!(
+        let report_client = self.report_client()?;
+        let (mut order_reports, fill_evidence, mut position_reports) = tokio::try_join!(
             self.generate_order_status_reports(&order_cmd),
-            self.generate_fill_reports(fill_cmd),
+            report_client.generate_fill_evidence(fill_cmd),
             self.generate_position_status_reports(&position_cmd),
         )?;
 
         tracing::info!(
             "generate_mass_status: {} order reports, {} fill reports, {} position reports",
             order_reports.len(),
-            fill_reports.len(),
+            fill_evidence.reports.len(),
             position_reports.len()
         );
 
@@ -1390,8 +1476,13 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
         // cannot be claimed complete.
         mass_status.set_report_window(start, start.is_some());
 
-        parse::fill_missing_avg_px(&mut order_reports, &fill_reports);
-        parse::fill_position_avg_px_from_fills(&mut position_reports, &fill_reports);
+        parse::fill_missing_avg_px(&mut order_reports, &fill_evidence.reports);
+        parse::fill_position_avg_px_from_fills(
+            &mut position_reports,
+            &fill_evidence,
+            &self.instrument_provider,
+        );
+        let fill_reports = fill_evidence.reports;
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
@@ -1804,6 +1895,9 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
+        self.seed_instruments_from_cache([cmd.instrument_id]);
+        self.seed_price_magnifiers_from_cache([cmd.instrument_id]);
+
         let client = self.ib_client.as_ref().context("IB client not connected")?;
 
         let orders = self.orders.clone();
@@ -1865,6 +1959,23 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
             return Ok(());
         }
 
+        // An order still awaiting submission (its price magnifier loading, say) has not reached
+        // IB, so the cancel completes here and its submission stops before IB
+        let awaiting = self
+            .orders
+            .lock()?
+            .take_awaiting_submission(cmd.client_order_id);
+
+        if let Some(submission) = awaiting {
+            return Self::send_awaiting_order_canceled(
+                cmd.client_order_id,
+                submission,
+                account_id,
+                &exec_sender,
+                clock.get_time_ns(),
+            );
+        }
+
         if let Err(reason) = self.ensure_client_ready_for_order_request("cancel order") {
             Self::send_order_cancel_rejected(
                 &target_order,
@@ -1924,6 +2035,28 @@ impl ExecutionClient for InteractiveBrokersExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        // Orders still awaiting submission have not reached IB, so they are canceled here and
+        // their submissions stop before IB
+        let awaiting = self
+            .orders
+            .lock()?
+            .take_awaiting_submissions(cmd.instrument_id, cmd.order_side);
+
+        if !awaiting.is_empty() {
+            let exec_sender = get_exec_event_sender();
+            let ts_event = get_atomic_clock_realtime().get_time_ns();
+
+            for (client_order_id, submission) in awaiting {
+                Self::send_awaiting_order_canceled(
+                    client_order_id,
+                    submission,
+                    self.core.account_id,
+                    &exec_sender,
+                    ts_event,
+                )?;
+            }
+        }
+
         if self
             .ensure_client_ready_for_order_request("cancel orders")
             .is_err()
@@ -2072,9 +2205,24 @@ impl InteractiveBrokersExecutionClient {
             self.core.account_type,
             self.core.base_currency,
         );
+        let base_currency = self.core.base_currency;
+        let mismatch_logged = AtomicBool::new(false);
         let exec_sender = get_exec_event_sender();
         let clock = get_atomic_clock_realtime();
         move |(balances, margins, info)| {
+            // IB reports the summary tags in the account's base currency, so a balance in
+            // another currency means the configured base currency is not the account's
+            if let Some(base_currency) = base_currency
+                && let Some(balance) = balances.iter().find(|b| b.currency != base_currency)
+                && !mismatch_logged.swap(true, Ordering::Relaxed)
+            {
+                tracing::error!(
+                    "IB account summary reports a balance in {}, but the configured \
+                     `base_currency` is {base_currency}",
+                    balance.currency,
+                );
+            }
+
             let ts_now = clock.get_time_ns();
             let state =
                 factory.generate_account_state(balances, margins, true, ts_now, ts_now, info);

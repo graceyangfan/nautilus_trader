@@ -52,7 +52,7 @@ use nautilus_execution::{
 use nautilus_model::{
     accounts::AccountAny,
     data::{Bar, InstrumentClose, InstrumentStatus, OrderBookDeltas, QuoteTick, TradeTick},
-    enums::{AccountType, OmsType},
+    enums::OmsType,
     events::{
         OrderCancelRejected, OrderEventAny, OrderModifyRejected, OrderRejected, PositionEvent,
     },
@@ -134,21 +134,31 @@ impl SandboxExecutionClient {
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
     ) -> anyhow::Result<Self> {
-        if config.binary_option_action_profile.is_some() {
-            anyhow::ensure!(
-                config.account_type == AccountType::Cash,
-                "Sandbox binary_option_action_profile requires account_type=Cash"
-            );
-            anyhow::ensure!(
-                config.oms_type == OmsType::Netting,
-                "Sandbox binary_option_action_profile requires oms_type=Netting"
-            );
-            anyhow::ensure!(
-                !config.frozen_account,
-                "Sandbox binary_option_action_profile requires frozen_account=false"
-            );
-        }
+        config.validate_binary_option_action_profile()?;
 
+        let fee_model = config.fee_model.clone().map(FeeModelHandle::from).ok_or_else(|| {
+            anyhow::anyhow!(
+                "SandboxExecutionClientConfig requires an explicit fee_model, including an explicit zero-fee model"
+            )
+        })?;
+
+        Ok(Self::new_with_fee_model(
+            core, config, clock, cache, fee_model,
+        ))
+    }
+
+    /// Creates a sandbox execution client with a runtime fee model.
+    ///
+    /// The supplied model takes precedence over `config.fee_model` and is shared
+    /// across all matching engines for this client.
+    #[must_use]
+    pub fn new_with_fee_model(
+        core: ExecutionClientCore,
+        config: SandboxExecutionClientConfig,
+        clock: Rc<RefCell<dyn Clock>>,
+        cache: Rc<RefCell<Cache>>,
+        fee_model: FeeModelHandle,
+    ) -> Self {
         let mut balances = AHashMap::new();
         for money in &config.starting_balances {
             balances.insert(money.currency.code.to_string(), *money);
@@ -159,12 +169,6 @@ impl SandboxExecutionClient {
             .clone()
             .map(FillModelHandle::from)
             .unwrap_or_default();
-
-        let fee_model = config.fee_model.clone().map(FeeModelHandle::from).ok_or_else(|| {
-            anyhow::anyhow!(
-                "SandboxExecutionClientConfig requires an explicit fee_model, including an explicit zero-fee model"
-            )
-        })?;
 
         let inner = Rc::new_cyclic(|weak: &std::rc::Weak<RefCell<SandboxInner>>| {
             RefCell::new(SandboxInner {
@@ -194,7 +198,7 @@ impl SandboxExecutionClient {
             core.base_currency,
         );
 
-        Ok(Self {
+        Self {
             core: RefCell::new(core),
             factory,
             config,
@@ -202,7 +206,7 @@ impl SandboxExecutionClient {
             handlers: RefCell::new(None),
             clock,
             cache,
-        })
+        }
     }
 
     /// Returns a reference to the configuration.
@@ -612,6 +616,11 @@ impl ExecutionClient for SandboxExecutionClient {
         self.config.oms_type
     }
 
+    // Position reports are always empty, so an absent report is not evidence of a flat position
+    fn provides_bulk_position_coverage(&self, _instrument_id: InstrumentId) -> bool {
+        false
+    }
+
     fn settles_contract_expirations(&self) -> bool {
         true
     }
@@ -655,6 +664,8 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
+        self.config.validate_binary_option_action_profile()?;
+
         if self.core.borrow().is_started() {
             return Ok(());
         }
@@ -725,6 +736,8 @@ impl ExecutionClient for SandboxExecutionClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
+        self.config.validate_binary_option_action_profile()?;
+
         if self.core.borrow().is_connected() {
             return Ok(());
         }

@@ -58,6 +58,8 @@ pub enum BusPayloadType {
     PortfolioSnapshot,
     SubscribeCommand,
     UnsubscribeCommand,
+    RequestCommand,
+    DataResponse,
     TradingCommand,
     ExecutionActionResult,
     GenerateExecutionMassStatus,
@@ -95,6 +97,8 @@ impl BusPayloadType {
         Self::PortfolioSnapshot,
         Self::SubscribeCommand,
         Self::UnsubscribeCommand,
+        Self::RequestCommand,
+        Self::DataResponse,
         Self::TradingCommand,
         Self::ExecutionActionResult,
         Self::GenerateExecutionMassStatus,
@@ -138,6 +142,8 @@ impl BusPayloadType {
             Self::PortfolioSnapshot => "PortfolioSnapshot",
             Self::SubscribeCommand => "SubscribeCommand",
             Self::UnsubscribeCommand => "UnsubscribeCommand",
+            Self::RequestCommand => "RequestCommand",
+            Self::DataResponse => "DataResponse",
             Self::TradingCommand => "TradingCommand",
             Self::ExecutionActionResult => "ExecutionActionResult",
             Self::GenerateExecutionMassStatus => "GenerateExecutionMassStatus",
@@ -202,6 +208,8 @@ impl BusPayloadType {
         match name {
             "SubscribeCommand" => Some(Self::SubscribeCommand),
             "UnsubscribeCommand" => Some(Self::UnsubscribeCommand),
+            "RequestCommand" => Some(Self::RequestCommand),
+            "DataResponse" => Some(Self::DataResponse),
             "TradingCommand" => Some(Self::TradingCommand),
             "ExecutionActionResult" => Some(Self::ExecutionActionResult),
             "GenerateExecutionMassStatus" => Some(Self::GenerateExecutionMassStatus),
@@ -220,6 +228,8 @@ impl BusPayloadType {
             self,
             Self::SubscribeCommand
                 | Self::UnsubscribeCommand
+                | Self::RequestCommand
+                | Self::DataResponse
                 | Self::TradingCommand
                 | Self::ExecutionActionResult
                 | Self::GenerateExecutionMassStatus
@@ -253,7 +263,6 @@ impl BusPayloadType {
         match encoding {
             SerializationEncoding::Json | SerializationEncoding::MsgPack => true,
             SerializationEncoding::Sbe => cfg!(feature = "sbe") && self.has_bus_binary_schema(),
-            SerializationEncoding::Capnp => cfg!(feature = "capnp") && self.has_bus_binary_schema(),
         }
     }
 
@@ -482,16 +491,7 @@ mod tests {
         not(feature = "sbe"),
         case(BusPayloadType::QuoteTick, SerializationEncoding::Sbe, false)
     )]
-    #[cfg_attr(
-        feature = "capnp",
-        case(BusPayloadType::QuoteTick, SerializationEncoding::Capnp, true)
-    )]
-    #[cfg_attr(
-        not(feature = "capnp"),
-        case(BusPayloadType::QuoteTick, SerializationEncoding::Capnp, false)
-    )]
     #[case(BusPayloadType::AccountState, SerializationEncoding::Json, true)]
-    #[case(BusPayloadType::AccountState, SerializationEncoding::Capnp, false)]
     #[case(BusPayloadType::Instrument, SerializationEncoding::Sbe, false)]
     #[cfg_attr(
         feature = "sbe",
@@ -500,14 +500,6 @@ mod tests {
     #[cfg_attr(
         not(feature = "sbe"),
         case(BusPayloadType::OptionGreeks, SerializationEncoding::Sbe, false)
-    )]
-    #[cfg_attr(
-        feature = "capnp",
-        case(BusPayloadType::OptionGreeks, SerializationEncoding::Capnp, true)
-    )]
-    #[cfg_attr(
-        not(feature = "capnp"),
-        case(BusPayloadType::OptionGreeks, SerializationEncoding::Capnp, false)
     )]
     #[case(
         BusPayloadType::Custom(Ustr::from("CustomPayload")),
@@ -544,6 +536,8 @@ mod tests {
         let payload_types = [
             (BusPayloadType::SubscribeCommand, "SubscribeCommand"),
             (BusPayloadType::UnsubscribeCommand, "UnsubscribeCommand"),
+            (BusPayloadType::RequestCommand, "RequestCommand"),
+            (BusPayloadType::DataResponse, "DataResponse"),
             (BusPayloadType::TradingCommand, "TradingCommand"),
             (
                 BusPayloadType::ExecutionActionResult,
@@ -594,7 +588,6 @@ mod tests {
             assert!(payload_type.supports(SerializationEncoding::Json));
             assert!(payload_type.supports(SerializationEncoding::MsgPack));
             assert!(!payload_type.supports(SerializationEncoding::Sbe));
-            assert!(!payload_type.supports(SerializationEncoding::Capnp));
         }
     }
 }

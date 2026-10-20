@@ -43,7 +43,7 @@ use super::{
 use crate::{
     enums::SerializationEncoding,
     messages::{
-        data::{SubscribeCommand, UnsubscribeCommand},
+        data::{DataResponse, RequestCommand, SubscribeCommand, UnsubscribeCommand},
         execution::{ExecutionActionResult, GenerateExecutionMassStatus, TradingCommand},
     },
 };
@@ -84,6 +84,8 @@ pub(super) fn forward_any_to_external_egress(topic: MStr<Topic>, message: &dyn A
             BusPayloadType::UnsubscribeCommand,
             message,
         )
+        || forward_downcast::<DataResponse>(topic, BusPayloadType::DataResponse, message)
+        || forward_downcast::<RequestCommand>(topic, BusPayloadType::RequestCommand, message)
         || forward_downcast::<TradingCommand>(topic, BusPayloadType::TradingCommand, message)
         || forward_downcast::<ExecutionActionResult>(
             topic,
@@ -215,7 +217,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::Instrument => {
-            handle_json_msgpack(
+            handle_payload(
                 topic,
                 message.payload_type,
                 message.encoding,
@@ -289,7 +291,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::AccountState => {
-            handle_json_msgpack(
+            handle_payload(
                 topic,
                 message.payload_type,
                 message.encoding,
@@ -298,7 +300,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::OrderEvent => {
-            handle_json_msgpack(
+            handle_payload(
                 topic,
                 message.payload_type,
                 message.encoding,
@@ -307,7 +309,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::PositionEvent => {
-            handle_json_msgpack(
+            handle_payload(
                 topic,
                 message.payload_type,
                 message.encoding,
@@ -316,7 +318,7 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::PortfolioSnapshot => {
-            handle_json_msgpack(
+            handle_payload(
                 topic,
                 message.payload_type,
                 message.encoding,
@@ -325,31 +327,37 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
             )?;
         }
         BusPayloadType::SubscribeCommand => {
-            handle_json_msgpack_any::<SubscribeCommand>(topic, message)?;
+            handle_payload_any::<SubscribeCommand>(topic, message)?;
         }
         BusPayloadType::UnsubscribeCommand => {
-            handle_json_msgpack_any::<UnsubscribeCommand>(topic, message)?;
+            handle_payload_any::<UnsubscribeCommand>(topic, message)?;
+        }
+        BusPayloadType::DataResponse => {
+            handle_payload_any::<DataResponse>(topic, message)?;
+        }
+        BusPayloadType::RequestCommand => {
+            handle_payload_any::<RequestCommand>(topic, message)?;
         }
         BusPayloadType::TradingCommand => {
-            handle_json_msgpack_any::<TradingCommand>(topic, message)?;
+            handle_payload_any::<TradingCommand>(topic, message)?;
         }
         BusPayloadType::ExecutionActionResult => unreachable!(
             "execution action results are ignored before external message republishing"
         ),
         BusPayloadType::GenerateExecutionMassStatus => {
-            handle_json_msgpack_any::<GenerateExecutionMassStatus>(topic, message)?;
+            handle_payload_any::<GenerateExecutionMassStatus>(topic, message)?;
         }
         BusPayloadType::OrderStatusReport => {
-            handle_json_msgpack_any::<OrderStatusReport>(topic, message)?;
+            handle_payload_any::<OrderStatusReport>(topic, message)?;
         }
         BusPayloadType::FillReport => {
-            handle_json_msgpack_any::<FillReport>(topic, message)?;
+            handle_payload_any::<FillReport>(topic, message)?;
         }
         BusPayloadType::PositionStatusReport => {
-            handle_json_msgpack_any::<PositionStatusReport>(topic, message)?;
+            handle_payload_any::<PositionStatusReport>(topic, message)?;
         }
         BusPayloadType::ExecutionMassStatus => {
-            handle_json_msgpack_any::<ExecutionMassStatus>(topic, message)?;
+            handle_payload_any::<ExecutionMassStatus>(topic, message)?;
         }
         #[cfg(feature = "defi")]
         BusPayloadType::Block
@@ -372,8 +380,9 @@ pub fn republish_external_message(message: &BusMessage) -> anyhow::Result<()> {
 /// Decodes a supported typed payload and passes it to `processor` before applying normal inbound
 /// republishing rules.
 ///
-/// JSON or MessagePack payloads identified by [`BusPayloadType::is_typed_message`] reach
-/// `processor` regardless of internal streaming registration. Internal republishing still requires
+/// JSON or MessagePack payloads identified by
+/// [`BusPayloadType::is_typed_message`] reach `processor` regardless of internal streaming
+/// registration. Internal republishing still requires
 /// registration. Unsupported type/encoding pairs are skipped with a warning. The processor mapping
 /// includes a `payload_type` field containing the [`BusPayloadType`] name. External egress is
 /// suppressed for the duration of processing, including processor callbacks. Other payloads bypass
@@ -400,6 +409,8 @@ pub fn process_external_typed_message(
     let result = match message.payload_type {
         BusPayloadType::SubscribeCommand => process_typed_payload::<SubscribeCommand>(topic, message, processor),
         BusPayloadType::UnsubscribeCommand => process_typed_payload::<UnsubscribeCommand>(topic, message, processor),
+        BusPayloadType::DataResponse => process_typed_payload::<DataResponse>(topic, message, processor),
+        BusPayloadType::RequestCommand => process_typed_payload::<RequestCommand>(topic, message, processor),
         BusPayloadType::TradingCommand => process_typed_payload::<TradingCommand>(topic, message, processor),
         BusPayloadType::ExecutionActionResult => Ok(()),
         BusPayloadType::GenerateExecutionMassStatus => process_typed_payload::<GenerateExecutionMassStatus>(topic, message, processor),
@@ -412,11 +423,11 @@ pub fn process_external_typed_message(
     result
 }
 
-fn handle_json_msgpack_any<T>(topic: MStr<Topic>, message: &BusMessage) -> anyhow::Result<()>
+fn handle_payload_any<T>(topic: MStr<Topic>, message: &BusMessage) -> anyhow::Result<()>
 where
     T: DeserializeOwned + Any,
 {
-    handle_json_msgpack(
+    handle_payload(
         topic,
         message.payload_type,
         message.encoding,
@@ -433,11 +444,8 @@ fn process_typed_payload<T>(
 where
     T: DeserializeOwned + serde::Serialize + Any,
 {
-    let Some(value) = codec::deserialize_json_msgpack_payload::<T>(
-        message.payload_type,
-        message.encoding,
-        &message.payload,
-    )?
+    let Some(value) =
+        codec::deserialize_payload::<T>(message.payload_type, message.encoding, &message.payload)?
     else {
         return Ok(());
     };
@@ -494,7 +502,7 @@ fn is_registered_streaming_type(message: &BusMessage) -> bool {
     false
 }
 
-pub(crate) fn handle_json_msgpack<T>(
+pub(crate) fn handle_payload<T>(
     topic: MStr<Topic>,
     payload_type: BusPayloadType,
     encoding: SerializationEncoding,
@@ -502,10 +510,9 @@ pub(crate) fn handle_json_msgpack<T>(
     publish: impl FnOnce(MStr<Topic>, &T),
 ) -> anyhow::Result<()>
 where
-    T: DeserializeOwned,
+    T: DeserializeOwned + 'static,
 {
-    let Some(value) = codec::deserialize_json_msgpack_payload(payload_type, encoding, payload)?
-    else {
+    let Some(value) = codec::deserialize_payload(payload_type, encoding, payload)? else {
         return Ok(());
     };
 
@@ -572,7 +579,7 @@ fn decode_custom_data_payload(
             decode_custom_data_value(custom_type_name, &value)
                 .context("failed to decode MsgPack CustomData")
         }
-        SerializationEncoding::Sbe | SerializationEncoding::Capnp => {
+        SerializationEncoding::Sbe => {
             codec::warn_unsupported_inbound(payload_type, encoding);
             Ok(None)
         }
