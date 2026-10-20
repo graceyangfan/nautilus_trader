@@ -173,6 +173,7 @@ pub(super) struct TestServerState {
     pub(super) batch_cancel_response_headers: Arc<tokio::sync::Mutex<VecDeque<HeaderMap>>>,
     pub(super) batch_cancel_bodies: Arc<tokio::sync::Mutex<Vec<Value>>>,
     pub(super) batch_cancel_echo_rejections: Arc<AtomicBool>,
+    pub(super) batch_cancel_echo_cancellations: Arc<AtomicBool>,
     pub(super) batch_cancel_delete_count: Arc<tokio::sync::Mutex<usize>>,
     pub(super) batch_cancel_request_gate: Arc<RequestGate>,
     pub(super) market_cancel_response: Arc<tokio::sync::Mutex<Option<Value>>>,
@@ -191,6 +192,7 @@ pub(super) struct TestServerState {
     pub(super) single_order_response_statuses: Arc<tokio::sync::Mutex<VecDeque<StatusCode>>>,
     pub(super) single_order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) single_order_get_count: Arc<AtomicUsize>,
+    pub(super) single_order_request_gate: Arc<RequestGate>,
     pub(super) trades_response_override: Arc<tokio::sync::Mutex<Option<Value>>>,
     pub(super) trades_response_by_id: Arc<tokio::sync::Mutex<HashMap<String, (StatusCode, Value)>>>,
     pub(super) trades_filter_after: Arc<AtomicBool>,
@@ -254,6 +256,7 @@ impl Default for TestServerState {
             batch_cancel_response_headers: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             batch_cancel_bodies: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             batch_cancel_echo_rejections: Arc::new(AtomicBool::new(false)),
+            batch_cancel_echo_cancellations: Arc::new(AtomicBool::new(false)),
             batch_cancel_delete_count: Arc::new(tokio::sync::Mutex::new(0)),
             batch_cancel_request_gate: Arc::new(RequestGate::default()),
             market_cancel_response: Arc::new(tokio::sync::Mutex::new(None)),
@@ -271,6 +274,7 @@ impl Default for TestServerState {
             single_order_response_statuses: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             single_order_response: Arc::new(tokio::sync::Mutex::new(None)),
             single_order_get_count: Arc::new(AtomicUsize::new(0)),
+            single_order_request_gate: Arc::new(RequestGate::default()),
             trades_response_override: Arc::new(tokio::sync::Mutex::new(None)),
             trades_response_by_id: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             trades_filter_after: Arc::new(AtomicBool::new(false)),
@@ -362,6 +366,7 @@ async fn handle_get_orders(
 async fn handle_get_order(State(state): State<TestServerState>, uri: Uri) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
     state.single_order_get_count.fetch_add(1, Ordering::AcqRel);
+    state.single_order_request_gate.wait().await;
     if let Some(status) = state
         .single_order_response_statuses
         .lock()
@@ -638,6 +643,11 @@ async fn handle_delete_orders(
             .map(|order_id| (order_id.to_string(), json!("order not found")))
             .collect::<serde_json::Map<_, _>>();
         json!({"canceled": [], "not_canceled": not_canceled})
+    } else if state
+        .batch_cancel_echo_cancellations
+        .load(Ordering::Acquire)
+    {
+        json!({"canceled": request, "not_canceled": {}})
     } else {
         state
             .batch_cancel_response

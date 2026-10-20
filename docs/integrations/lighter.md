@@ -921,8 +921,11 @@ Funding fields differ:
 - `current_funding_rate`: upcoming estimate used in live updates.
 - `funding_rate` and `funding_timestamp`: last completed payment.
 
-Market stats provide no future settlement time, so live updates leave `interval` and `next_funding_ns`
-unset. Spot `spot_market_stats` emits `IndexPriceUpdate`.
+Lighter funds hourly, so live updates set `interval=60`. Market stats provide no future settlement
+time, so `next_funding_ns` stays unset. Spot `spot_market_stats` emits `IndexPriceUpdate`.
+
+Lighter quotes funding rates in percent. The adapter converts live and historical rates to
+fractions, the Nautilus convention.
 
 Historical funding requests use public `/api/v1/fundings`, not account-specific `positionFunding`:
 
@@ -1121,6 +1124,15 @@ or a bounded strategy that earns enough fills to replenish its quota.
 The WebSocket client sends heartbeats every 30 seconds and reconnects with exponential backoff in
 [250 milliseconds, 30 seconds]. After 90 seconds without an inbound frame, it reconnects even if
 the venue leaves the stalled socket open. Pongs refresh this window without market data.
+
+On a venue `shutdown` notice, the handler requests an immediate reconnect through the shared
+WebSocket client. Notices from an older connection are ignored. The adapter uses its normal
+subscription replay, [nonce recovery](#nonce-recovery), and
+[account stream readiness](#account-stream-readiness) paths.
+
+The old connection stops streaming before the replacement is ready. Fresh snapshots and HTTP
+reconciliation recover state across the gap. A subsequent server close, including code `1012`,
+uses the same reconnect path.
 
 ### Private authentication
 

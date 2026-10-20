@@ -878,10 +878,19 @@ endpoint. The adapter sends sequential chunks and chooses each new chunk from th
 endpoint's 1,000-ID limit and the signer's current cancellation burst. A signer starts with the
 Standard 120-token burst, and a tier reported by one response applies to the next new chunk.
 
-Each chunk retries independently with the same order IDs unless a lower reported tier requires smaller chunks
-before the retry. The adapter merges the completed responses and processes each requested order once after
-every chunk succeeds. If a later chunk exhausts its retries, earlier chunks may already have changed venue
-state. The adapter emits no partial per-order results. Reconciliation resolves the unknown overall outcome.
+Each chunk retries independently with the same order IDs unless a lower reported tier requires smaller chunks.
+Confirmed cancellations override conflicting rejection reasons for the same ID.
+
+If a chunk fails, results from earlier completed chunks still apply. For the remaining orders:
+
+- **Failed chunk**: Definitive failures emit `OrderCancelRejected`; ambiguous failures leave cancels in flight.
+- **Beyond the failed chunk**: Cancels stay in flight if an earlier, larger attempt included those orders.
+- **Never attempted**: Orders receive `OrderCancelRejected` with a local not-sent reason.
+
+In-flight cancels await reconciliation. See [Retry classification](#retry-classification).
+
+Orders with adapter order context close from user-channel events. Orders without it, such as external orders,
+receive `OrderCanceled` from the HTTP response.
 
 `CancelAllOrders` selects its cancellation scope as follows:
 
@@ -2366,6 +2375,9 @@ Five-minute markets, such as Up/Down crypto markets, can expire before the venue
 CLOB metadata. Account for that delay or raise the retry cap. After the retry budget is exhausted,
 the adapter logs a condition still missing on Gamma as a terminal miss. Resubscribe after the
 market becomes available.
+
+If the configured instrument filters reject an uncached instrument, auto-load drops its pending
+subscriptions without further retries or a terminal-miss error. It logs the rejection at DEBUG level.
 
 ### Market resolution events
 

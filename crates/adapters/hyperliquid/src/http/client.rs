@@ -27,7 +27,7 @@ use std::{
     time::Duration,
 };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use anyhow::Context;
 use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
@@ -37,10 +37,10 @@ use nautilus_core::{
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_model::{
-    data::{Bar, BarType},
+    data::{Bar, BarType, FundingRateUpdate},
     enums::{
-        AccountType, BarAggregation, CurrencyType, OrderSide, OrderStatus, OrderType, TimeInForce,
-        TriggerType,
+        AccountType, BarAggregation, CurrencyType, MarketStatusAction, OrderSide, OrderStatus,
+        OrderType, TimeInForce, TriggerType,
     },
     events::AccountState,
     identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol, VenueOrderId},
@@ -82,7 +82,7 @@ use crate::{
             round_to_sig_figs, time_in_force_to_hyperliquid_tif,
         },
     },
-    data::candle_to_bar,
+    data::{candle_to_bar, funding_entry_to_update},
     data_types::HyperliquidPublicTrade,
     http::{
         error::{Error, Result},
@@ -230,6 +230,11 @@ const RATE_LIMIT_BACKOFF_CAP: Duration = Duration::from_secs(5);
 const RATE_LIMIT_INFO_RETRIES_MAX: u32 = 3;
 const RETRY_AFTER_HEADER: &str = "retry-after";
 const VAULT_TOKEN_PREFIX: &str = "vntls:";
+
+/// Maximum rows returned per `fundingHistory` call (the venue per-response cap).
+pub const HYPERLIQUID_FUNDING_HISTORY_MAX_LIMIT: usize = 500;
+/// Seven days of hourly funding, used when a request gives no start or limit.
+const DEFAULT_FUNDING_RATES_LIMIT: usize = 7 * 24;
 
 /// Provides a raw HTTP client for low-level Hyperliquid REST API operations.
 ///
@@ -824,11 +829,19 @@ impl HyperliquidRawHttpClient {
     }
 
     /// Build a signed exchange request using the typed HyperliquidExchangeAction enum.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action is unsupported, credentials are missing, or signing fails.
     pub fn sign_action_exec_request(
         &self,
         action: &HyperliquidExchangeAction,
         expires_after: Option<u64>,
     ) -> Result<HyperliquidExchangeRequest<HyperliquidExchangeAction>> {
+        if matches!(action, HyperliquidExchangeAction::UsdClassTransfer { .. }) {
+            return Err(Error::bad_request("Unsupported action: usdClassTransfer"));
+        }
+
         let signer = self
             .signer
             .as_ref()
@@ -1566,7 +1579,19 @@ impl HyperliquidHttpClient {
 
     /// Fetch and parse all instrument definitions, populating the asset indices cache.
     pub async fn request_instrument_defs(&self) -> Result<Vec<HyperliquidInstrumentDef>> {
+        Ok(self.load_instrument_defs().await?.0)
+    }
+
+    /// Loads all instrument definitions, together with the product types whose
+    /// metadata loaded in full.
+    async fn load_instrument_defs(
+        &self,
+    ) -> Result<(
+        Vec<HyperliquidInstrumentDef>,
+        AHashSet<HyperliquidProductType>,
+    )> {
         let mut defs: Vec<HyperliquidInstrumentDef> = Vec::new();
+        let mut loaded = AHashSet::new();
         let spot_meta = match self.inner.get_spot_meta().await {
             Ok(spot_meta) => Some(spot_meta),
             Err(e) => {
@@ -1603,6 +1628,7 @@ impl HyperliquidHttpClient {
                     );
                     defs.extend(perp_defs);
                 }
+                loaded.insert(HyperliquidProductType::Perp);
             }
             Err(e) => {
                 log::warn!("Failed to load allPerpMetas, falling back to meta: {e}");
@@ -1644,6 +1670,7 @@ impl HyperliquidHttpClient {
                         spot_defs.len(),
                     );
                     defs.extend(spot_defs);
+                    loaded.insert(HyperliquidProductType::Spot);
                 }
                 Err(e) => {
                     log::warn!("Failed to parse Hyperliquid spot instruments: {e}");
@@ -1662,6 +1689,7 @@ impl HyperliquidHttpClient {
                         outcome_defs.len(),
                     );
                     defs.extend(outcome_defs);
+                    loaded.insert(HyperliquidProductType::Outcome);
                 }
                 Err(e) => {
                     log::warn!("Failed to parse Hyperliquid outcome instruments: {e}");
@@ -1704,7 +1732,7 @@ impl HyperliquidHttpClient {
             self.asset_indices.len()
         );
 
-        Ok(defs)
+        Ok((defs, loaded))
     }
 
     /// Converts instrument definitions into Nautilus instruments.
@@ -1717,6 +1745,40 @@ impl HyperliquidHttpClient {
     pub async fn request_instruments(&self) -> Result<Vec<InstrumentAny>> {
         let defs = self.request_instrument_defs().await?;
         Ok(self.convert_defs(defs))
+    }
+
+    /// Fetch all available instruments together with the market status of each.
+    pub(crate) async fn request_instruments_with_statuses(&self) -> Result<InstrumentSnapshot> {
+        let (defs, loaded) = self.load_instrument_defs().await?;
+        let def_statuses: AHashMap<Ustr, MarketStatusAction> = defs
+            .iter()
+            .map(|def| {
+                let action = if def.active {
+                    MarketStatusAction::Trading
+                } else {
+                    MarketStatusAction::Close
+                };
+                (def.symbol, action)
+            })
+            .collect();
+        let instruments = self.convert_defs(defs);
+
+        // Defs that fail conversion yield no instrument, so they get no status
+        let statuses = instruments
+            .iter()
+            .filter_map(|instrument| {
+                let instrument_id = instrument.id();
+                def_statuses
+                    .get(&instrument_id.symbol.inner())
+                    .map(|&action| (instrument_id, action))
+            })
+            .collect();
+
+        Ok(InstrumentSnapshot {
+            instruments,
+            statuses,
+            loaded,
+        })
     }
 
     /// Builds the `allDexsAssetCtxs` normalization map from dex name to ordered instrument IDs.
@@ -2028,6 +2090,10 @@ impl HyperliquidHttpClient {
     }
 
     /// Build the signed exchange request used by both HTTP and WebSocket post transports.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the action is unsupported, credentials are missing, or signing fails.
     pub fn sign_action_exec_request(
         &self,
         action: &HyperliquidExchangeAction,
@@ -3360,6 +3426,117 @@ impl HyperliquidHttpClient {
         ))
     }
 
+    /// Requests funding rate history for a perpetual, paging past the venue's
+    /// per-response cap.
+    ///
+    /// With `start`, returns up to `limit` rows from `start` onward. Without it,
+    /// returns the most recent `limit` rows (default seven days).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument is not a perpetual, `start` is not
+    /// before `end`, or a request fails.
+    pub async fn request_funding_rates(
+        &self,
+        instrument: &InstrumentAny,
+        start: Option<jiff::Timestamp>,
+        end: Option<jiff::Timestamp>,
+        limit: Option<usize>,
+    ) -> Result<Vec<FundingRateUpdate>> {
+        let instrument_id = instrument.id();
+
+        if !matches!(instrument, InstrumentAny::CryptoPerpetual(_)) {
+            return Err(Error::bad_request(format!(
+                "funding rates are only available for perpetual instruments: {instrument_id}",
+            )));
+        }
+
+        let coin = instrument.raw_symbol().inner();
+
+        if let (Some(start), Some(end)) = (start, end)
+            && start >= end
+        {
+            return Err(Error::bad_request(format!(
+                "invalid funding request range: start={start}, end={end}",
+            )));
+        }
+
+        let now = jiff::Timestamp::now();
+        let end = end.unwrap_or(now).min(now);
+
+        if let Some(start) = start
+            && start >= end
+        {
+            return Ok(Vec::new());
+        }
+
+        let requested_limit = limit.filter(|n| *n > 0);
+        let target_limit = requested_limit.unwrap_or(DEFAULT_FUNDING_RATES_LIMIT);
+        let start_was_unspecified = start.is_none();
+        let end_ms = end.as_millisecond().max(0) as u64;
+
+        let start_ms = start.map_or_else(
+            || {
+                let lookback_rows = target_limit.saturating_add(1) as u64;
+                // Hyperliquid funding interval is 1h
+                end_ms.saturating_sub((60 * 60 * 1_000_u64).saturating_mul(lookback_rows))
+            },
+            |dt| dt.as_millisecond().max(0) as u64,
+        );
+
+        let mut funding_rates = Vec::new();
+        let mut cursor_ms = start_ms;
+
+        'pages: while cursor_ms <= end_ms {
+            let entries = self
+                .info_funding_history(coin.as_str(), cursor_ms, Some(end_ms))
+                .await?;
+            let Some(last_time_ms) = entries.iter().map(|entry| entry.time).max() else {
+                break;
+            };
+
+            let mut page: Vec<FundingRateUpdate> = entries
+                .iter()
+                .filter(|entry| (cursor_ms..=end_ms).contains(&entry.time))
+                .map(|entry| funding_entry_to_update(entry, instrument_id))
+                .collect();
+            page.sort_by_key(|rate| rate.ts_event);
+
+            for update in page {
+                if funding_rates
+                    .last()
+                    .is_some_and(|last: &FundingRateUpdate| last.ts_event == update.ts_event)
+                {
+                    continue;
+                }
+                funding_rates.push(update);
+
+                if !start_was_unspecified
+                    && requested_limit.is_some_and(|limit| funding_rates.len() >= limit)
+                {
+                    break 'pages;
+                }
+            }
+
+            if entries.len() < HYPERLIQUID_FUNDING_HISTORY_MAX_LIMIT {
+                break;
+            }
+
+            // `startTime` is inclusive, so step past the last row
+            let next_cursor_ms = last_time_ms.saturating_add(1);
+            if next_cursor_ms <= cursor_ms {
+                break;
+            }
+            cursor_ms = next_cursor_ms;
+        }
+
+        if start_was_unspecified && funding_rates.len() > target_limit {
+            funding_rates = funding_rates.split_off(funding_rates.len() - target_limit);
+        }
+
+        Ok(funding_rates)
+    }
+
     /// Submits an order to the exchange.
     ///
     /// # Errors
@@ -3950,6 +4127,15 @@ pub(crate) struct ReportSweep<T> {
     pub complete: bool,
 }
 
+/// The instrument universe with the market status of each instrument.
+#[derive(Debug)]
+pub(crate) struct InstrumentSnapshot {
+    pub instruments: Vec<InstrumentAny>,
+    pub statuses: AHashMap<InstrumentId, MarketStatusAction>,
+    /// Product types whose metadata loaded in full.
+    pub loaded: AHashSet<HyperliquidProductType>,
+}
+
 fn reconciliation_dexes_from_builders(
     builder_dexes: impl IntoIterator<Item = Ustr>,
 ) -> Vec<Option<Ustr>> {
@@ -4104,6 +4290,88 @@ mod tests {
 
     const TEST_PRIVATE_KEY: &str =
         "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    #[rstest]
+    fn test_usd_class_transfer_rejected_without_credentials(
+        #[values(HyperliquidEnvironment::Mainnet, HyperliquidEnvironment::Testnet)]
+        environment: HyperliquidEnvironment,
+    ) {
+        let client = HyperliquidRawHttpClient::new(environment, 5, None).unwrap();
+
+        let action = HyperliquidExchangeAction::UsdClassTransfer {
+            from: "spot".to_string(),
+            to: "perp".to_string(),
+            amount: dec!(1.25),
+        };
+
+        let error = client.sign_action_exec_request(&action, None).unwrap_err();
+
+        assert!(matches!(error, Error::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "bad request: Unsupported action: usdClassTransfer"
+        );
+    }
+
+    #[rstest]
+    fn test_usd_class_transfer_rejected_before_nonce_allocation(
+        #[values(HyperliquidEnvironment::Mainnet, HyperliquidEnvironment::Testnet)]
+        environment: HyperliquidEnvironment,
+        #[values(None, Some("0x1234567890123456789012345678901234567890"))] vault: Option<&str>,
+        #[values(None, Some(1_900_000_000_000))] expires_after: Option<u64>,
+    ) {
+        let mut client =
+            HyperliquidHttpClient::from_credentials(TEST_PRIVATE_KEY, vault, environment, 5, None)
+                .unwrap();
+        Arc::get_mut(&mut client.inner).unwrap().nonce_manager = None;
+
+        let action = HyperliquidExchangeAction::UsdClassTransfer {
+            from: "perp".to_string(),
+            to: "spot".to_string(),
+            amount: dec!(2.75),
+        };
+
+        let error = client
+            .sign_action_exec_request(&action, expires_after)
+            .unwrap_err();
+
+        assert!(matches!(error, Error::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "bad request: Unsupported action: usdClassTransfer"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_usd_class_transfer_rejected_without_dispatch(
+        #[values(HyperliquidEnvironment::Mainnet, HyperliquidEnvironment::Testnet)]
+        environment: HyperliquidEnvironment,
+    ) {
+        let (addr, count, server) =
+            start_retry_server(RetryFailure::Response(400), usize::MAX, None).await;
+        let mut client =
+            HyperliquidHttpClient::from_credentials(TEST_PRIVATE_KEY, None, environment, 5, None)
+                .unwrap();
+        client.set_base_exchange_url(format!("http://{addr}/exchange"));
+
+        let action = HyperliquidExchangeAction::UsdClassTransfer {
+            from: "spot".to_string(),
+            to: "perp".to_string(),
+            amount: dec!(3.125),
+        };
+
+        let error = client.post_action_exec(&action).await.unwrap_err();
+
+        server.abort();
+
+        assert!(matches!(error, Error::BadRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "bad request: Unsupported action: usdClassTransfer"
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 
     #[rstest]
     #[case(0)]

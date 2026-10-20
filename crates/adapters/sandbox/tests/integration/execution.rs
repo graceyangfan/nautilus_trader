@@ -25,6 +25,7 @@ use nautilus_common::{
     cache::Cache,
     clients::ExecutionClient,
     clock::{Clock, VirtualClock},
+    factories::SimulatedExecutionClientFactory,
     live::set_exec_event_sender,
     messages::{
         ExecutionEvent,
@@ -37,7 +38,10 @@ use nautilus_common::{
         self, MessageBus, MessagingSwitchboard, TypedHandler,
         stubs::get_typed_into_message_saving_handler, typed_handler::TypedIntoHandler,
     },
-    runner::{SyncTradingCommandSender, drain_trading_cmd_queue, replace_exec_cmd_sender},
+    runner::{
+        SyncTradingCommandSender, TimeEventMessage, TimeEventSender, drain_trading_cmd_queue,
+        replace_exec_cmd_sender, replace_time_event_sender,
+    },
 };
 use nautilus_core::{DurationNanos, UUID4, UnixNanos};
 use nautilus_data::engine::DataEngine;
@@ -47,11 +51,14 @@ use nautilus_execution::{
     client::core::ExecutionClientCore,
     engine::ExecutionEngine,
     models::{
-        fee::{FeeModelAny, MakerTakerFeeModel, ProbabilityPriceFeeModel},
+        fee::{
+            FeeModel, FeeModelAny, FeeModelHandle, MakerTakerFeeModel, ProbabilityPriceFeeModel,
+        },
         fill::{DefaultFillModel, FillModel, FillModelAny, FillModelHandle},
         latency::{LatencyModelAny, StaticLatencyModel},
     },
 };
+use nautilus_live::manager::{ExecutionManager, ExecutionManagerConfig};
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::{Bar, BarType, Data, InstrumentClose, InstrumentStatus, QuoteTick, TradeTick},
@@ -75,7 +82,9 @@ use nautilus_model::{
     position::Position,
     types::{Currency, Money, Price, Quantity},
 };
-use nautilus_sandbox::{SandboxExecutionClient, SandboxExecutionClientConfig};
+use nautilus_sandbox::{
+    SandboxExecutionClient, SandboxExecutionClientConfig, SandboxExecutionClientFactory,
+};
 #[cfg(feature = "python")]
 use pyo3::{IntoPyObjectExt, Python, ffi::c_str, types::PyAnyMethods};
 use rstest::{fixture, rstest};
@@ -546,7 +555,7 @@ fn seed_binary_option_position_from_fill(
 }
 
 fn submit_market_open_order(
-    client: &SandboxExecutionClient,
+    client: &dyn ExecutionClient,
     cache: &Rc<RefCell<Cache>>,
     trader_id: TraderId,
     instrument: &InstrumentAny,
@@ -1468,6 +1477,75 @@ fn test_probability_price_fee_model_config_drives_sandbox_commission(
     );
 }
 
+#[derive(Debug)]
+struct NoopTimeEventSender;
+
+impl TimeEventSender for NoopTimeEventSender {
+    fn send(&self, _: TimeEventMessage) {}
+}
+
+#[derive(Default)]
+struct TestFeeModel {
+    used: Cell<bool>,
+}
+
+impl FeeModel for TestFeeModel {
+    fn get_commission(
+        &self,
+        _order: &OrderAny,
+        _fill_quantity: Quantity,
+        _fill_px: Price,
+        _instrument: &InstrumentAny,
+    ) -> anyhow::Result<Money> {
+        anyhow::ensure!(!self.used.replace(true), "Fee model reused across clients");
+        Ok(Money::from("0.01 USDC"))
+    }
+}
+
+#[rstest]
+#[tokio::test(flavor = "current_thread")]
+async fn test_fee_model_factory_overrides_config_and_isolates_clients(trader_id: TraderId) {
+    let factory = SandboxExecutionClientFactory
+        .with_fee_model_factory(|| FeeModelHandle::new(TestFeeModel::default()));
+    replace_time_event_sender(Arc::new(NoopTimeEventSender));
+    let instrument = make_binary_option_instrument("0xCOND", "0xYES", "Yes", u64::MAX);
+
+    for (account_id, configured_model) in [
+        (AccountId::from("POLYMARKET-001"), false),
+        (AccountId::from("POLYMARKET-002"), true),
+    ] {
+        *msgbus::get_message_bus().borrow_mut() = MessageBus::default();
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument.clone()).unwrap();
+        cache
+            .add_quote(create_binary_option_quote(instrument.id()))
+            .unwrap();
+        let cache = Rc::new(RefCell::new(cache));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        nautilus_common::live::runner::replace_exec_event_sender(tx);
+        let mut config = create_config(trader_id, account_id, instrument.id().venue);
+        if !configured_model {
+            config.fee_model = None;
+        }
+        let mut client = factory
+            .create(trader_id, "SANDBOX", &config, cache.clone())
+            .unwrap();
+        client.start().unwrap();
+
+        submit_market_open_order(client.as_ref(), &cache, trader_id, &instrument, "FEE", 0);
+        let commissions: Vec<_> = drain_order_events(&mut rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                OrderEventAny::Filled(fill) => fill.commission,
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(commissions, vec![Money::from("0.01 USDC")]);
+        client.stop().unwrap();
+    }
+}
+
 #[cfg(feature = "python")]
 #[rstest]
 fn test_python_fee_model_config_drives_sandbox_commission(
@@ -2048,6 +2126,9 @@ fn test_client_initial_state(execution_client: SandboxExecutionClient, venue: Ve
     assert!(!execution_client.is_connected());
     assert_eq!(execution_client.venue(), venue);
     assert_eq!(execution_client.oms_type(), OmsType::Netting);
+    assert!(
+        !execution_client.provides_bulk_position_coverage(InstrumentId::from("ETHUSDT-PERP.SIM"))
+    );
     assert!(execution_client.settles_contract_expirations());
     assert_eq!(execution_client.matching_engine_count(), 0);
 }
@@ -4324,6 +4405,69 @@ async fn test_generate_mass_status_returns_empty_report(
     assert!(mass_status.order_reports().is_empty());
     assert!(mass_status.fill_reports().is_empty());
     assert!(mass_status.position_reports().is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_position_check_keeps_open_sandbox_position(
+    trader_id: TraderId,
+    account_id: AccountId,
+    venue: Venue,
+    instrument: InstrumentAny,
+) {
+    let (mut context, mut rx) =
+        setup_channel_context(trader_id, account_id, venue, &instrument, None);
+    context
+        .client
+        .process_quote_tick(&create_quote_tick(instrument.id(), 1000.0, 1001.0))
+        .unwrap();
+
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .client_order_id("O-POSITION-CHECK-1".into())
+        .build();
+    submit_to_client(&context, trader_id, &order);
+    let mut fill = apply_order_events_from_channel(&context.cache, &mut rx)
+        .into_iter()
+        .find_map(|event| match event {
+            OrderEventAny::Filled(fill) => Some(fill),
+            _ => None,
+        })
+        .expect("market order should fill against the quote");
+    fill.position_id = Some(PositionId::new("P-POSITION-CHECK-1"));
+    let position = Position::new(&instrument, fill);
+    context
+        .cache
+        .borrow_mut()
+        .add_position(&position, OmsType::Netting)
+        .unwrap();
+
+    let mut manager = ExecutionManager::new(
+        context.test_clock.clone(),
+        context.cache.clone(),
+        ExecutionManagerConfig {
+            position_check_threshold_ns: DurationNanos::ZERO,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let events = manager
+        .check_positions_consistency(&[&context.client])
+        .await;
+
+    assert!(events.is_empty());
+    assert!(
+        context
+            .cache
+            .borrow()
+            .position(&position.id)
+            .is_some_and(|position| position.is_open())
+    );
+
+    context.client.stop().unwrap();
 }
 
 #[rstest]

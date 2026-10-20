@@ -104,6 +104,10 @@ from nautilus_trader.adapters.hyperliquid import builder_fee_revoke
 builder_fee_revoke()
 ```
 
+The approval and revocation scripts and Python functions accept `HYPERLIQUID_TESTNET=true` or `1`
+for testnet, or `false` or `0` for mainnet (the default when unset). Boolean words are case-insensitive.
+They reject other values, including empty strings, before signing a request.
+
 The Rust scripts print an action summary. They wait for an Enter keypress before signing. If anything in the
 summary looks wrong, abort with `Ctrl+C`. To skip the prompt, append `-- --yes` to the `cargo run` command.
 The Python bindings do not prompt, so make sure to review the active environment variables before calling.
@@ -697,6 +701,16 @@ instruments = await client.load_instrument_definitions(
 )
 ```
 
+### Instrument status
+
+Hyperliquid has no market status stream, so the adapter derives `InstrumentStatus` from the instrument
+refresh, which polls at the interval set by `update_instruments_interval_mins`.
+
+- Active markets are `TRADING` and delisted markets are `CLOSE`.
+- A market removed from the venue becomes `NOT_AVAILABLE_FOR_TRADING`. A failed metadata fetch does not
+  count as a removal.
+- Subscribing emits the current status immediately.
+
 ## Data subscriptions
 
 The adapter supports the following data subscriptions. All perpetual data types
@@ -713,6 +727,7 @@ The adapter supports the following data subscriptions. All perpetual data types
 | Mark prices       | ✓    | -        | -     | `MarkPriceUpdate`             | Perpetual mark price ticks.                      |
 | Index prices      | ✓    | -        | -     | `IndexPriceUpdate`            | Underlying reference prices.                     |
 | Funding rates     | ✓    | -        | ✓     | `FundingRateUpdate`           | `fundingHistory` endpoint.                       |
+| Instrument status | ✓    | ✓        | -     | `InstrumentStatus`            | Polled with the instrument refresh.              |
 | Open interest     | ✓    | -        | -     | `HyperliquidOpenInterest`     | Custom data from `activeAssetCtx`.               |
 | All mids          | ✓    | -        | -     | `HyperliquidAllMids`          | Custom data from `allMids`.                      |
 | All dex contexts  | ✓    | -        | -     | `HyperliquidAllDexsAssetCtxs` | Custom data from `allDexsAssetCtxs`.             |

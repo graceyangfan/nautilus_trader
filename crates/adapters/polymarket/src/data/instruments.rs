@@ -191,12 +191,14 @@ pub(super) fn publish_cached_condition_closed(
     instrument_update_state: &Arc<Mutex<InstrumentUpdateState>>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     data_sender: &EventSender<DataEvent>,
+    clock: &AtomicTime,
 ) -> usize {
     let update_state = instrument_update_state.lock();
     if update_state.retired {
         return 0;
     }
 
+    let ts_init = clock.get_time_ns();
     let mut updated = Vec::new();
 
     instruments.rcu(|map| {
@@ -212,6 +214,8 @@ pub(super) fn publish_cached_condition_closed(
                 && binary_market_closed(binary) != Some(true)
             {
                 set_market_closed(binary, true);
+                binary.ts_init = ts_init;
+                binary.ts_event = ts_init;
                 updated.push(InstrumentAny::BinaryOption(binary.clone()));
             }
         }
@@ -257,7 +261,12 @@ pub(super) fn cache_and_publish_instruments(
     now_ns: UnixNanos,
     instruments: Vec<InstrumentAny>,
 ) -> usize {
-    let mut total = 0;
+    let update_state = instrument_update_state.lock();
+    if update_state.retired {
+        return 0;
+    }
+
+    let mut pending = Vec::with_capacity(instruments.len());
 
     for instrument in instruments {
         if is_instrument_expired_and_not_reported_open(&instrument, now_ns) {
@@ -268,21 +277,50 @@ pub(super) fn cache_and_publish_instruments(
             continue;
         }
 
-        let instrument_id = instrument.id();
+        match update_state.compose_instrument(&instrument) {
+            Ok(instrument) => pending.push(instrument),
+            Err(e) => log::error!(
+                "Failed to apply live tick to instrument {}: {e}",
+                instrument.id()
+            ),
+        }
+    }
 
-        if apply_live_instrument(
-            closed_condition_ids,
-            instrument_update_state,
-            instruments_cache,
-            token_meta,
-            &instrument,
-            |instrument| {
-                if let Err(e) = data_sender.send(DataEvent::Instrument(instrument.clone())) {
-                    log::warn!("Failed to publish instrument {instrument_id}: {e}");
-                }
-            },
-        ) {
-            total += 1;
+    {
+        let terminal_conditions = closed_condition_ids.lock();
+        pending.retain(|instrument| {
+            !extract_condition_id(&instrument.id())
+                .is_ok_and(|condition_id| terminal_conditions.contains(&condition_id))
+        });
+
+        if pending.is_empty() {
+            return 0;
+        }
+
+        for instrument in &pending {
+            token_meta.insert(
+                Ustr::from(instrument.raw_symbol().as_str()),
+                TokenMeta::from_instrument(instrument),
+            );
+        }
+
+        // Batch cache writes while keeping closure checks and cache mutations ordered
+        instruments_cache.rcu(|map| {
+            map.extend(
+                pending
+                    .iter()
+                    .map(|instrument| (instrument.id(), instrument.clone())),
+            );
+        });
+    }
+
+    let total = pending.len();
+
+    // Keep the update guard through publication so live tick updates cannot overtake this batch
+    for instrument in pending {
+        let instrument_id = instrument.id();
+        if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
+            log::warn!("Failed to publish instrument {instrument_id}: {e}");
         }
     }
 
@@ -405,6 +443,7 @@ pub(super) async fn refresh_expired_market_closure(
     now_ns: UnixNanos,
     subscriptions: &super::subscriptions::DataSubscriptions,
     cancellation: Option<&CancellationToken>,
+    clock: &AtomicTime,
 ) -> anyhow::Result<usize> {
     let mut carried: AHashMap<String, Vec<InstrumentId>> = AHashMap::new();
 
@@ -461,6 +500,7 @@ pub(super) async fn refresh_expired_market_closure(
     // Compose against the latest cached value, so a concurrent tick size change is not discarded.
     // Guarded because `rcu` clones the whole cache, and most ticks have nothing to close.
     if !closing_ids.is_empty() {
+        let ts_init = clock.get_time_ns();
         cache.rcu(|map| {
             updated.clear();
 
@@ -469,6 +509,8 @@ pub(super) async fn refresh_expired_market_closure(
                     && binary_market_closed(binary) != Some(true)
                 {
                     set_market_closed(binary, true);
+                    binary.ts_init = ts_init;
+                    binary.ts_event = ts_init;
                     updated.push(InstrumentAny::BinaryOption(binary.clone()));
                 }
             }
@@ -816,12 +858,83 @@ mod tests {
     }
 
     #[rstest]
-    fn cache_and_publish_skips_terminal_condition() {
+    fn cache_and_publish_merges_batch_and_preserves_live_ticks() {
         let instruments = Arc::new(AtomicMap::new());
         let instrument_update_state = Arc::new(Mutex::new(InstrumentUpdateState::default()));
         let token_meta = Arc::new(DashMap::new());
-        let closed_condition_ids =
-            Arc::new(Mutex::new(AHashSet::from_iter(["terminal".to_string()])));
+        let existing =
+            stub_instrument("existing-token", Price::from("0.01"), Quantity::from("0.1"));
+        let stale = stub_instrument("updated-token", Price::from("0.01"), Quantity::from("0.1"));
+        cache_instrument_unchecked(&instruments, &token_meta, &existing);
+        cache_instrument_unchecked(&instruments, &token_meta, &stale);
+        let refreshed = stub_instrument(
+            "updated-token",
+            Price::from("0.01"),
+            Quantity::from("0.001"),
+        );
+        let added = stub_instrument("added-token", Price::from("0.01"), Quantity::from("0.1"));
+        let invalid = stub_instrument("invalid-token", Price::from("0.01"), Quantity::from("0.1"));
+        instrument_update_state.lock().record_live_tick(
+            Ustr::from("updated-token"),
+            "0.001".parse().unwrap(),
+            UnixNanos::from(42),
+        );
+        instrument_update_state.lock().record_live_tick(
+            Ustr::from("invalid-token"),
+            "-0.01".parse().unwrap(),
+            UnixNanos::from(43),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let total = cache_and_publish_instruments(
+            &Arc::new(Mutex::new(AHashSet::new())),
+            &instrument_update_state,
+            &instruments,
+            &token_meta,
+            &tx.into(),
+            UnixNanos::default(),
+            vec![refreshed.clone(), added.clone(), invalid.clone()],
+        );
+        let events = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| match event {
+                DataEvent::Instrument(instrument) => instrument,
+                _ => panic!("Expected instrument event"),
+            })
+            .collect::<Vec<_>>();
+        let updated = instruments.get_cloned(&refreshed.id()).unwrap();
+        let meta = token_meta.get(&Ustr::from("updated-token")).unwrap();
+
+        assert_eq!(total, 2);
+        assert_eq!(instruments.len(), 3);
+        assert_eq!(token_meta.len(), 3);
+        assert_eq!(instruments.get_cloned(&existing.id()), Some(existing));
+        assert_eq!(instruments.get_cloned(&added.id()), Some(added.clone()));
+        assert!(!instruments.contains_key(&invalid.id()));
+        assert!(!token_meta.contains_key(&Ustr::from("invalid-token")));
+        assert_eq!(updated.price_increment(), Price::from("0.001"));
+        assert_eq!(updated.size_increment(), Quantity::from("0.001"));
+        assert_eq!(updated.ts_event(), UnixNanos::from(42));
+        assert_eq!(meta.instrument_id, refreshed.id());
+        assert_eq!(meta.price_precision, 4);
+        assert_eq!(meta.size_precision, 3);
+        assert_eq!(events, vec![updated, added]);
+    }
+
+    #[rstest]
+    #[case::terminal_condition(false)]
+    #[case::retired_generation(true)]
+    fn cache_and_publish_skips_terminal_or_retired(#[case] retired: bool) {
+        let instruments = Arc::new(AtomicMap::new());
+        let instrument_update_state = Arc::new(Mutex::new(InstrumentUpdateState::default()));
+        let token_meta = Arc::new(DashMap::new());
+        let closed_condition_ids = Arc::new(Mutex::new(AHashSet::new()));
+
+        if retired {
+            instrument_update_state.lock().retire_generation();
+        } else {
+            closed_condition_ids.lock().insert("terminal".to_string());
+        }
+
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let instrument =
             stub_instrument("terminal-token", Price::from("0.01"), Quantity::from("0.1"));
@@ -1010,6 +1123,45 @@ mod tests {
         binary
     }
 
+    #[rstest]
+    fn cached_closure_updates_observation_timestamps_once() {
+        let instrument = InstrumentAny::BinaryOption(past_end_open_instrument());
+        let condition_id = extract_condition_id(&instrument.id()).unwrap();
+        let instruments = Arc::new(AtomicMap::new());
+        instruments.insert(instrument.id(), instrument.clone());
+        let update_state = Arc::new(Mutex::new(InstrumentUpdateState::default()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = tx.into();
+        let observed_at = UnixNanos::from(100);
+        let clock = AtomicTime::new(false, observed_at);
+        let publish = || {
+            publish_cached_condition_closed(
+                &condition_id,
+                &update_state,
+                &instruments,
+                &sender,
+                &clock,
+            )
+        };
+
+        assert_eq!(publish(), 1);
+        let DataEvent::Instrument(published) = rx.try_recv().unwrap() else {
+            panic!("Expected closure instrument event");
+        };
+        let cached = instruments.get_cloned(&instrument.id()).unwrap();
+
+        for updated in [&cached, &published] {
+            assert_eq!(updated.ts_init(), observed_at);
+            assert_eq!(updated.ts_event(), observed_at);
+            assert_eq!(market_closed(updated), Some(true));
+            assert_eq!(updated.price_increment(), instrument.price_increment());
+        }
+
+        clock.set_time(UnixNanos::from(101));
+        assert_eq!(publish(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
     fn requested_condition_ids(query: Option<&str>) -> Vec<String> {
         query
             .unwrap_or_default()
@@ -1057,7 +1209,11 @@ mod tests {
         #[case] closed: bool,
         #[case] fail: bool,
     ) {
-        let instrument = InstrumentAny::BinaryOption(past_end_open_instrument());
+        let binary = past_end_open_instrument();
+        let probe_time = UnixNanos::from(binary.expiration_ns.as_u64() + 1);
+        let observed_at = UnixNanos::from(probe_time.as_u64() + 1);
+        let clock = AtomicTime::new(false, probe_time);
+        let instrument = InstrumentAny::BinaryOption(binary);
         let instruments = Arc::new(AtomicMap::new());
         instruments.insert(instrument.id(), instrument.clone());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1081,15 +1237,27 @@ mod tests {
             ws_client,
             false,
         );
-        let result = refresh_expired_market_closure(
+        let sender = tx.into();
+        let mut refresh = Box::pin(refresh_expired_market_closure(
             &client,
             &instruments,
-            &tx.clone().into(),
-            UnixNanos::from(u64::MAX),
+            &sender,
+            probe_time,
             &subscriptions,
             None,
+            &clock,
+        ));
+        assert!(futures_util::poll!(&mut refresh).is_pending());
+        clock.set_time(observed_at);
+        let updated = crate::http::parse::rebuild_instrument_with_tick_size(
+            &instrument,
+            "0.005",
+            probe_time,
+            probe_time,
         )
-        .await;
+        .unwrap();
+        instruments.insert(instrument.id(), updated);
+        let result = refresh.await;
 
         if fail {
             assert!(result.is_err());
@@ -1098,20 +1266,37 @@ mod tests {
         }
 
         assert_eq!(result.unwrap(), usize::from(closed));
-        let cached = instruments.load();
-        let cached = cached.get(&instrument.id()).unwrap();
-        assert_eq!(market_closed(cached), Some(closed));
-        // Gamma reports a 0.01 tick size; the cached definition keeps its own 0.001.
-        assert_eq!(cached.price_increment(), Price::from("0.001"));
+        let cached = instruments.get_cloned(&instrument.id()).unwrap();
+        assert_eq!(market_closed(&cached), Some(closed));
+        // Gamma reports 0.01; preserve the tick size updated while the probe was pending
+        assert_eq!(cached.price_increment(), Price::from("0.005"));
 
         if closed {
+            assert_eq!(cached.ts_init(), observed_at);
+            assert_eq!(cached.ts_event(), observed_at);
             let event = rx.try_recv().expect("closure instrument event");
             let DataEvent::Instrument(published) = event else {
                 panic!("Expected instrument event, was {event:?}");
             };
             assert_eq!(published.id(), instrument.id());
             assert_eq!(market_closed(&published), Some(true));
-            assert_eq!(published.price_increment(), Price::from("0.001"));
+            assert_eq!(published.ts_init(), observed_at);
+            assert_eq!(published.ts_event(), observed_at);
+            assert_eq!(published.price_increment(), Price::from("0.005"));
+            assert_eq!(
+                refresh_expired_market_closure(
+                    &client,
+                    &instruments,
+                    &sender,
+                    observed_at,
+                    &subscriptions,
+                    None,
+                    &clock,
+                )
+                .await
+                .unwrap(),
+                0
+            );
             assert!(rx.try_recv().is_err());
         } else {
             assert!(rx.try_recv().is_err());
@@ -1191,6 +1376,7 @@ mod tests {
             UnixNanos::from(u64::MAX),
             &subscriptions,
             None,
+            &AtomicTime::default(),
         )
         .await;
 
