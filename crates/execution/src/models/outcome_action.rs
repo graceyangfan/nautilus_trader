@@ -613,6 +613,26 @@ mod tests {
     }
 
     #[rstest]
+    #[case(Currency::USD(), dec!(0.01), dec!(0.005))]
+    #[case(Currency::USDC(), dec!(0.00000001), dec!(0.000000005))]
+    fn test_action_commissions_preserve_subcurrency_allocations(
+        #[case] currency: Currency,
+        #[case] fee_rate: Decimal,
+        #[case] leg_fee: Decimal,
+    ) {
+        let (yes, no) = action_commissions(Decimal::ONE, currency, fee_rate).unwrap();
+        let total = Money::from_decimal(fee_rate, currency).unwrap();
+
+        assert!(leg_fee.scale() > u32::from(currency.precision));
+        assert_eq!(yes.currency, currency);
+        assert_eq!(no.currency, currency);
+        assert_eq!(yes.as_decimal(), leg_fee);
+        assert_eq!(no.as_decimal(), leg_fee);
+        assert_eq!(yes.raw() + no.raw(), total.raw());
+        assert_eq!(yes.as_decimal() + no.as_decimal(), total.as_decimal());
+    }
+
+    #[rstest]
     fn test_plan_split_creates_orderless_yes_and_no_fills() {
         let cache = cache_with_binary_option_pair("100 USDC", UnixNanos::from(2));
         let fills =
@@ -643,6 +663,43 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(err.to_string(), "Insufficient free USDC balance for split");
+    }
+
+    #[rstest]
+    #[case::insufficient("1.25 USDC", false)]
+    #[case::exact("1.25000001 USDC", true)]
+    fn test_plan_split_accounts_for_subcurrency_commissions(
+        #[case] free: &str,
+        #[case] accepted: bool,
+    ) {
+        let cache = cache_with_binary_option_pair(free, UnixNanos::from(2));
+        let command = split_command();
+        let profile = BinaryOptionActionProfile::new(
+            BinaryOptionActionConfig::new(dec!(0.000000008), Decimal::ZERO).unwrap(),
+            BinaryOptionActionValidatorHandle::new(TestValidator),
+        );
+
+        let result = plan_binary_option_action(&profile, &command, &cache, UnixNanos::from(1));
+
+        if accepted {
+            let fills = result.unwrap();
+            for fill in fills {
+                assert_eq!(fill.commission.unwrap().as_decimal(), dec!(0.000000005));
+            }
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "Insufficient free USDC balance for split"
+            );
+        }
+
+        assert_eq!(
+            cache
+                .try_account(&command.account_id)
+                .unwrap()
+                .balance_free(Some(Currency::USDC())),
+            Some(Money::from(free)),
+        );
     }
 
     #[rstest]
