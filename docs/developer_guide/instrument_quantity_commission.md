@@ -61,6 +61,11 @@ Canonical projected inventory prevents subsequent zero-fee or quote-fee fills
 from reintroducing deducted units through floating-point round trips. Remaining
 subquantum inventory is conservatively unavailable, not proof of zero holdings.
 This policy does not rewrite Native moving-average pricing or Money rounding.
+Upstream `Money::from_decimal_exact` supports sub-currency amounts for reported
+balances and venue fees without a custom Currency or Money implementation. Position's
+BUY/SELL handlers still reconstruct realized PnL at currency precision. Changing only
+the cost conversion to exact Money would therefore lose cost tails on the next fill;
+the cumulative cost projection retains that upstream Position convention.
 
 Original fills are the replay inputs; internal Commission adjustments are derived
 once. Ordinary Redis/SQL persistence rebuilds both totals from the original fills;
@@ -77,7 +82,7 @@ order or position state.
 - Reported cash accounts, long linear inventory, unit multiplier.
 - Positive Decimal inventory fees, including 18-decimal tails.
 - Native gross order completion, partial executions, duplicate replay and net lifecycle.
-- JSON, Arrow order events and Cap'n Proto order events retain the new field.
+- JSON and Arrow order events retain the new field; upstream no longer has Cap'n Proto support.
 
 Inverse products, shorts/flips, calculated accounts, price restatements and fill voids
 remain unsupported by this prototype and are rejected before application. An opening net
