@@ -7571,11 +7571,21 @@ fn test_purge_position() {
     let audusd_sim = InstrumentAny::CurrencyPair(audusd_sim);
 
     // Create an order and fill to generate a position
-    let order = OrderTestBuilder::new(OrderType::Market)
+    let mut order = OrderTestBuilder::new(OrderType::Market)
         .instrument_id(audusd_sim.id())
         .side(OrderSide::Buy)
         .quantity(Quantity::from(100_000))
         .build();
+
+    let account_id = AccountId::new("SIM-001");
+    let position_id = PositionId::new("P-123456");
+    cache
+        .add_order(order.clone(), Some(position_id), None, false)
+        .unwrap();
+    let submitted = TestOrderEventStubs::submitted(&order, account_id);
+    update_order_with_event(&mut cache, &mut order, submitted);
+    let accepted = TestOrderEventStubs::accepted(&order, account_id, VenueOrderId::new("V-OPEN"));
+    update_order_with_event(&mut cache, &mut order, accepted);
 
     let filled = TestOrderEventStubs::filled(
         &order,
@@ -7590,6 +7600,7 @@ fn test_purge_position() {
         None,
     );
 
+    update_order_with_event(&mut cache, &mut order, filled.clone());
     let mut position = Position::new(&audusd_sim, filled.into());
     let position_id = position.id;
 
@@ -7602,12 +7613,21 @@ fn test_purge_position() {
     assert_eq!(cache.positions_total_count(None, None, None, None, None), 1);
 
     // Close the position first (create a closing order and fill)
-    let order_close = OrderTestBuilder::new(OrderType::Market)
+    let mut order_close = OrderTestBuilder::new(OrderType::Market)
         .instrument_id(audusd_sim.id())
         .side(OrderSide::Sell)
         .quantity(Quantity::from(100_000))
         .client_order_id(ClientOrderId::new("O-19700101-000000-001-001-2"))
         .build();
+
+    cache
+        .add_order(order_close.clone(), Some(position_id), None, false)
+        .unwrap();
+    let submitted = TestOrderEventStubs::submitted(&order_close, account_id);
+    update_order_with_event(&mut cache, &mut order_close, submitted);
+    let accepted =
+        TestOrderEventStubs::accepted(&order_close, account_id, VenueOrderId::new("V-CLOSE"));
+    update_order_with_event(&mut cache, &mut order_close, accepted);
 
     let filled_close = TestOrderEventStubs::filled(
         &order_close,
@@ -7622,11 +7642,19 @@ fn test_purge_position() {
         None,
     );
 
+    update_order_with_event(&mut cache, &mut order_close, filled_close.clone());
     position.apply(&filled_close.into());
     cache.update_position(&position).unwrap();
 
     // Verify position is now closed
     assert!(position.is_closed());
+
+    let related = [order.client_order_id(), order_close.client_order_id()];
+    assert_eq!(position.client_order_ids().len(), related.len());
+
+    for id in related {
+        assert_eq!(cache.position_id(&id), Some(&position_id));
+    }
 
     // Purge the position
     cache.purge_position(position_id);
@@ -7634,6 +7662,14 @@ fn test_purge_position() {
     // Verify the position is gone
     assert!(!cache.position_exists(&position_id));
     assert_eq!(cache.positions_total_count(None, None, None, None, None), 0);
+
+    for id in related {
+        assert!(cache.order_exists(&id));
+        assert!(
+            cache.position_id(&id).is_none(),
+            "purged position must not retain a forward order link"
+        );
+    }
 }
 
 #[rstest]
@@ -13936,4 +13972,94 @@ fn test_cache_api_infallible_borrow_conflict_panics_with_context() {
     let api = CacheApi::new(&cell);
     let _guard = cell.borrow_mut();
     let _ = api.order(&ClientOrderId::from("BORROW-ORDER"));
+}
+
+#[rstest]
+#[case::same(false)]
+#[case::distinct(true)]
+fn test_purge_order_cleans_indexed_and_object_owner_links(#[case] distinct: bool) {
+    let mut cache = Cache::default();
+    let object_strategy = StrategyId::new("OBJECT-001");
+    let indexed_strategy = if distinct {
+        StrategyId::new("INDEX-001")
+    } else {
+        object_strategy
+    };
+    let indexed_position = PositionId::new("P-INDEX");
+    let object_position = if distinct {
+        PositionId::new("P-OBJECT")
+    } else {
+        indexed_position
+    };
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(InstrumentId::from("AUD/USD.SIM"))
+        .strategy_id(object_strategy)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(100_000))
+        .build();
+    let id = order.client_order_id();
+    cache
+        .add_order(order, Some(indexed_position), None, false)
+        .unwrap();
+    cache
+        .order_mut(&id)
+        .unwrap()
+        .set_position_id(Some(object_position));
+    cache.index.order_strategy.insert(id, indexed_strategy);
+    cache.index.strategies.insert(indexed_strategy);
+    cache
+        .index
+        .strategy_orders
+        .entry(indexed_strategy)
+        .or_default()
+        .insert(id);
+    let positions = AHashSet::from_iter([indexed_position, object_position]);
+    let mut strategies = AHashSet::from_iter([object_strategy, indexed_strategy]);
+
+    for (index, position) in positions.iter().enumerate() {
+        let strategy = StrategyId::new(format!("POSITION-{index:03}").as_str());
+        strategies.insert(strategy);
+        cache.index.strategies.insert(strategy);
+        cache.index.strategy_orders.entry(strategy).or_default();
+        cache
+            .index
+            .position_orders
+            .entry(*position)
+            .or_default()
+            .insert(id);
+        if let Some(previous) = cache.index.position_strategy.insert(*position, strategy)
+            && let Some(positions) = cache.index.strategy_positions.get_mut(&previous)
+        {
+            positions.remove(position);
+            if positions.is_empty() {
+                cache.index.strategy_positions.remove(&previous);
+            }
+        }
+        cache
+            .index
+            .strategy_positions
+            .entry(strategy)
+            .or_default()
+            .insert(*position);
+    }
+
+    cache.purge_order(id);
+
+    assert!(!cache.order_exists(&id));
+    for position in positions {
+        assert!(!cache.index.position_orders.contains_key(&position));
+        assert!(!cache.index.position_strategy.contains_key(&position));
+    }
+
+    for strategy in strategies {
+        assert!(
+            !cache.index.strategy_orders.contains_key(&strategy),
+            "{strategy}"
+        );
+        assert!(
+            !cache.index.strategy_positions.contains_key(&strategy),
+            "{strategy}"
+        );
+        assert!(!cache.index.strategies.contains(&strategy));
+    }
 }

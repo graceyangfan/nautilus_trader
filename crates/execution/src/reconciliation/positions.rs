@@ -28,7 +28,8 @@ use nautilus_model::{
         AvgPxReconciliation, LiquiditySide, OrderSide, OrderStatus, OrderType, PositionSide,
         TimeInForce,
     },
-    identifiers::{AccountId, InstrumentId, VenueOrderId},
+    events::OrderFilled,
+    identifiers::{AccountId, InstrumentId, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::Order,
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
@@ -488,18 +489,41 @@ pub fn check_position_reconciliation(
 /// to the position would count the execution twice.
 #[must_use]
 pub fn fill_precedes_snapshot_reconciled_position(cache: &Cache, report: &FillReport) -> bool {
+    snapshot_covers_fill(
+        cache,
+        report.account_id,
+        report.instrument_id,
+        report.trade_id,
+        report.ts_event,
+    )
+}
+
+pub(crate) fn fill_event_precedes_snapshot_reconciled_position(
+    cache: &Cache,
+    fill: &OrderFilled,
+) -> bool {
+    snapshot_covers_fill(
+        cache,
+        fill.account_id,
+        fill.instrument_id,
+        fill.trade_id,
+        fill.ts_event,
+    )
+}
+
+fn snapshot_covers_fill(
+    cache: &Cache,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    trade_id: TradeId,
+    ts_event: UnixNanos,
+) -> bool {
     cache
-        .positions_open(
-            None,
-            Some(&report.instrument_id),
-            None,
-            Some(&report.account_id),
-            None,
-        )
+        .positions_open(None, Some(&instrument_id), None, Some(&account_id), None)
         .into_iter()
         .any(|position| {
-            report.ts_event < position.ts_opened
-                && !position.trade_ids.contains(&report.trade_id)
+            ts_event < position.ts_opened
+                && !position.trade_ids.contains(&trade_id)
                 && cache
                     .order(&position.opening_order_id)
                     .is_some_and(|order| {

@@ -96,9 +96,9 @@ use rust_decimal::Decimal;
 use crate::{
     client::ExecutionClientAdapter,
     reconciliation::{
-        check_position_reconciliation, fill_precedes_snapshot_reconciled_position,
-        generate_external_order_status_events, generate_reconciliation_order_events,
-        generate_reconciliation_order_pre_fill_events,
+        check_position_reconciliation, fill_event_precedes_snapshot_reconciled_position,
+        fill_precedes_snapshot_reconciled_position, generate_external_order_status_events,
+        generate_reconciliation_order_events, generate_reconciliation_order_pre_fill_events,
         generate_reconciliation_order_snapshot_events, reconcile_fill_report as reconcile_fill,
     },
 };
@@ -3111,7 +3111,16 @@ impl ExecutionEngine {
     }
 
     fn handle_event(&mut self, event: &OrderEventAny) {
-        self.handle_event_with_position_application(event, true);
+        // A venue fill can follow a snapshot which already includes it, so direct WS events
+        // and reports check the same boundary on the engine thread, while synthetic
+        // reconciliation adjustments still update their position.
+        let apply_position = match event {
+            OrderEventAny::Filled(fill) if !fill.reconciliation => {
+                !fill_event_precedes_snapshot_reconciled_position(&self.cache.borrow(), fill)
+            }
+            _ => true,
+        };
+        self.handle_event_with_position_application(event, apply_position);
     }
 
     fn handle_event_with_position_application(

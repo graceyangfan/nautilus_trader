@@ -98,6 +98,7 @@ pub use position::CacheSnapshotRef;
 use position::PositionSnapshotFrame;
 pub use refs::{AccountRef, AccountRefMut, OrderRef, OrderRefMut, PositionRef, PositionRefMut};
 use rust_decimal::Decimal;
+use smallvec::SmallVec;
 use ustr::Ustr;
 pub use view::CacheView; // Re-export
 
@@ -1479,7 +1480,7 @@ impl Cache {
                 affected_order_list_ids.insert(order_list_id);
             }
 
-            if self.purge_order_except_aliases(client_order_id) {
+            if self.purge_order_except_aliases(client_order_id, log::Level::Debug) {
                 purged_client_order_ids.insert(client_order_id);
             }
         }
@@ -1488,6 +1489,7 @@ impl Cache {
             self.index
                 .venue_order_ids
                 .retain(|_, owner| !purged_client_order_ids.contains(owner));
+            log::info!("Purged {} closed orders", purged_client_order_ids.len());
         }
 
         for order_list_id in affected_order_list_ids {
@@ -1543,7 +1545,7 @@ impl Cache {
     ///
     /// For safety, an order is prevented from being purged if it's open.
     pub fn purge_order(&mut self, client_order_id: ClientOrderId) {
-        if self.purge_order_except_aliases(client_order_id) {
+        if self.purge_order_except_aliases(client_order_id, log::Level::Info) {
             self.index
                 .venue_order_ids
                 .retain(|_, owner| owner != &client_order_id);
@@ -1554,7 +1556,11 @@ impl Cache {
     /// caller to sweep by owner, so a bulk purge pays for one pass rather than one pass per order.
     ///
     /// Returns whether the order was purged, so a skipped purge leaves its aliases intact.
-    fn purge_order_except_aliases(&mut self, client_order_id: ClientOrderId) -> bool {
+    fn purge_order_except_aliases(
+        &mut self,
+        client_order_id: ClientOrderId,
+        log_level: log::Level,
+    ) -> bool {
         struct OrderDetails {
             is_open: bool,
             instrument_id: InstrumentId,
@@ -1668,25 +1674,26 @@ impl Cache {
             }
         }
 
-        let mut position_ids = AHashSet::new();
+        let mut position_ids = SmallVec::<[PositionId; 2]>::new();
         if let Some(position_id) = indexed_position_id {
-            position_ids.insert(position_id);
+            position_ids.push(position_id);
         }
 
         if let Some(position_id) = order_details
             .as_ref()
             .and_then(|details| details.position_id)
+            && !position_ids.contains(&position_id)
         {
-            position_ids.insert(position_id);
+            position_ids.push(position_id);
         }
 
-        let mut strategy_ids = AHashSet::new();
+        let mut strategy_ids = SmallVec::<[StrategyId; 4]>::new();
         if let Some(strategy_id) = indexed_strategy_id {
-            strategy_ids.insert(strategy_id);
+            strategy_ids.push(strategy_id);
         }
 
         if let Some(details) = &order_details {
-            strategy_ids.insert(details.strategy_id);
+            strategy_ids.push(details.strategy_id);
         }
 
         for position_id in position_ids {
@@ -1714,7 +1721,7 @@ impl Cache {
 
             self.index.position_orders.remove(&position_id);
             if let Some(strategy_id) = self.index.position_strategy.remove(&position_id) {
-                strategy_ids.insert(strategy_id);
+                strategy_ids.push(strategy_id);
                 if let Some(strategy_positions) =
                     self.index.strategy_positions.get_mut(&strategy_id)
                 {
@@ -1739,6 +1746,9 @@ impl Cache {
                 }
             }
         }
+
+        strategy_ids.sort_unstable();
+        strategy_ids.dedup();
 
         for strategy_id in strategy_ids {
             // An absent reverse bucket is not an empty one: it means the index is already
@@ -1778,7 +1788,7 @@ impl Cache {
         self.index.orders_pending_cancel.remove(&client_order_id);
 
         if order_details.is_some() {
-            log::info!("Purged order {client_order_id}");
+            log::log!(log_level, "Purged order {client_order_id}");
         }
 
         true
@@ -1788,14 +1798,19 @@ impl Cache {
     ///
     /// For safety, a position is prevented from being purged if it's open.
     pub fn purge_position(&mut self, position_id: PositionId) {
-        // Snapshot the position so we can release the borrow before mutating indexes.
-        let position = self
-            .positions
-            .get(&position_id)
-            .map(|cell| cell.borrow().clone());
+        // Cleanup needs metadata and owner IDs, not a second copy of replay history.
+        let position = self.positions.get(&position_id).map(|cell| {
+            let position = cell.borrow();
+            let order_ids = if position.is_open() {
+                Vec::new()
+            } else {
+                position.client_order_ids()
+            };
+            (position.clone_without_events(), order_ids)
+        });
 
         // Prevent purging open positions
-        if let Some(ref pos) = position
+        if let Some((pos, _)) = &position
             && pos.is_open()
         {
             log::warn!("Position {position_id} found open when purging, skipping purge");
@@ -1803,7 +1818,7 @@ impl Cache {
         }
 
         // If position exists in cache, remove it and clean up position-specific indices
-        if let Some(ref pos) = position {
+        if let Some((pos, order_ids)) = position {
             self.positions.remove(&position_id);
 
             // Remove from venue positions index
@@ -1872,7 +1887,7 @@ impl Cache {
             }
 
             // Remove position ID from orders that reference it
-            for client_order_id in pos.client_order_ids() {
+            for client_order_id in order_ids {
                 self.index.order_position.remove(&client_order_id);
             }
 

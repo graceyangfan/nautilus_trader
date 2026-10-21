@@ -117,6 +117,29 @@ impl OrderAny {
         }
     }
 
+    /// Returns the last order event without collecting the event history.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the order has no events (violates invariant).
+    #[must_use]
+    pub fn last_event(&self) -> &OrderEventAny {
+        let core: &OrderCore = match self {
+            Self::Limit(order) => order,
+            Self::LimitIfTouched(order) => order,
+            Self::Market(order) => order,
+            Self::MarketIfTouched(order) => order,
+            Self::MarketToLimit(order) => order,
+            Self::StopLimit(order) => order,
+            Self::StopMarket(order) => order,
+            Self::TrailingStopLimit(order) => order,
+            Self::TrailingStopMarket(order) => order,
+        };
+        core.events()
+            .last()
+            .expect("Order invariant violated: no events")
+    }
+
     /// Assigns the order to the list identified by `id`.
     ///
     /// # Panics
@@ -455,6 +478,22 @@ mod tests {
         assert_eq!(order.order_type(), OrderType::Market);
         assert_eq!(order.instrument_id(), init_event.instrument_id);
         assert_eq!(order.quantity(), init_event.quantity);
+    }
+
+    #[rstest]
+    #[case::limit(OrderType::Limit)]
+    #[case::limit_if_touched(OrderType::LimitIfTouched)]
+    #[case::market(OrderType::Market)]
+    #[case::market_if_touched(OrderType::MarketIfTouched)]
+    #[case::market_to_limit(OrderType::MarketToLimit)]
+    #[case::stop_limit(OrderType::StopLimit)]
+    #[case::stop_market(OrderType::StopMarket)]
+    #[case::trailing_stop_limit(OrderType::TrailingStopLimit)]
+    #[case::trailing_stop_market(OrderType::TrailingStopMarket)]
+    fn test_last_event_borrows_native_history(#[case] order_type: OrderType) {
+        let order = order_for_list_id_test(order_type);
+        let events = Order::events(&order);
+        assert!(std::ptr::eq(order.last_event(), *events.last().unwrap()));
     }
 
     #[rstest]

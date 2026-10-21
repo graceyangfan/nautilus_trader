@@ -18922,6 +18922,63 @@ fn open_external_audusd_position(
     client_order_id
 }
 
+fn process_report_as_live_fill(engine: &mut ExecutionEngine, report: &FillReport) {
+    let cached = report
+        .client_order_id
+        .and_then(|id| engine.cache().borrow().order_owned(&id));
+    let order = if let Some(order) = cached {
+        order
+    } else {
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .trader_id(TraderId::test_default())
+            .strategy_id(StrategyId::external())
+            .instrument_id(report.instrument_id)
+            .client_order_id(ClientOrderId::from("O-REPLAY-EVENT"))
+            .side(report.order_side)
+            .quantity(report.last_qty)
+            .build();
+        engine
+            .cache()
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("STUB")), true)
+            .unwrap();
+        engine.process(&TestOrderEventStubs::submitted(&order, report.account_id));
+        engine.process(&TestOrderEventStubs::accepted(
+            &order,
+            report.account_id,
+            report.venue_order_id,
+        ));
+        order
+    };
+    let instrument = engine
+        .cache()
+        .borrow()
+        .instrument(&report.instrument_id)
+        .unwrap()
+        .clone();
+    let mut fill = build_order_filled(
+        order.trader_id(),
+        order.strategy_id(),
+        order.instrument_id(),
+        order.client_order_id(),
+        report.venue_order_id,
+        report.account_id,
+        report.trade_id,
+        order.order_side(),
+        order.order_type(),
+        report.last_qty,
+        report.last_px,
+        instrument.quote_currency(),
+        report.liquidity_side,
+        report.venue_position_id,
+        Some(report.commission),
+    );
+    fill.ts_event = report.ts_event;
+    fill.quantity_commission = report.quantity_commission;
+    assert!(!fill.reconciliation);
+    engine.process(&OrderEventAny::Filled(fill));
+}
+
 #[rstest]
 #[case::reconciliation_opened_earlier_fill(true, 1_000_000, dec!(100_000), false)]
 #[case::fill_opened_earlier_fill(false, 1_000_000, dec!(200_000), true)]
@@ -18929,6 +18986,7 @@ fn open_external_audusd_position(
 #[case::reconciliation_opened_later_fill(true, 10_000_000, dec!(200_000), true)]
 fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
     mut execution_engine: ExecutionEngine,
+    #[values(false, true)] native_event: bool,
     #[case] reconciliation_opened: bool,
     #[case] replay_ts_event: u64,
     #[case] expected_qty: Decimal,
@@ -18949,7 +19007,11 @@ fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
         Price::from("1.00000"),
     );
     replayed.ts_event = UnixNanos::from(replay_ts_event);
-    execution_engine.reconcile_fill_report(&replayed);
+    if native_event {
+        process_report_as_live_fill(&mut execution_engine, &replayed);
+    } else {
+        execution_engine.reconcile_fill_report(&replayed);
+    }
 
     let cache = execution_engine.cache().borrow();
     let replay_client_order_id = cache
@@ -18975,6 +19037,7 @@ fn test_reconcile_fill_report_does_not_reopen_snapshot_reconciled_position(
 #[case::other_account(audusd_sim(), AccountId::from("SIM-002"))]
 fn test_reconcile_fill_report_applies_earlier_fill_outside_reconciled_position(
     mut execution_engine: ExecutionEngine,
+    #[values(false, true)] native_event: bool,
     #[case] instrument: CurrencyPair,
     #[case] account_id: AccountId,
 ) {
@@ -19027,7 +19090,12 @@ fn test_reconcile_fill_report_applies_earlier_fill_outside_reconciled_position(
         Quantity::from(100_000),
         Price::from("1.00000"),
     );
-    execution_engine.reconcile_fill_report(&report);
+
+    if native_event {
+        process_report_as_live_fill(&mut execution_engine, &report);
+    } else {
+        execution_engine.reconcile_fill_report(&report);
+    }
 
     let cache = execution_engine.cache().borrow();
     let order = cache.order(&client_order_id).unwrap();
