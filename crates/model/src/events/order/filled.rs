@@ -85,6 +85,9 @@ pub struct OrderFilled {
     pub position_id: Option<PositionId>,
     /// The commission generated from this execution.
     pub commission: Option<Money>,
+    /// Fee charged in inventory units of this instrument, exclusive of a nonzero currency fee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity_commission: Option<Quantity>,
     /// Additional fill metadata (venue/adapter specific).
     pub info: Option<IndexMap<Ustr, Ustr>>,
     /// The causation ID associated with the event.
@@ -138,6 +141,7 @@ impl OrderFilled {
             reconciliation,
             position_id,
             commission,
+            quantity_commission: None,
             info,
             causation_id: None,
         }
@@ -169,6 +173,11 @@ impl OrderFilled {
         opening_position_id: Option<PositionId>,
         opening_event_id: UUID4,
     ) -> anyhow::Result<(Self, Self)> {
+        anyhow::ensure!(
+            self.quantity_commission.is_none(),
+            "quantity commission does not support position flips"
+        );
+
         if let Some(commission) = self.commission {
             amount(commission)?;
         }
@@ -216,6 +225,9 @@ impl Debug for OrderFilled {
             Some(commission) => commission.to_string(),
             None => "None".to_string(),
         };
+        let quantity_commission_str = self
+            .quantity_commission
+            .map_or_else(String::new, |fee| format!(", quantity_commission={fee}"));
         write!(
             f,
             "{}(\
@@ -231,7 +243,7 @@ impl Debug for OrderFilled {
             order_type={}, \
             last_qty={}, \
             last_px={} {}, \
-            commission={}, \
+            commission={}{}, \
             liquidity_side={}, \
             event_id={}, \
             ts_event={}, \
@@ -251,6 +263,7 @@ impl Debug for OrderFilled {
             self.last_px.to_formatted_string(),
             self.currency,
             commission_str,
+            quantity_commission_str,
             self.liquidity_side,
             self.event_id,
             self.ts_event,
@@ -261,6 +274,9 @@ impl Debug for OrderFilled {
 
 impl Display for OrderFilled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quantity_commission_str = self
+            .quantity_commission
+            .map_or_else(String::new, |fee| format!(", quantity_commission={fee}"));
         write!(
             f,
             "{}(\
@@ -274,7 +290,7 @@ impl Display for OrderFilled {
             order_type={}, \
             last_qty={}, \
             last_px={} {}, \
-            commission={}, \
+            commission={}{}, \
             liquidity_side={}, \
             ts_event={})",
             stringify!(OrderFilled),
@@ -291,6 +307,7 @@ impl Display for OrderFilled {
             self.last_px.to_formatted_string(),
             self.currency,
             self.commission.unwrap_or(Money::from("0.0 USD")),
+            quantity_commission_str,
             self.liquidity_side,
             self.ts_event
         )
@@ -462,6 +479,10 @@ impl OrderEvent for OrderFilled {
         self.commission
     }
 
+    fn quantity_commission(&self) -> Option<Quantity> {
+        self.quantity_commission
+    }
+
     fn ts_event(&self) -> UnixNanos {
         self.ts_event
     }
@@ -526,6 +547,21 @@ mod tests {
             order_side=BUY, order_type=LIMIT, last_qty=0.561, last_px=22_000 USDT, \
             commission=12.20000000 USDT, liquidity_side=TAKER, ts_event=0)"
         );
+    }
+
+    #[rstest]
+    fn test_quantity_commission_is_visible_in_fill_text(mut order_filled: OrderFilled) {
+        order_filled.commission = Some(Money::zero(Currency::USDT()));
+        order_filled.quantity_commission = Some(Quantity::from("0.01"));
+        assert!(format!("{order_filled}").contains("quantity_commission=0.01"));
+        assert!(format!("{order_filled:?}").contains("quantity_commission=0.01"));
+    }
+
+    #[rstest]
+    fn test_negative_quantity_commission_is_rejected_during_decode(order_filled: OrderFilled) {
+        let mut data = serde_json::to_value(order_filled).unwrap();
+        data["quantity_commission"] = serde_json::json!("-0.01");
+        assert!(serde_json::from_value::<OrderFilled>(data).is_err());
     }
 
     #[rstest]

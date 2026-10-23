@@ -791,7 +791,14 @@ pub fn reconcile_fill_report(
         return None;
     }
 
-    let potential_filled_qty = order.filled_qty() + report.last_qty;
+    let Some(potential_filled_qty) = order.checked_filled_qty(report.last_qty) else {
+        log::error!(
+            "Cannot reconcile fill {}: order quantity exceeds representation bounds",
+            report.trade_id
+        );
+        return None;
+    };
+
     if potential_filled_qty > order.quantity() {
         if !allow_overfills {
             log::warn!(
@@ -832,7 +839,7 @@ pub fn reconcile_fill_report(
         report.trade_id,
     );
 
-    Some(OrderEventAny::Filled(OrderFilled::new(
+    let mut fill = OrderFilled::new(
         order.trader_id(),
         order.strategy_id(),
         order.instrument_id(),
@@ -853,7 +860,9 @@ pub fn reconcile_fill_report(
         report.venue_position_id,
         Some(report.commission),
         None,
-    )))
+    );
+    fill.quantity_commission = report.quantity_commission;
+    Some(OrderEventAny::Filled(fill))
 }
 
 /// Checks if the order should be updated based on quantity, price, or trigger price

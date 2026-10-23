@@ -63,8 +63,12 @@ mod serial_tests {
         },
         orders::{Order, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
         position::Position,
-        types::{Currency, Money, Price, Quantity},
+        types::{
+            Currency, Money, Price, Quantity,
+            fixed::{FIXED_PRECISION, check_fixed_precision},
+        },
     };
+    use rust_decimal::Decimal;
     use sqlx::PgPool;
     use ustr::Ustr;
 
@@ -920,6 +924,18 @@ mod serial_tests {
             .info(info.clone())
             .build();
         filled.causation_id = Some(causation_id);
+        assert_event_round_trip(&pool, &OrderEventAny::Filled(filled.clone())).await;
+        filled.event_id = UUID4::new();
+        filled.client_order_id = unique("quantity-fee");
+        filled.commission = Some(Money::zero(currency));
+        let precision = if check_fixed_precision(18).is_ok() {
+            18
+        } else {
+            FIXED_PRECISION
+        };
+        filled.quantity_commission = Some(
+            Quantity::from_decimal_dp(Decimal::new(1, u32::from(precision)), precision).unwrap(),
+        );
         assert_event_round_trip(&pool, &OrderEventAny::Filled(filled)).await;
 
         let mut fill_voided = OrderFillVoidedSpec::builder()
@@ -988,6 +1004,15 @@ mod serial_tests {
             .info(info)
             .build();
         fill.causation_id = Some(UUID4::new());
+        fill.commission = Some(Money::zero(currency));
+        let precision = if check_fixed_precision(18).is_ok() {
+            18
+        } else {
+            FIXED_PRECISION
+        };
+        fill.quantity_commission = Some(
+            Quantity::from_decimal_dp(Decimal::new(1, u32::from(precision)), precision).unwrap(),
+        );
 
         DatabaseQueries::add_position(&pool, position_id, &fill)
             .await

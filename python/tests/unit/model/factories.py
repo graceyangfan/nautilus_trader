@@ -50,7 +50,10 @@ from nautilus_trader.model import TriggerType
 from nautilus_trader.model import VenueOrderId
 
 
-def make_fill_report(instrument_id: InstrumentId) -> object:
+def make_fill_report(
+    instrument_id: InstrumentId,
+    quantity_commission: Quantity | None = None,
+) -> object:
     """
     Make fill report.
     """
@@ -62,7 +65,10 @@ def make_fill_report(instrument_id: InstrumentId) -> object:
         order_side=OrderSide.BUY,
         last_qty=Quantity.from_int(100_000),
         last_px=Price.from_str("1.00010"),
-        commission=Money.from_str("2.00 USD"),
+        commission=Money.from_str("2.00 USD")
+        if quantity_commission is None
+        else Money.from_str("0 USD"),
+        quantity_commission=quantity_commission,
         liquidity_side=LiquiditySide.TAKER,
         ts_event=10,
         ts_init=11,

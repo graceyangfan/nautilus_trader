@@ -53,6 +53,9 @@ pub struct FillReport {
     pub last_px: Price,
     /// The commission generated from the fill.
     pub commission: Money,
+    /// Fee charged in inventory units of this instrument; currency commission must be zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity_commission: Option<Quantity>,
     /// The liquidity side of the execution.
     pub liquidity_side: LiquiditySide,
     /// The cumulative or chunk average execution price when provided by the venue.
@@ -98,6 +101,7 @@ impl FillReport {
             last_qty,
             last_px,
             commission,
+            quantity_commission: None,
             liquidity_side,
             avg_px: None,
             report_id: report_id.unwrap_or_default(),
@@ -123,9 +127,12 @@ impl FillReport {
 
 impl Display for FillReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quantity_commission_str = self
+            .quantity_commission
+            .map_or_else(String::new, |fee| format!(", quantity_commission={fee}"));
         write!(
             f,
-            "FillReport(instrument={}, side={}, qty={}, last_px={}, trade_id={}, venue_order_id={}, commission={}, liquidity={})",
+            "FillReport(instrument={}, side={}, qty={}, last_px={}, trade_id={}, venue_order_id={}, commission={}{}, liquidity={})",
             self.instrument_id,
             self.order_side,
             self.last_qty,
@@ -133,6 +140,7 @@ impl Display for FillReport {
             self.trade_id,
             self.venue_order_id,
             self.commission,
+            quantity_commission_str,
             self.liquidity_side,
         )
     }
@@ -167,6 +175,16 @@ mod tests {
             UnixNanos::from(2_000_000_000),
             None,
         )
+    }
+
+    #[rstest]
+    fn test_quantity_commission_is_visible_in_report_text() {
+        let mut report = test_fill_report();
+        let before = report.to_string();
+        assert!(!before.contains("quantity_commission"));
+        report.commission = Money::zero(Currency::USD());
+        report.quantity_commission = Some(Quantity::from("0.64"));
+        assert!(report.to_string().contains("quantity_commission=0.64"));
     }
 
     #[rstest]

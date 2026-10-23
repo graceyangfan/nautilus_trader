@@ -351,10 +351,30 @@ pub trait Order: 'static + Send {
     fn leaves_qty(&self) -> Quantity;
     fn overfill_qty(&self) -> Quantity;
 
+    /// Returns gross filled quantity after an exact scale-aligned addition.
+    ///
+    /// Returns `None` if the order or fill cannot be represented at the common scale.
+    fn checked_filled_qty(&self, fill_qty: Quantity) -> Option<Quantity> {
+        let precision = self
+            .quantity()
+            .precision
+            .max(self.filled_qty().precision)
+            .max(fill_qty.precision);
+        self.quantity().checked_rescale(precision)?;
+        self.filled_qty()
+            .checked_rescale(precision)?
+            .checked_add(fill_qty.checked_rescale(precision)?)
+    }
+
     /// Calculates potential overfill quantity without mutating order state.
     fn calculate_overfill(&self, fill_qty: Quantity) -> Quantity {
-        let potential_filled = self.filled_qty() + fill_qty;
-        let quantity = self.quantity();
+        let potential_filled = self
+            .checked_filled_qty(fill_qty)
+            .expect("fill quantity bounds pre-checked");
+        let quantity = self
+            .quantity()
+            .checked_rescale(potential_filled.precision)
+            .expect("order quantity scale pre-checked");
         if potential_filled > quantity {
             potential_filled - quantity
         } else {
@@ -913,16 +933,47 @@ impl OrderCore {
             self.status.transition(&event)?
         };
 
-        if let OrderEventAny::Filled(fill) = &event
-            && self.filled_qty.checked_add(fill.last_qty).is_none()
-        {
-            return Err(CorrectnessError::PredicateViolation {
-                message: format!(
-                    "filled quantity overflowed Quantity raw bounds: {} + {}",
-                    self.filled_qty, fill.last_qty
-                ),
+        // Prepare scale changes before any state mutation; original event facts remain unchanged
+        let current_precision = self
+            .quantity
+            .precision
+            .max(self.filled_qty.precision)
+            .max(self.leaves_qty.precision)
+            .max(self.voided_qty.precision)
+            .max(self.non_reopened_voided_qty.precision)
+            .max(self.overfill_qty.precision);
+        let precision = match &event {
+            OrderEventAny::Filled(fill) => current_precision.max(fill.last_qty.precision),
+            OrderEventAny::Updated(update) => current_precision.max(update.quantity.precision),
+            OrderEventAny::FillVoided(void) => current_precision.max(void.voided_qty.precision),
+            _ => current_precision,
+        };
+        let quantities = self.prepare_quantity_scale(precision)?;
+        if let OrderEventAny::Updated(update) = &event {
+            update.quantity.checked_rescale(precision).ok_or_else(|| {
+                OrderError::Invariant(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "updated quantity {} cannot be rescaled exactly to precision {precision}",
+                        update.quantity
+                    ),
+                })
+            })?;
+        }
+
+        if let OrderEventAny::Filled(fill) = &event {
+            let sum = self
+                .filled_qty
+                .checked_rescale(precision)
+                .and_then(|filled| filled.checked_add(fill.last_qty.checked_rescale(precision)?));
+            if sum.is_none() {
+                return Err(CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "filled quantity overflowed Quantity raw bounds: {} + {}",
+                        self.filled_qty, fill.last_qty
+                    ),
+                }
+                .into());
             }
-            .into());
         }
 
         let rejection_status = if matches!(
@@ -956,6 +1007,15 @@ impl OrderCore {
         }
 
         let source_status = self.status;
+
+        if let Some([quantity, filled, voided, non_reopened, leaves, overfill]) = quantities {
+            self.quantity = quantity;
+            self.filled_qty = filled;
+            self.voided_qty = voided;
+            self.non_reopened_voided_qty = non_reopened;
+            self.leaves_qty = leaves;
+            self.overfill_qty = overfill;
+        }
 
         // Save current status as previous_status for ALL transitions except:
         // - Initialized (no prior state exists)
@@ -1005,6 +1065,44 @@ impl OrderCore {
         self.ts_last = event.ts_event();
         self.events.push(event);
         Ok(())
+    }
+
+    fn prepare_quantity_scale(&self, precision: u8) -> Result<Option<[Quantity; 6]>, OrderError> {
+        if precision <= crate::types::fixed::FIXED_PRECISION || precision == self.quantity.precision
+        {
+            return Ok(None);
+        }
+        let rescale = |quantity: Quantity| -> Result<Quantity, OrderError> {
+            quantity.checked_rescale(precision).ok_or_else(|| {
+                CorrectnessError::PredicateViolation {
+                    message: format!(
+                        "order quantity {quantity} exceeds precision {precision} bounds"
+                    ),
+                }
+                .into()
+            })
+        };
+
+        // Retained fills also participate in correction replay after a scale promotion
+        for event in &self.events {
+            match event {
+                OrderEventAny::Filled(fill) => {
+                    rescale(fill.last_qty)?;
+                }
+                OrderEventAny::FillVoided(void) => {
+                    rescale(void.voided_qty)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(Some([
+            rescale(self.quantity)?,
+            rescale(self.filled_qty)?,
+            rescale(self.voided_qty)?,
+            rescale(self.non_reopened_voided_qty)?,
+            rescale(self.leaves_qty)?,
+            rescale(self.overfill_qty)?,
+        ]))
     }
 
     fn denied(&mut self, event: &OrderDenied) {
@@ -1240,7 +1338,19 @@ impl OrderCore {
                 matched_corrections.insert(fill.trade_id);
             }
             let removed = Self::removed_fill_qty(fill, correction);
-            let effective = fill.last_qty - removed;
+            let precision = self
+                .quantity
+                .precision
+                .max(fill.last_qty.precision)
+                .max(removed.precision);
+            let removed = removed
+                .checked_rescale(precision)
+                .expect("correction scale pre-checked");
+            let effective = fill
+                .last_qty
+                .checked_rescale(removed.precision)
+                .expect("fill scale pre-checked")
+                - removed;
             voided = voided.saturating_add(removed);
             if correction.is_some_and(|event| !event.is_reopened) {
                 non_reopened_voided = non_reopened_voided.saturating_add(removed);
@@ -1276,7 +1386,14 @@ impl OrderCore {
 
         for (trade_id, correction) in corrections {
             if !matched_corrections.contains(&trade_id) {
-                voided = voided.saturating_add(correction.voided_qty);
+                voided = voided.saturating_add(
+                    correction
+                        .voided_qty
+                        .checked_rescale(
+                            self.quantity.precision.max(correction.voided_qty.precision),
+                        )
+                        .expect("correction scale pre-checked"),
+                );
             }
         }
 
@@ -1324,7 +1441,13 @@ impl OrderCore {
     /// non-reopened voided quantity so it does not become working again (see
     /// `docs/concepts/events/order_fill_voided.md`).
     pub(crate) fn apply_updated_quantity(&mut self, new_quantity: Quantity) {
-        self.quantity = new_quantity;
+        self.quantity = if self.quantity.precision > crate::types::fixed::FIXED_PRECISION {
+            new_quantity
+                .checked_rescale(self.quantity.precision.max(new_quantity.precision))
+                .expect("updated quantity scale pre-checked")
+        } else {
+            new_quantity
+        };
         let unfilled_qty = self.quantity.saturating_sub(self.filled_qty);
         let voided_qty = self.non_reopened_voided_qty;
 
@@ -1338,9 +1461,13 @@ impl OrderCore {
     }
 
     fn filled(&mut self, event: &OrderFilled, source_status: OrderStatus) {
+        let last_qty = event
+            .last_qty
+            .checked_rescale(self.quantity.precision.max(event.last_qty.precision))
+            .expect("fill quantity scale pre-checked");
         let new_filled_qty = self
             .filled_qty
-            .checked_add(event.last_qty)
+            .checked_add(last_qty)
             .expect("fill quantity bounds pre-checked");
 
         // Calculate overfill if any
@@ -1349,7 +1476,7 @@ impl OrderCore {
             self.overfill_qty = self.overfill_qty.saturating_add(overfill);
         }
 
-        let new_leaves_qty = self.leaves_qty.saturating_sub(event.last_qty);
+        let new_leaves_qty = self.leaves_qty.saturating_sub(last_qty);
 
         if new_filled_qty >= self.quantity {
             self.status = OrderStatus::Filled;
@@ -3979,6 +4106,175 @@ mod tests {
         assert_eq!(order.overfill_qty(), Quantity::from(0));
         assert_eq!(order.filled_qty(), Quantity::from(100_000));
         assert_eq!(order.leaves_qty(), Quantity::from(0));
+    }
+
+    #[rstest]
+    #[case("1")]
+    #[case("1.0000")]
+    fn test_ordinary_quantity_update_and_void_preserve_precision(#[case] void_qty: &str) {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from("10.000"))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from("4.000"))
+            .build();
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        order
+            .apply(OrderEventAny::Updated(
+                OrderUpdatedSpec::builder()
+                    .quantity(Quantity::from(12))
+                    .build(),
+            ))
+            .unwrap();
+        assert_eq!(order.quantity().precision, 0);
+        order
+            .apply(OrderEventAny::FillVoided(matching_fill_void(
+                &fill,
+                Quantity::from(void_qty),
+                None,
+            )))
+            .unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(3));
+        assert_eq!(order.voided_qty(), Quantity::from(1));
+        assert_eq!(order.leaves_qty(), Quantity::from(9));
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+        assert_eq!(replayed.filled_qty(), order.filled_qty());
+        assert_eq!(replayed.leaves_qty(), order.leaves_qty());
+    }
+
+    #[rstest]
+    fn test_ordinary_unmatched_void_preserves_quantity_precision() {
+        let (mut order, _, _, fill) = accepted_order_with_first_fill();
+        let void = OrderFillVoided {
+            trade_id: TradeId::from("UNMATCHED"),
+            is_reopened: false,
+            ..matching_fill_void(&fill, Quantity::from("1.0000"), None)
+        };
+        order.apply(OrderEventAny::FillVoided(void)).unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(4));
+        assert_eq!(order.voided_qty(), Quantity::from(1));
+        assert_eq!(order.quantity().precision, 0);
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_atomic_gross_mixed_scales_update_duplicate_and_replay() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(100))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let first = OrderFilledSpec::builder()
+            .last_qty(Quantity::from("17.000000000000000001"))
+            .trade_id(TradeId::from("ATOMIC-1"))
+            .build();
+        assert_eq!(
+            order.checked_filled_qty(first.last_qty),
+            Some(first.last_qty)
+        );
+        order.apply(OrderEventAny::Filled(first.clone())).unwrap();
+        assert_eq!(order.filled_qty(), first.last_qty);
+        assert_eq!(order.leaves_qty(), Quantity::from("82.999999999999999999"));
+        let before = serde_json::to_value(&order).unwrap();
+        assert!(matches!(
+            order.apply(OrderEventAny::Filled(first.clone())),
+            Err(OrderError::DuplicateFill(_))
+        ));
+        assert_eq!(serde_json::to_value(&order).unwrap(), before);
+
+        let update = OrderUpdatedSpec::builder()
+            .quantity(Quantity::from(101))
+            .build();
+        order.apply(OrderEventAny::Updated(update)).unwrap();
+        assert_eq!(order.leaves_qty(), Quantity::from("83.999999999999999999"));
+        let mut restored: MarketOrder =
+            serde_json::from_value(serde_json::to_value(&order).unwrap()).unwrap();
+
+        for (id, qty) in [("ATOMIC-2", "5"), ("ATOMIC-3", "78.999999999999999999")] {
+            let fill = OrderFilledSpec::builder()
+                .last_qty(Quantity::from(qty))
+                .trade_id(TradeId::from(id))
+                .build();
+            order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+            restored.apply(OrderEventAny::Filled(fill)).unwrap();
+        }
+        assert_eq!(order.status(), OrderStatus::Filled);
+        assert_eq!(order.filled_qty(), Quantity::from(101));
+        assert!(order.leaves_qty().is_zero());
+        assert!(order.overfill_qty().is_zero());
+        assert_eq!(
+            serde_json::to_value(&order).unwrap(),
+            serde_json::to_value(&restored).unwrap()
+        );
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+        assert_eq!(replayed.filled_qty(), order.filled_qty());
+        assert_eq!(replayed.leaves_qty(), order.leaves_qty());
+        assert_eq!(replayed.avg_px(), order.avg_px());
+        assert!(
+            matches!(order.events()[2], OrderEventAny::Filled(fill) if fill.last_qty == first.last_qty)
+        );
+    }
+
+    #[cfg(feature = "defi")]
+    #[rstest]
+    fn test_atomic_gross_void_overfill_and_scale_failure() {
+        let init = OrderInitializedSpec::builder()
+            .quantity(Quantity::from(10))
+            .build();
+        let mut order: MarketOrder = init.try_into().unwrap();
+        order
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let fill = OrderFilledSpec::builder()
+            .last_qty(Quantity::from("10.000000000000000001"))
+            .build();
+        assert_eq!(
+            order.calculate_overfill(fill.last_qty),
+            Quantity::from("0.000000000000000001")
+        );
+        order.apply(OrderEventAny::Filled(fill.clone())).unwrap();
+        assert_eq!(order.overfill_qty(), Quantity::from("0.000000000000000001"));
+        order
+            .apply(OrderEventAny::FillVoided(matching_fill_void(
+                &fill,
+                Quantity::from("0.000000000000000001"),
+                None,
+            )))
+            .unwrap();
+        assert_eq!(order.filled_qty(), Quantity::from(10));
+        assert_eq!(order.voided_qty(), Quantity::from("0.000000000000000001"));
+        let replayed =
+            OrderAny::from_events(order.events().into_iter().cloned().collect()).unwrap();
+        assert_eq!(replayed.filled_qty(), order.filled_qty());
+
+        let max = Quantity::from_raw(QUANTITY_RAW_MAX, 0);
+        let mut too_large: MarketOrder = OrderInitializedSpec::builder()
+            .quantity(max)
+            .build()
+            .try_into()
+            .unwrap();
+        too_large
+            .apply(OrderEventAny::Accepted(
+                OrderAcceptedSpec::builder().build(),
+            ))
+            .unwrap();
+        let before = serde_json::to_value(&too_large).unwrap();
+        assert!(too_large.apply(OrderEventAny::Filled(fill)).is_err());
+        assert_eq!(serde_json::to_value(&too_large).unwrap(), before);
     }
 
     #[rstest]

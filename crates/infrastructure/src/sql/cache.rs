@@ -414,9 +414,11 @@ async fn check_schema_migrated(pool: &PgPool) -> Result<(), sqlx::Error> {
             ('order_event', 'is_reopened'),
             ('order_event', 'info'),
             ('order_event', 'causation_id'),
+            ('order_event', 'quantity_commission'),
             ('position_event', 'reconciliation'),
             ('position_event', 'info'),
-            ('position_event', 'causation_id')
+            ('position_event', 'causation_id'),
+            ('position_event', 'quantity_commission')
         ) AS required(table_name, column_name)
         WHERE NOT EXISTS (
             SELECT 1

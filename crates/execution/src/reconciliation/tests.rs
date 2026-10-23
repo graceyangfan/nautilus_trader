@@ -18,6 +18,7 @@
 
 use std::cmp::Ordering;
 
+use indexmap::IndexSet;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{
@@ -1492,6 +1493,107 @@ fn create_limit_order_report(
         UnixNanos::from(4_500),
         None,
     )
+}
+
+#[rstest]
+#[case::separate_orders(false)]
+#[case::spanning_order(true)]
+fn test_quantity_commission_reconciliation_detects_net_zero_crossing(
+    instrument: InstrumentAny,
+    #[case] spanning_order: bool,
+    #[values(false, true)] generate_synthetic: bool,
+) {
+    let original =
+        create_two_lifecycle_mass_status(&instrument, vec![], Quantity::from("0.10"), dec!(4050));
+    let mut fills: Vec<_> = original.fill_reports().into_values().flatten().collect();
+    fills[0].quantity_commission = Some(Quantity::from("0.01"));
+    fills[1].last_qty = Quantity::from("0.04");
+    if spanning_order {
+        for fill in &mut fills {
+            fill.venue_order_id = VenueOrderId::from("SPANNING");
+        }
+    }
+    let mut mass_status = ExecutionMassStatus::new(
+        original.client_id,
+        original.account_id,
+        original.venue,
+        original.ts_init,
+        None,
+    );
+    mass_status.add_fill_reports(fills.clone());
+    mass_status.add_position_reports(
+        original
+            .position_reports()
+            .into_values()
+            .flatten()
+            .collect(),
+    );
+    let result = if generate_synthetic {
+        process_mass_status_for_reconciliation(&mass_status, &instrument, None)
+    } else {
+        process_mass_status_for_reconciliation_without_synthetic_reports(
+            &mass_status,
+            &instrument,
+            None,
+        )
+    }
+    .unwrap();
+    let expected = if spanning_order {
+        fills.as_slice()
+    } else {
+        &fills[2..]
+    };
+    let actual: Vec<_> = result.fills.into_values().flatten().collect();
+    assert_eq!(actual.as_slice(), expected);
+    assert!(result.orders.is_empty());
+    assert!(result.order_only_ids.is_empty());
+    let expected_keys: IndexSet<_> = if spanning_order {
+        fills[..2]
+            .iter()
+            .map(|fill| (fill.account_id, fill.instrument_id, fill.trade_id))
+            .collect()
+    } else {
+        Default::default()
+    };
+    assert_eq!(result.order_only_fill_keys, expected_keys);
+}
+
+#[rstest]
+#[case::zero_fee("0", OrderSide::Buy, false)]
+#[case::equal_fee("0.05", OrderSide::Buy, false)]
+#[case::excess_fee("0.06", OrderSide::Buy, false)]
+#[case::sell_fee("0.01", OrderSide::Sell, false)]
+#[case::currency_fee("0.01", OrderSide::Buy, true)]
+fn test_quantity_commission_reconciliation_rejects_invalid_projection(
+    instrument: InstrumentAny,
+    #[case] fee: &str,
+    #[case] side: OrderSide,
+    #[case] currency_fee: bool,
+) {
+    let original =
+        create_two_lifecycle_mass_status(&instrument, vec![], Quantity::from("0.10"), dec!(4050));
+    let mut fills: Vec<_> = original.fill_reports().into_values().flatten().collect();
+    fills[0].quantity_commission = Some(Quantity::from(fee));
+    fills[0].order_side = side;
+    if currency_fee {
+        fills[0].commission = Money::from("1 USD");
+    }
+    let mut mass_status = ExecutionMassStatus::new(
+        original.client_id,
+        original.account_id,
+        original.venue,
+        original.ts_init,
+        None,
+    );
+    mass_status.add_fill_reports(fills);
+    mass_status.add_position_reports(
+        original
+            .position_reports()
+            .into_values()
+            .flatten()
+            .collect(),
+    );
+    assert!(process_mass_status_for_reconciliation(&mass_status, &instrument, None).is_err());
 }
 
 #[rstest]

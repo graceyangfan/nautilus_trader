@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS "order_event" (
     account_id TEXT,
     position_id TEXT,
     commission TEXT,
+    quantity_commission TEXT,
     tags TEXT[],
     released_price TEXT,
     protection_price TEXT,
@@ -233,6 +234,7 @@ ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS correction_id TEXT;
 ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS is_reopened BOOLEAN DEFAULT FALSE;
 ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS info JSONB;
 ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS causation_id TEXT;
+ALTER TABLE "order_event" ADD COLUMN IF NOT EXISTS quantity_commission TEXT;
 
 CREATE TABLE IF NOT EXISTS "order_position_index" (
     trader_id TEXT NOT NULL REFERENCES trader(id) ON DELETE CASCADE,
@@ -265,6 +267,7 @@ CREATE TABLE IF NOT EXISTS "position_event" (
     liquidity_side TEXT NOT NULL,
     position_id TEXT NOT NULL,
     commission TEXT,
+    quantity_commission TEXT,
     reconciliation BOOLEAN DEFAULT FALSE,
     info JSONB,
     causation_id TEXT,
@@ -279,6 +282,7 @@ CREATE TABLE IF NOT EXISTS "position_event" (
 ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS reconciliation BOOLEAN DEFAULT FALSE;
 ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS info JSONB;
 ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS causation_id TEXT;
+ALTER TABLE "position_event" ADD COLUMN IF NOT EXISTS quantity_commission TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_position_event_position_id
     ON position_event(position_id, event_sequence);

@@ -30,7 +30,7 @@ pub(super) struct FillSnapshot {
     pub venue_order_id: VenueOrderId,
     /// The order side (BUY or SELL).
     pub side: OrderSide,
-    /// The fill quantity.
+    /// The inventory quantity contributed by the fill, net of any quantity commission.
     pub qty: Decimal,
     /// The fill price.
     pub px: Decimal,

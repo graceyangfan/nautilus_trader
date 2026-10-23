@@ -269,6 +269,7 @@ const ORDER_FILLED_FIELDS: &[JsonFieldSpec] = &[
     JsonFieldSpec::utf8("position_id", true),
     JsonFieldSpec::utf8("commission", true),
     JsonFieldSpec::utf8_json("info", true),
+    JsonFieldSpec::utf8("quantity_commission", true),
 ];
 
 const ORDER_FILL_VOIDED_FIELDS: &[JsonFieldSpec] = &[
@@ -306,6 +307,9 @@ fn instrument_metadata(type_name: &'static str, instrument_id: &str) -> HashMap<
 
 macro_rules! impl_order_event_arrow {
     ($type:ty, $type_name:expr, $fields:expr) => {
+        impl_order_event_arrow!($type, $type_name, $fields, |_| $fields);
+    };
+    ($type:ty, $type_name:expr, $fields:expr, $decode_fields:expr) => {
         impl ArrowSchemaProvider for $type {
             fn get_schema(metadata: Option<HashMap<String, String>>) -> Schema {
                 schema_for_type($type_name, metadata, $fields)
@@ -338,7 +342,8 @@ macro_rules! impl_order_event_arrow {
                 metadata: &HashMap<String, String>,
                 record_batch: RecordBatch,
             ) -> Result<Vec<Self>, EncodingError> {
-                decode_batch(metadata, &record_batch, $fields, Some($type_name))
+                let fields = ($decode_fields)(&record_batch);
+                decode_batch(metadata, &record_batch, fields, Some($type_name))
             }
         }
     };
@@ -379,7 +384,22 @@ impl_order_event_arrow!(
     ORDER_MODIFY_REJECTED_FIELDS
 );
 impl_order_event_arrow!(OrderUpdated, "OrderUpdated", ORDER_UPDATED_FIELDS);
-impl_order_event_arrow!(OrderFilled, "OrderFilled", ORDER_FILLED_FIELDS);
+// Older monetary-only batches have no quantity-fee column. Keep the existing fields
+// strict while letting serde supply None for this additive fee attribute.
+fn order_filled_decode_fields(batch: &RecordBatch) -> &'static [JsonFieldSpec] {
+    if batch.schema().index_of("quantity_commission").is_ok() {
+        ORDER_FILLED_FIELDS
+    } else {
+        &ORDER_FILLED_FIELDS[..ORDER_FILLED_FIELDS.len() - 1]
+    }
+}
+
+impl_order_event_arrow!(
+    OrderFilled,
+    "OrderFilled",
+    ORDER_FILLED_FIELDS,
+    order_filled_decode_fields
+);
 impl_order_event_arrow!(OrderFillVoided, "OrderFillVoided", ORDER_FILL_VOIDED_FIELDS);
 
 #[cfg(test)]
@@ -400,7 +420,10 @@ mod tests {
             },
         },
         identifiers::PositionId,
-        types::{Money, Quantity},
+        types::{
+            Money, Quantity,
+            fixed::{FIXED_PRECISION, check_fixed_precision},
+        },
     };
     use rstest::rstest;
     use rust_decimal::Decimal;
@@ -432,6 +455,35 @@ mod tests {
         let decoded = OrderFilled::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
 
         assert_eq!(decoded, vec![event]);
+    }
+
+    #[rstest]
+    fn test_order_filled_quantity_commission_round_trip(mut order_filled: OrderFilled) {
+        let precision = if check_fixed_precision(18).is_ok() {
+            18
+        } else {
+            FIXED_PRECISION
+        };
+        order_filled.commission = Some(Money::zero(order_filled.currency));
+        order_filled.quantity_commission = Some(
+            Quantity::from_decimal_dp(Decimal::new(1, u32::from(precision)), precision).unwrap(),
+        );
+        let metadata = order_filled.metadata();
+        let batch =
+            OrderFilled::encode_batch(&metadata, std::slice::from_ref(&order_filled)).unwrap();
+        let decoded = OrderFilled::decode_typed_batch(batch.schema().metadata(), batch).unwrap();
+        assert_eq!(decoded, vec![order_filled]);
+    }
+
+    #[rstest]
+    fn test_order_filled_without_quantity_commission_column(order_filled: OrderFilled) {
+        let metadata = order_filled.metadata();
+        let batch =
+            OrderFilled::encode_batch(&metadata, std::slice::from_ref(&order_filled)).unwrap();
+        let columns: Vec<_> = (0..batch.num_columns() - 1).collect();
+        let legacy = batch.project(&columns).unwrap();
+        let decoded = OrderFilled::decode_typed_batch(legacy.schema().metadata(), legacy).unwrap();
+        assert_eq!(decoded, vec![order_filled]);
     }
 
     #[rstest]

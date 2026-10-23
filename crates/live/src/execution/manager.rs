@@ -3103,6 +3103,8 @@ impl ExecutionManager {
         let mut matched = false;
         let mut quantity = Quantity::zero(report.last_qty.precision);
         let mut commission = Money::zero(report.commission.currency);
+        let mut quantity_commission =
+            Quantity::zero(report.quantity_commission.unwrap_or_default().precision);
 
         for position in positions {
             if flip.map_or_else(
@@ -3112,7 +3114,7 @@ impl ExecutionManager {
                 continue;
             }
 
-            let Some((position_quantity, position_commission)) =
+            let Some((position_quantity, position_commission, position_quantity_commission)) =
                 position_fill_report_totals(&position, report, client_order_id, flip.is_some())
             else {
                 return false;
@@ -3126,12 +3128,28 @@ impl ExecutionManager {
                 return false;
             };
 
+            let precision = quantity_commission
+                .precision
+                .max(position_quantity_commission.precision);
+            let Some(next_quantity_commission) = quantity_commission
+                .checked_rescale(precision)
+                .and_then(|total| {
+                    total.checked_add(position_quantity_commission.checked_rescale(precision)?)
+                })
+            else {
+                return false;
+            };
+
+            quantity_commission = next_quantity_commission;
             matched |= position_quantity.non_zero();
             quantity = next_quantity;
             commission = next_commission;
         }
 
-        matched && quantity == report.last_qty && commission == report.commission
+        matched
+            && quantity == report.last_qty
+            && commission == report.commission
+            && quantity_commission == report.quantity_commission.unwrap_or_default()
     }
 
     /// Reconciles cached positions against venue position reports.
@@ -5258,7 +5276,7 @@ impl ExecutionManager {
 
         let ts_now = self.clock.borrow().timestamp_ns();
 
-        let event = OrderFilled::new(
+        let mut event = OrderFilled::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
@@ -5281,6 +5299,7 @@ impl ExecutionManager {
             None,
         );
 
+        event.quantity_commission = fill.quantity_commission;
         Some((event, fill_key))
     }
 }
@@ -5290,7 +5309,7 @@ fn position_fill_report_totals(
     report: &FillReport,
     client_order_id: Option<ClientOrderId>,
     apply_voids: bool,
-) -> Option<(Quantity, Money)> {
+) -> Option<(Quantity, Money, Quantity)> {
     let mut fills = position
         .replay_events
         .iter()
@@ -5311,20 +5330,30 @@ fn position_fill_report_totals(
             _ => None,
         });
 
-    let (mut position_quantity, mut position_commission) = fills.try_fold(
+    let (mut position_quantity, mut position_commission, quantity_commission) = fills.try_fold(
         (
             Quantity::zero(report.last_qty.precision),
             Money::zero(report.commission.currency),
+            Quantity::zero(report.quantity_commission.unwrap_or_default().precision),
         ),
-        |(quantity, commission), fill| {
+        |(quantity, commission, quantity_commission), fill| {
             let fill_commission = fill.commission?;
-            if fill_commission.currency != report.commission.currency {
+            if fill_commission.currency != report.commission.currency
+                || fill.quantity_commission.is_some() != report.quantity_commission.is_some()
+            {
                 return None;
             }
+
+            let fee = fill.quantity_commission.unwrap_or_default();
+            let precision = quantity_commission.precision.max(fee.precision);
+            let quantity_commission = quantity_commission
+                .checked_rescale(precision)?
+                .checked_add(fee.checked_rescale(precision)?)?;
 
             Some((
                 quantity.checked_add(fill.last_qty)?,
                 commission.checked_add(fill_commission)?,
+                quantity_commission,
             ))
         },
     )?;
@@ -5346,7 +5375,7 @@ fn position_fill_report_totals(
         position_commission = corrected_commission;
     }
 
-    Some((position_quantity, position_commission))
+    Some((position_quantity, position_commission, quantity_commission))
 }
 
 #[cfg(test)]

@@ -130,6 +130,9 @@ pub trait OrderEvent: 'static + Send {
     fn account_id(&self) -> Option<AccountId>;
     fn position_id(&self) -> Option<PositionId>;
     fn commission(&self) -> Option<Money>;
+    fn quantity_commission(&self) -> Option<Quantity> {
+        None
+    }
     fn ts_event(&self) -> UnixNanos;
     fn ts_init(&self) -> UnixNanos;
     fn causation_id(&self) -> Option<UUID4> {

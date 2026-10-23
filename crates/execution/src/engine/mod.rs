@@ -1624,7 +1624,7 @@ impl ExecutionEngine {
             return None;
         }
 
-        let raised_qty = order.filled_qty().checked_add(report.last_qty)?;
+        let raised_qty = order.checked_filled_qty(report.last_qty)?;
         if raised_qty <= order.quantity()
             || !self.client_allows_reconciliation_overfill(order, report)
         {
@@ -3237,6 +3237,20 @@ impl ExecutionEngine {
                     return false;
                 }
 
+                let previous_quantity_fee = restatement
+                    && order_before_fill.events().iter().any(|event| {
+                        matches!(event, OrderEventAny::Filled(previous)
+                            if previous.trade_id == fill.trade_id && previous.quantity_commission.is_some())
+                    });
+
+                if apply_position
+                    && let Err(e) =
+                        self.validate_quantity_commission(&fill, restatement, previous_quantity_fee)
+                {
+                    log::error!("Cannot apply quantity commission: {e}");
+                    return false;
+                }
+
                 let affects_quantity = fill_affects_quantity(apply_position, restatement);
                 if affects_quantity
                     && !self.validate_fill_for_external_position(
@@ -3286,6 +3300,14 @@ impl ExecutionEngine {
                         }
                         _ => None,
                     });
+
+                if original_fill
+                    .as_ref()
+                    .is_some_and(|fill| fill.quantity_commission.is_some())
+                {
+                    log::error!("Quantity commission fill voids are unsupported");
+                    return false;
+                }
 
                 if voided.position_id.is_none() {
                     voided.position_id = original_fill.as_ref().and_then(|fill| fill.position_id);
@@ -3427,6 +3449,11 @@ impl ExecutionEngine {
                 fill.trade_id,
                 position_id
             );
+            return false;
+        }
+
+        if let Err(e) = self.validate_quantity_commission(&fill, false, false) {
+            log::error!("Cannot apply leg quantity commission: {e}");
             return false;
         }
 
@@ -3892,6 +3919,56 @@ impl ExecutionEngine {
         position_id
     }
 
+    // Reject unsupported inventory fees before mutating or publishing fill state.
+    // Legacy currency fees retain their existing path.
+    fn validate_quantity_commission(
+        &self,
+        fill: &OrderFilled,
+        restatement: bool,
+        previous_quantity_fee: bool,
+    ) -> anyhow::Result<()> {
+        let cache = self.cache.borrow();
+        let quantity_fee_position = fill
+            .position_id
+            .and_then(|id| cache.position(&id))
+            .is_some_and(|position| {
+                !position.is_closed()
+                    && (restatement
+                        || position.is_long()
+                            && fill.is_sell()
+                            && fill.last_qty > position.quantity)
+                    && position
+                        .events
+                        .iter()
+                        .any(|event| event.quantity_commission.is_some())
+            });
+
+        if fill.quantity_commission.is_none() && !previous_quantity_fee && !quantity_fee_position {
+            return Ok(());
+        }
+
+        let account = cache
+            .account(&fill.account_id)
+            .ok_or_else(|| anyhow::anyhow!("quantity fee account missing"))?;
+        anyhow::ensure!(
+            account.account_type() == AccountType::Cash && !account.calculated_account_state(),
+            "quantity commission requires a reported cash account"
+        );
+        anyhow::ensure!(!restatement, "quantity fee restatements are unsupported");
+        let position_id = fill
+            .position_id
+            .ok_or_else(|| anyhow::anyhow!("quantity fee position identity missing"))?;
+        if let Some(position) = cache.position(&position_id).filter(|p| !p.is_closed()) {
+            position.check_quantity_commission(fill)?;
+        } else {
+            let instrument = cache
+                .instrument(&fill.instrument_id)
+                .ok_or_else(|| anyhow::anyhow!("quantity fee instrument missing"))?;
+            Position::new_checked(instrument, fill.clone())?;
+        }
+        Ok(())
+    }
+
     fn validate_fill_for_order(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
         if order.is_duplicate_fill(fill) {
             log::warn!(
@@ -4120,6 +4197,10 @@ impl ExecutionEngine {
     }
 
     fn check_overfill(&self, order: &OrderAny, fill: &OrderFilled) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            order.checked_filled_qty(fill.last_qty).is_some(),
+            "fill exceeds order quantity representation bounds"
+        );
         let potential_overfill = order.calculate_overfill(fill.last_qty);
 
         if potential_overfill.is_positive() {

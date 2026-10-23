@@ -231,6 +231,65 @@ The first sale retains unallocated cost and the difference between Decimal PnL a
 The final close consumes both remainders: total PnL is `2.10 - 1.10 = 1.00 USD`. Discarding fractional PnL or
 reusing a rounded average can introduce drift.
 
+### Instrument quantity commissions
+
+Live adapters can supply `quantity_commission: Quantity | None` on `FillReport`. The corresponding
+`OrderFilled` retains that fee in units of its instrument. Existing constructors default to `None`.
+The gross `last_qty`, order completion and execution VWAP retain their existing meaning.
+
+For a BUY of gross quantity `q` at price `p` with quantity fee `f`:
+
+- Inventory increases by `q - f`.
+- Opening cost increases by `(q - f) * p`.
+- Realized PnL expenses `f * p`, using the existing PnL remainder accumulation.
+
+For example, BUY 10 at 10 with a fee of 1 unit, then BUY 10 at 20 without a fee. The position holds
+19 units with opening cost 290 and realized fee expense 10. Selling all 19 at 20 without another fee
+closes with total realized profit 80. The gross order VWAP and net inventory basis are distinct.
+
+This fee path requires a reported cash account with `calculate_account_state=False`, linear inventory,
+a unit multiplier and quote-currency settlement. The fee must be positive, smaller than the gross
+quantity, and on a BUY into long or flat inventory. Nonzero monetary commission and quantity commission
+are mutually exclusive on a fill. SELL fills with monetary commission retain the existing path.
+Reported cash remains venue-authoritative; the fee valuation is not a second cash deduction.
+Existing base-currency monetary commissions retain their established accounting convention.
+
+For comparison, BUY 10 at 10 and SELL all received inventory at 12, with a quote fee of 1 on the SELL:
+
+| BUY fee                          | Gross BUY quantity | Received inventory | Opening cost | Initial realized PnL | Final realized PnL |
+| -------------------------------- | ------------------ | ------------------ | ------------ | -------------------- | ------------------ |
+| Monetary fee of 1 quote unit     | 10                 | 10                 | 100          | -1                   | 18                 |
+| Quantity fee of 1 inventory unit | 10                 | 9                  | 90           | -10                  | 7                  |
+
+The monetary case spends 101 and receives 119; the quantity case spends 100 and receives 107.
+Both preserve gross execution facts and reconcile realized PnL with their respective cash flows.
+The existing monetary `commissions` collection does not include quantity-fee valuations; the original
+quantity fee remains on the fill and its expense flows through realized PnL.
+
+Quantity fees use existing `Quantity` precision and range checks. With `defi`, supported 18-decimal
+quantities remain exact through fills, inventory, serialization and replay. Orders align their quantity
+state without rounding when a fill requires a finer raw scale. Gross order progress and leaves retain
+that scale through later fills, updates and replay; the original event quantity is unchanged. Bounds
+and rescaling failures are checked before order mutation. Construct submitted order quantities using
+the instrument's quantity API; exact execution facts are distinct from submission increments.
+Monetary fee valuation continues to use existing Decimal bounds and `Money` remainders.
+
+Duplicate fills apply once. Restore from original fee-bearing fills or complete position snapshots;
+a holdings-only snapshot cannot reconstruct historical fee expense. A current position episode that
+contains a quantity fee rejects price restatements and flips, including later monetary-only fills.
+Voids of quantity-fee fills, quantity rebates and independent late fee amendments are unsupported.
+After the position closes flat, a new monetary-only episode retains its existing behavior. Application
+rejects unsupported quantity-fee accounting before advancing the affected order or publishing the fill.
+
+Use `None` for a zero quantity fee. The positive-fee, BUY-only and mutually exclusive fee restrictions
+define this first release's scope; they do not imply that other fee combinations are economically
+invalid. Existing accounts and position histories with no quantity fees retain their established
+accounting paths.
+
+This release covers actual reported fees in live execution. Fee models and simulated execution remain
+monetary-only. Settlement notional that differs from `q * p` through independent venue rounding is not
+represented by the quantity commission.
+
 ### Venue cash settlement
 
 Venue settlement rules specify where and how to round booked cash, which can differ from internal PnL.

@@ -54,7 +54,7 @@ const DEFAULT_TOLERANCE: Decimal = Decimal::from_parts(1, 0, 0, false, 4); // 0.
 ///
 /// # Errors
 ///
-/// Returns an error if synthetic report creation fails.
+/// Returns an error if fill projection or synthetic report creation fails.
 pub fn process_mass_status_for_reconciliation(
     mass_status: &ExecutionMassStatus,
     instrument: &InstrumentAny,
@@ -98,7 +98,7 @@ fn process_mass_status_for_reconciliation_inner(
         }
     };
 
-    let extracted = extract_fills_for_instrument(mass_status, instrument_id);
+    let extracted = extract_fills_for_instrument(mass_status, instrument_id)?;
     let fill_snapshots = extracted.snapshots;
     let mut order_map = extracted.orders;
     let mut fill_map = extracted.fills;
@@ -693,7 +693,7 @@ struct ExtractedFills {
 fn extract_fills_for_instrument(
     mass_status: &ExecutionMassStatus,
     instrument_id: InstrumentId,
-) -> ExtractedFills {
+) -> anyhow::Result<ExtractedFills> {
     let mut snapshots = Vec::new();
     let mut order_map = IndexMap::new();
     let mut fill_map = IndexMap::new();
@@ -720,10 +720,35 @@ fn extract_fills_for_instrument(
                     .and_then(|order| order.order_side)
                     .unwrap_or(fill.order_side);
 
+                // Simulate net inventory while retaining gross execution quantities in the
+                // original reports below.
+                let quantity = if let Some(fee) = fill.quantity_commission {
+                    anyhow::ensure!(
+                        side == OrderSide::Buy && fill.order_side == OrderSide::Buy,
+                        "quantity commission requires a BUY into long inventory",
+                    );
+                    anyhow::ensure!(
+                        fee.non_zero() && fill.commission.is_zero(),
+                        "quantity commission requires a positive fee and zero currency commission",
+                    );
+                    let precision = fill.last_qty.precision.max(fee.precision);
+                    let net = fill.last_qty.checked_rescale(precision)
+                        .and_then(|gross| gross.checked_sub(fee.checked_rescale(precision)?))
+                        .filter(Quantity::non_zero)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "quantity commission net inventory is non-positive or unrepresentable"
+                        ))?;
+
+                    // Reject a net quantity that Decimal cannot represent exactly
+                    Decimal::from_str_exact(&net.to_string())?
+                } else {
+                    fill.last_qty.into()
+                };
+
                 snapshots.push(FillSnapshot::new(
                     venue_order_id,
                     side,
-                    fill.last_qty.into(),
+                    quantity,
                     fill.last_px.into(),
                     fill.ts_event.as_u64(),
                 ));
@@ -739,11 +764,11 @@ fn extract_fills_for_instrument(
     // Sort chronologically
     snapshots.sort_by_key(|f| f.ts_event);
 
-    ExtractedFills {
+    Ok(ExtractedFills {
         snapshots,
         orders: order_map,
         fills: fill_map,
-    }
+    })
 }
 
 /// Simulate position from chronologically ordered fills using netting logic.

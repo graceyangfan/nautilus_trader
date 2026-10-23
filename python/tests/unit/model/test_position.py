@@ -70,6 +70,7 @@ def _make_fill(
     currency: object = None,
     event_id: object = None,
     ts_event: object = 0,
+    quantity_commission: Quantity | None = None,
 ) -> object:
     if instrument is None:
         instrument = AUDUSD_SIM
@@ -97,6 +98,7 @@ def _make_fill(
         reconciliation=False,
         position_id=None if position_id is None else PositionId(position_id),
         commission=Money.from_str_exact(commission),
+        quantity_commission=quantity_commission,
     )
 
 
@@ -860,3 +862,33 @@ def test_position_dict_round_trip_preserves_incremental_accounting() -> None:
     assert restored.to_dict() == original.to_dict()
     assert restored.realized_pnl.as_decimal() == Decimal(1)
     assert restored.signed_qty == Decimal(0)
+
+
+def test_quantity_commission_updates_net_inventory_and_existing_cost_accounting() -> None:
+    """
+    Include inventory fees in net cost and round-trip PnL without changing gross fills.
+    """
+    opening = _make_fill(
+        last_qty=10,
+        last_px="1.00000",
+        commission="0 USD",
+        quantity_commission=Quantity.from_int(1),
+    )
+    position = Position(AUDUSD_SIM, opening)
+    assert position.quantity == Quantity.from_str("9")
+    assert position.realized_pnl == Money.from_str("-1 USD")
+    addition = _make_fill(last_qty=10, last_px="2.00000", commission="0 USD", trade_id="T-ADD")
+    position.apply(addition)
+    assert position.quantity == Quantity.from_str("19")
+    closing = _make_fill(
+        order_side=OrderSide.SELL,
+        last_qty=19,
+        last_px="3.00000",
+        commission="0 USD",
+        trade_id="T-CLOSE",
+    )
+    position.apply(closing)
+    assert position.is_closed
+    assert position.realized_pnl == Money.from_str("27 USD")
+    position.apply(closing)
+    assert position.realized_pnl == Money.from_str("27 USD")

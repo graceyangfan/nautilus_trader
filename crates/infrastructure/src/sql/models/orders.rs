@@ -601,6 +601,11 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledRow {
             info,
         );
         order_event.causation_id = causation_id;
+        order_event.quantity_commission = row
+            .try_get::<Option<&str>, _>("quantity_commission")?
+            .map(str::parse::<Quantity>)
+            .transpose()
+            .map_err(|e| sqlx::Error::Decode(e.into()))?;
         Ok(Self(order_event))
     }
 }

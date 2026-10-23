@@ -66,13 +66,13 @@ use nautilus_live::{
     manager::{ExecutionManager, ExecutionManagerConfig},
 };
 use nautilus_model::{
-    accounts::{AccountAny, MarginAccount},
+    accounts::{Account, AccountAny, CashAccount, MarginAccount},
     enums::{
         AccountType, AvgPxReconciliation, ContingencyType, LiquiditySide, OmsType, OrderSide,
         OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
-        OrderEventAny, OrderFilled,
+        OrderEventAny, OrderFilled, PositionEvent,
         account::state::AccountState,
         order::spec::{
             OrderAcceptedSpec, OrderCancelRejectedSpec, OrderFillVoidedSpec,
@@ -21322,4 +21322,323 @@ async fn test_reconcile_pending_update_trigger_price(#[case] status: OrderStatus
     assert_eq!(after.price(), Some(Price::from("3100.00")));
     assert_eq!(after.trigger_price(), Some(Price::from("3250.00")));
     assert_eq!(after.filled_qty(), Quantity::from(0));
+}
+
+#[rstest]
+#[case::currency_fee("100", None, "100", "-0.25 USDT")]
+#[case::quantity_fee("100", Some(Quantity::from("1")), "99", "-1 USDT")]
+#[cfg_attr(
+    feature = "defi",
+    case::quantity_fee_tail(
+        "100",
+        Some(Quantity::from("0.000000000000000001")),
+        "99.999999999999999999",
+        "0 USDT"
+    )
+)]
+#[cfg_attr(
+    feature = "defi",
+    case::quantity_fee_exact_gross(
+        "10.123456789123456789",
+        Some(Quantity::from("0.123456789123456789")),
+        "10",
+        "-0.1234567891234568 USDT"
+    )
+)]
+fn test_live_quantity_commission_report_preserves_gross_order_and_reported_cash(
+    #[case] gross: &str,
+    #[case] quantity_fee: Option<Quantity>,
+    #[case] net: &str,
+    #[case] pnl: &str,
+    #[values(false, true)] startup: bool,
+) {
+    let mut ctx = TestContext::new();
+    let instrument: InstrumentAny = currency_pair_btcusdt().into();
+    ctx.add_instrument(instrument.clone());
+    let state = AccountState::new(
+        test_account_id(),
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("1000000 USDT"),
+            Money::zero(Currency::USDT()),
+            Money::from("1000000 USDT"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    );
+    let account = CashAccount::new(state, false, false);
+    ctx.cache
+        .borrow_mut()
+        .update_account(&account.into())
+        .unwrap();
+    let client_order_id = ClientOrderId::from("O-LIVE-QUANTITY-FEE");
+    let venue_order_id = VenueOrderId::from("V-LIVE-QUANTITY-FEE");
+    let mut order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from(gross))
+        .build();
+    order
+        .apply(TestOrderEventStubs::submitted(&order, test_account_id()))
+        .unwrap();
+    order
+        .apply(TestOrderEventStubs::accepted(
+            &order,
+            test_account_id(),
+            venue_order_id,
+        ))
+        .unwrap();
+    ctx.exec_engine
+        .borrow_mut()
+        .register_oms_type(order.strategy_id(), OmsType::Netting);
+
+    if startup {
+        ctx.cache
+            .borrow_mut()
+            .register_external_order_claims(order.strategy_id(), &[instrument.id()])
+            .unwrap();
+    }
+    let topic = switchboard::get_event_position_topic(order.strategy_id());
+    let (position_handler, position_messages): (_, TypedMessageSavingHandler<PositionEvent>) =
+        get_typed_message_saving_handler(None);
+    msgbus::subscribe_position_events(topic.into(), position_handler.clone(), None);
+    ctx.add_order(order);
+    let mut report = FillReport::new(
+        test_account_id(),
+        instrument.id(),
+        venue_order_id,
+        TradeId::from("T-LIVE-QUANTITY-FEE"),
+        OrderSide::Buy,
+        Quantity::from(gross),
+        Price::from("1"),
+        if quantity_fee.is_some() {
+            Money::zero(Currency::USDT())
+        } else {
+            Money::from("0.25 USDT")
+        },
+        LiquiditySide::Taker,
+        Some(client_order_id),
+        None,
+        UnixNanos::from(1_000_000),
+        UnixNanos::from(1_000_000),
+        None,
+    );
+    report.quantity_commission = quantity_fee;
+    let mut mass_status = ExecutionMassStatus::new(
+        test_client_id(),
+        test_account_id(),
+        test_venue(),
+        UnixNanos::default(),
+        None,
+    );
+    mass_status.add_fill_reports(vec![report.clone()]);
+    if startup {
+        mass_status.add_position_reports(vec![PositionStatusReport::new(
+            test_account_id(),
+            instrument.id(),
+            PositionSide::Long,
+            Quantity::from(net),
+            UnixNanos::from(2_000_000),
+            UnixNanos::from(2_000_000),
+            None,
+            None,
+            Some(dec!(1)),
+        )]);
+    }
+    let result = ctx
+        .manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    assert!(result.events.iter().any(|event| matches!(event,
+        OrderEventAny::Filled(fill) if fill.quantity_commission == quantity_fee
+            && fill.last_qty == Quantity::from(gross))));
+    assert_eq!(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, OrderEventAny::Filled(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .positions_total_count(None, None, None, None, None),
+        1
+    );
+    let cached_order = ctx.get_order(&client_order_id).unwrap();
+    assert_eq!(cached_order.filled_qty(), Quantity::from(gross));
+    assert_eq!(cached_order.status(), OrderStatus::Filled);
+    let position_id = cached_order.position_id().unwrap();
+    let position = ctx.cache.borrow().position(&position_id).unwrap().clone();
+    assert_eq!(position.quantity, Quantity::from(net));
+    assert_eq!(
+        position.realized_pnl,
+        Some(Money::from_str_exact(pnl).unwrap())
+    );
+    let messages = position_messages.get_messages();
+    let [PositionEvent::PositionOpened(opened)] = messages.as_slice() else {
+        panic!("Expected one position opening, was {messages:?}");
+    };
+    assert_eq!(opened.quantity, position.quantity);
+    assert_eq!(opened.realized_pnl, position.realized_pnl);
+    assert!(ctx.manager.position_contains_fill_report(&report));
+    let mut modified = report.clone();
+    modified.quantity_commission = Some(Quantity::zero(0));
+    assert!(!ctx.manager.position_contains_fill_report(&modified));
+    #[cfg(feature = "defi")]
+    if let Some(fee) = report.quantity_commission {
+        modified.quantity_commission = Some(fee.checked_rescale(18).unwrap());
+        assert!(ctx.manager.position_contains_fill_report(&modified));
+    }
+    let restored: Position =
+        serde_json::from_slice(&serde_json::to_vec(&position).unwrap()).unwrap();
+    ctx.cache.borrow_mut().update_position(&restored).unwrap();
+    assert!(ctx.manager.position_contains_fill_report(&report));
+    ctx.manager
+        .reconcile_execution_mass_status(&mass_status, &ctx.exec_engine);
+    let after_duplicate = ctx.cache.borrow().position(&position_id).unwrap().clone();
+    assert_eq!(after_duplicate.quantity, position.quantity);
+    assert_eq!(after_duplicate.realized_pnl, position.realized_pnl);
+    let fee = quantity_fee.unwrap_or_default();
+    report.quantity_commission = Some(
+        fee.checked_add(Quantity::from(1).checked_rescale(fee.precision).unwrap())
+            .unwrap(),
+    );
+    assert!(!ctx.manager.position_contains_fill_report(&report));
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .account(&test_account_id())
+            .unwrap()
+            .balance_total(Some(Currency::USDT())),
+        Some(Money::from("1000000 USDT")),
+    );
+    assert_eq!(position_messages.get_messages().len(), 1);
+    msgbus::unsubscribe_position_events(topic.into(), &position_handler);
+}
+
+#[cfg(feature = "defi")]
+#[rstest]
+#[case::live(false)]
+#[case::projection(true)]
+fn test_quantity_fee_mixed_gross_precision_preserves_order_and_inventory(#[case] projection: bool) {
+    let ctx = TestContext::new();
+    let instrument: InstrumentAny = currency_pair_btcusdt().into();
+    ctx.add_instrument(instrument.clone());
+    let state = AccountState::new(
+        test_account_id(),
+        AccountType::Cash,
+        vec![AccountBalance::new(
+            Money::from("1000000 USDT"),
+            Money::zero(Currency::USDT()),
+            Money::from("1000000 USDT"),
+        )],
+        vec![],
+        true,
+        UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        None,
+    );
+    ctx.cache
+        .borrow_mut()
+        .update_account(&CashAccount::new(state, false, false).into())
+        .unwrap();
+    let order = OrderTestBuilder::new(OrderType::Market)
+        .instrument_id(instrument.id())
+        .quantity(Quantity::from(100))
+        .build();
+    ctx.add_order(order.clone());
+    ctx.exec_engine
+        .borrow_mut()
+        .process(&TestOrderEventStubs::submitted(&order, test_account_id()));
+    ctx.exec_engine
+        .borrow_mut()
+        .process(&TestOrderEventStubs::accepted(
+            &order,
+            test_account_id(),
+            VenueOrderId::from("V-MIXED"),
+        ));
+    let event = TestOrderEventStubs::filled(
+        &order,
+        &instrument,
+        Some(TradeId::from("T-MIXED")),
+        None,
+        Some(Price::from("1")),
+        Some(Quantity::from("1.000000000000000001")),
+        Some(LiquiditySide::Taker),
+        Some(Money::zero(Currency::USDT())),
+        None,
+        Some(test_account_id()),
+    );
+    let OrderEventAny::Filled(mut fill) = event else {
+        unreachable!()
+    };
+    fill.quantity_commission = Some(Quantity::from("0.01"));
+    let mut report = FillReport::new(
+        fill.account_id,
+        fill.instrument_id,
+        fill.venue_order_id,
+        fill.trade_id,
+        fill.order_side,
+        fill.last_qty,
+        fill.last_px,
+        fill.commission.unwrap(),
+        fill.liquidity_side,
+        Some(fill.client_order_id),
+        None,
+        fill.ts_event,
+        fill.ts_init,
+        None,
+    );
+    report.quantity_commission = fill.quantity_commission;
+    assert!(
+        nautilus_execution::reconciliation::reconcile_fill_report(
+            &order,
+            &report,
+            &instrument,
+            UnixNanos::default(),
+            false,
+        )
+        .is_some()
+    );
+
+    for _ in 0..2 {
+        if projection {
+            ctx.exec_engine
+                .borrow_mut()
+                .project_reconciliation_fill(&fill);
+        } else {
+            ctx.exec_engine
+                .borrow_mut()
+                .process(&OrderEventAny::Filled(fill.clone()));
+        }
+    }
+    let cached_order = ctx.get_order(&order.client_order_id()).unwrap();
+    assert_eq!(cached_order.filled_qty(), fill.last_qty);
+    assert_eq!(
+        cached_order.leaves_qty(),
+        Quantity::from("98.999999999999999999")
+    );
+    assert_eq!(cached_order.status(), OrderStatus::PartiallyFilled);
+    assert_eq!(
+        ctx.cache
+            .borrow()
+            .positions_total_count(None, None, None, None, None),
+        usize::from(!projection)
+    );
+
+    if !projection {
+        let position_id = cached_order.position_id().unwrap();
+        let cache = ctx.cache.borrow();
+        let position = cache.position(&position_id).unwrap();
+        assert_eq!(position.quantity, Quantity::from("0.990000000000000001"));
+        assert_eq!(position.cost_open, dec!(0.990000000000000001));
+        assert_eq!(position.events.len(), 1);
+    }
 }

@@ -1314,6 +1314,7 @@ def test_order_filled(
     assert "OrderFilled" in repr(event)
 
 
+@pytest.mark.parametrize("quantity_commission", [None, Quantity.from_str("0.6400000000000001")])
 def test_order_filled_to_dict_roundtrip(
     trader_id: TraderId,
     strategy_id: StrategyId,
@@ -1322,6 +1323,7 @@ def test_order_filled_to_dict_roundtrip(
     client_order_id: ClientOrderId,
     venue_order_id: VenueOrderId,
     uuid: UUID4,
+    quantity_commission: Quantity | None,
 ) -> None:
     """
     Test order filled to dict roundtrip.
@@ -1344,12 +1346,19 @@ def test_order_filled_to_dict_roundtrip(
         ts_event=0,
         ts_init=0,
         reconciliation=False,
-        commission=Money.from_str("2.00 USD"),
+        commission=Money.from_str("2 USD" if quantity_commission is None else "0 USD"),
+        quantity_commission=quantity_commission,
     )
 
     restored = OrderFilled.from_dict(event.to_dict())
 
     assert restored == event
+    assert restored.quantity_commission == quantity_commission
+    assert ("quantity_commission" in event.to_dict()) == (quantity_commission is not None)
+    invalid = event.to_dict()
+    invalid["quantity_commission"] = "-0.01"
+    with pytest.raises(ValueError, match="non-negative"):
+        OrderFilled.from_dict(invalid)
 
 
 def test_order_fill_voided_to_dict_roundtrip(order_fill_voided: object) -> None:

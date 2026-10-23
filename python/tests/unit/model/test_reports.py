@@ -18,6 +18,7 @@ Test reports behavior.
 
 from decimal import Decimal
 
+import pytest
 from tests.providers import TestInstrumentProvider
 from tests.unit.model.factories import make_fill_report
 from tests.unit.model.factories import make_market_order_snapshot_values
@@ -63,19 +64,29 @@ from nautilus_trader.model import Venue
 from nautilus_trader.model import VenueOrderId
 
 
-def test_fill_report_to_dict_and_from_dict_roundtrip(audusd_id: InstrumentId) -> None:
+@pytest.mark.parametrize("quantity_commission", [None, Quantity.from_str("0.6400000000000001")])
+def test_fill_report_to_dict_and_from_dict_roundtrip(
+    audusd_id: InstrumentId,
+    quantity_commission: Quantity | None,
+) -> None:
     """
     Test fill report to dict and from dict roundtrip.
     """
-    report = make_fill_report(audusd_id)
+    report = make_fill_report(audusd_id, quantity_commission)
 
     data = report.to_dict()
     restored = FillReport.from_dict(data)
 
     assert data["type"] == "FillReport"
     assert restored == report
+    assert restored.quantity_commission == quantity_commission
+    assert ("quantity_commission" in data) == (quantity_commission is not None)
     assert restored.client_order_id == ClientOrderId("O-1")
     assert restored.venue_position_id == PositionId("P-1")
+    invalid = dict(data)
+    invalid["quantity_commission"] = "-0.01"
+    with pytest.raises(ValueError, match="non-negative"):
+        FillReport.from_dict(invalid)
 
 
 def test_order_status_report_to_dict_and_from_dict_roundtrip(audusd_id: InstrumentId) -> None:

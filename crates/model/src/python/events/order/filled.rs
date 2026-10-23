@@ -37,7 +37,7 @@ impl OrderFilled {
     /// Creates a new `OrderFilled` instance.
     #[expect(clippy::too_many_arguments)]
     #[new]
-    #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, venue_order_id, account_id, trade_id, order_side, order_type, last_qty, last_px, currency, liquidity_side, event_id, ts_event, ts_init, reconciliation, position_id=None, commission=None, info=None))]
+    #[pyo3(signature = (trader_id, strategy_id, instrument_id, client_order_id, venue_order_id, account_id, trade_id, order_side, order_type, last_qty, last_px, currency, liquidity_side, event_id, ts_event, ts_init, reconciliation, position_id=None, commission=None, info=None, quantity_commission=None))]
     fn py_new(
         trader_id: TraderId,
         strategy_id: StrategyId,
@@ -59,8 +59,9 @@ impl OrderFilled {
         position_id: Option<PositionId>,
         commission: Option<Money>,
         info: Option<IndexMap<String, String>>,
+        quantity_commission: Option<Quantity>,
     ) -> Self {
-        Self::new(
+        let mut fill = Self::new(
             trader_id,
             strategy_id,
             instrument_id,
@@ -81,7 +82,9 @@ impl OrderFilled {
             position_id,
             commission,
             info.map(str_indexmap_to_ustr),
-        )
+        );
+        fill.quantity_commission = quantity_commission;
+        fill
     }
 
     fn __richcmp__(&self, other: &Self, op: CompareOp, py: Python<'_>) -> Py<PyAny> {
@@ -184,6 +187,13 @@ impl OrderFilled {
         self.liquidity_side
     }
 
+    /// Fee denominated in this instrument's inventory units, separate from gross quantity.
+    #[getter]
+    #[pyo3(name = "quantity_commission")]
+    const fn py_quantity_commission(&self) -> Option<Quantity> {
+        self.quantity_commission
+    }
+
     #[getter]
     #[pyo3(name = "event_id")]
     fn py_event_id(&self) -> UUID4 {
@@ -277,6 +287,9 @@ impl OrderFilled {
         dict.set_item("ts_event", self.ts_event.as_u64())?;
         dict.set_item("ts_init", self.ts_init.as_u64())?;
         dict.set_item("reconciliation", self.reconciliation)?;
+        if let Some(value) = self.quantity_commission {
+            dict.set_item("quantity_commission", value.to_string())?;
+        }
 
         match &self.info {
             Some(info) => {
