@@ -17,6 +17,7 @@ CARGO_LLVM_COV_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-llvm-
 CARGO_MACHETE_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-machete)
 CARGO_NEXTEST_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-nextest)
 CARGO_VET_VERSION := $(shell bash scripts/cargo-tool-version.sh cargo-vet)
+RUST_CODE_ANALYSIS_VERSION := $(shell bash scripts/cargo-tool-version.sh rust-code-analysis-cli)
 CBINDGEN_VERSION := $(shell bash scripts/cargo-tool-version.sh cbindgen)
 FLAMEGRAPH_VERSION := $(shell bash scripts/cargo-tool-version.sh flamegraph)
 LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
@@ -210,6 +211,9 @@ SIM_FILTERSET := package(nautilus-common) + package(nautilus-event-store) + \
 	package(nautilus-execution) + \
 	(package(nautilus-live) & test(test_startup_reconciliation_times_out_waiting_for_mass_status)) + \
 	(package(nautilus-live) & test(~task::tests)) + \
+	(package(nautilus-live) & test(test_bulk_report_acceptance)) + \
+	(package(nautilus-live) & test(test_position_report_acceptance)) + \
+	(package(nautilus-live) & (test(test_targeted_report_acceptance) | test(test_targeted_collection))) + \
 	(package(nautilus-core) & test(~virtual_time))
 SIM_HIGH_PRECISION_PACKAGES := -p nautilus-common -p nautilus-execution
 
@@ -275,13 +279,13 @@ ADAPTER_CRATES := nautilus-architect-ax nautilus-betfair nautilus-binance \
     nautilus-blockchain nautilus-bybit nautilus-cli \
     nautilus-coinapi nautilus-coinbase nautilus-databento nautilus-deribit nautilus-derive \
     nautilus-dydx nautilus-hyperliquid nautilus-interactive-brokers \
-    nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket \
+    nautilus-kraken nautilus-lighter nautilus-okx nautilus-polymarket nautilus-pyo3 \
     nautilus-sandbox nautilus-tardis
 
 # Workspace members without Rust test functions:
-# nautilus-trader is the container library, nautilus-pyo3 owns generated bindings,
-# and nautilus-tutorials has a binary target with test = false.
-NO_TEST_CRATES := nautilus-trader nautilus-pyo3 nautilus-tutorials
+# nautilus-trader is the container library, and nautilus-tutorials has a binary
+# target with test = false.
+NO_TEST_CRATES := nautilus-trader nautilus-tutorials
 
 # > Colors
 # Use ANSI escape codes directly for cross-platform compatibility (Git Bash on Windows doesn't have tput)
@@ -604,6 +608,7 @@ install-tools: check-binstall-installed install-uv  #-- Install required develop
 	&& cargo install cbindgen --version $(CBINDGEN_VERSION) --locked \
 	&& cargo install flamegraph --version $(FLAMEGRAPH_VERSION) --locked \
 	&& cargo install lychee --version $(LYCHEE_VERSION) --locked \
+	&& cargo install rust-code-analysis-cli --version $(RUST_CODE_ANALYSIS_VERSION) --locked \
 	&& cargo install tokei --version $(TOKEI_VERSION) --locked \
 	&& cargo binstall prek --version $(PREK_VERSION) --no-confirm --locked
 
@@ -911,6 +916,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/ci/test-validate-wheel-upload.bash
 	$Q bash scripts/ci/test-verify-published-registries-crates.bash
 	$Q bash scripts/test-check-cargo-cooldown.bash
+	$Q bash scripts/test-cargo-ci-benches.bash
 	$Q bash scripts/test-clippy-strict-audit.bash
 	$Q bash scripts/test-update-cargo-dependencies.bash
 	$Q python3 -B scripts/ci/test_check_commit_message.py
@@ -1301,7 +1307,7 @@ CODSPEED_BENCH_ARGS := $(addprefix --package ,$(CODSPEED_BENCH_CRATES)) \
 cargo-ci-benches: check-cargo-cooldown  #-- Run Rust benches for the crates included in the CI performance workflow
 	@for crate in $(CI_BENCH_CRATES); do \
 	  echo "Running benches for $$crate"; \
-	  cargo bench --locked -p $$crate --profile bench --benches --no-fail-fast; \
+	  cargo bench --locked -p $$crate --profile bench --benches --no-fail-fast || exit $$?; \
 	done
 
 .PHONY: cargo-codspeed-build
@@ -1354,9 +1360,11 @@ init-services:  #-- Initialize development services eg. for integration tests (s
 .PHONY: start-services
 start-services:  #-- Start development services (without reinitializing database)
 	$(info $(M) Starting development services...)
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/postgres
-	bash scripts/ci/docker-pull-retry.sh dpage/pgadmin4
-	bash scripts/ci/docker-pull-retry.sh public.ecr.aws/docker/library/redis
+	@set -e; \
+	images=$$(docker compose -f .docker/docker-compose.yml config --images); \
+	for image in $$images; do \
+		bash scripts/ci/docker-pull-retry.sh "$$image"; \
+	done
 	docker compose -f .docker/docker-compose.yml up -d
 
 .PHONY: stop-services

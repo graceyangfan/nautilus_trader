@@ -12,6 +12,13 @@ execution, signing, and WebSocket operations have the same behavior from Rust an
 The adapter handles order preparation and signing for several wallet configurations. This guide
 covers market data, trade execution, session key administration, and Deposit Wallet position operations.
 
+The adapter supports Conditional Tokens Framework (CTF) markets with market protocol `v1`. This is
+separate from CLOB service version `2` and the `CTFExchangeV2` order format. Markets with protocol `v2`,
+a missing version, or an unknown version are unsupported, even with populated `clobTokenIds`.
+Instrument providers skip these markets; the historical data loader rejects them. Unsupported markets
+are not retried while [waiting for CLOB metadata](#markets-awaiting-clob-metadata). See the
+[Protocol V2 migration guide](https://docs.polymarket.com/migrate/polymarket-v2/api-integrations).
+
 ## Installation
 
 The Python package includes the Polymarket adapter. No adapter-specific extra is required.
@@ -465,9 +472,10 @@ unrelated calls, size a merge to `"max"`, or redeem positions automatically.
 
 ### Inputs and approvals
 
-Each operation looks up the market on the public CLOB by condition ID and errors if `neg_risk` is
-absent. It then selects the canonical pUSD token and the standard or negative-risk collateral
-adapter. Callers pass a 0x-prefixed 32-byte condition ID and do not supply contract addresses.
+Each operation looks up the market on the public CLOB by condition ID and requires market protocol `v1`
+and a present `neg_risk` value before encoding calldata. It then selects the canonical pUSD token and
+the standard or negative-risk collateral adapter. Callers pass a 0x-prefixed 32-byte condition ID and
+do not supply contract addresses.
 
 - **Split and merge amounts**: Positive pUSD decimals exactly representable at six decimal places, with no
   rounding. Amounts use pUSD units, never base units. `"max"` is not accepted.
@@ -1013,7 +1021,7 @@ Reasons are limited to 512 characters, including the literal `... [truncated]` m
 preceding space.
 
 On single and batch submit responses, the exact normalized reason `order_version_mismatch` becomes
-`Polymarket CLOB order version mismatch; adapter supports V2 only`. Other submit response reasons
+`Polymarket CLOB order format mismatch; expected CTFExchangeV2 orders`. Other submit response reasons
 remain unchanged after normalization.
 
 The venue reports a post-only crossing as `invalid post-only order: order crosses book`. Only that exact
@@ -1377,8 +1385,8 @@ Outcome instruments discovered from the same event snapshot share its JSON alloc
 Rust callers can borrow the string with `info.get_str("gamma_event")` and iterate with `info.borrowed_entries()`.
 Indexing, `&Params` iteration, and the read-only `IndexMap` interface materialize and cache owned values.
 Python values and serialized contents stay the same; deserialization does not retain allocation sharing.
-The existing normalized metadata keys remain available, including `token_id`, `condition_id`, `market_id`,
-and `event_id` when known.
+Normalized metadata includes `market_version`, `token_id`, `condition_id`, `market_id`, and `event_id`
+when known. `market_version` records the accepted market protocol, `v1`.
 
 These strings contain the received JSON objects before enrichment. Tick-size updates preserve them. Use the
 instrument's typed price increment for the current tick size. The adapter does not fetch additional related
@@ -1781,6 +1789,10 @@ An earlier ID from an [order modification](#order-modification) counts only if t
 on that order. When `instrument_config.load_ids` is non-empty, the instrument must also be listed.
 Cached orders do not offset unmapped, unowned maker, or untimestamped trades.
 
+Unsupported-market open orders and holdings are skipped, but confirmed trades still participate in
+these completeness checks. With no `load_ids` scope, an unmapped trade on an unsupported market makes
+the bounded window incomplete.
+
 For an incomplete window, the adapter logs a warning listing each failing condition before the
 engine logs its incomplete-report warning. It emits no additional report for a cached closed order, so
 reconciliation does not apply that order's quantity or commission again.
@@ -2063,7 +2075,7 @@ Fresh book subscriptions and reconnects arm a one-shot `book_snapshot_timeout_se
 snapshot is lost, this deadline starts recovery even without venue updates. While armed, early updates and rejected
 snapshots leave the book gated until a valid snapshot arrives or recovery starts.
 
-A zero timeout disables initial, reconnect, and hash-group deadlines, plus per-attempt snapshot deadlines
+A zero timeout disables initial and reconnect deadlines, plus per-attempt snapshot deadlines
 within the 180-second retry budget. The budget still ends a pending attempt; later attempts time out after one minute.
 
 The venue sends a `book` snapshot on first subscribe and ignores duplicate subscribes. A book-delta
@@ -2074,14 +2086,14 @@ Recovery cycles the asset's subscription until a valid snapshot arrives.
 A single `price_change` payload can contain interleaved updates for several assets. The adapter
 groups book updates by instrument, then splits consecutive updates by hash. Quote processing remains
 in venue payload order.
-[Hash validation](#price-change-bursts) can combine several frames into one completed book delta batch.
+Each hash group emits its own [normalized book delta batch](#price-change-bursts).
 
 Both book output modes reject input older than a retained timestamp mark. Incremental input advances
 it even while gated; snapshots advance it only after validation and acceptance.
 
 - Book-delta unsubscribe, shard reconnect, and tick-size changes reset the mark.
 - Recovery subscription cycles retain it.
-- Disconnect clears it and unpublished cached changes. A retained published book can still reject older snapshots.
+- Disconnect clears it. A retained published book can still reject older snapshots.
 
 Equal millisecond timestamps do not establish source order.
 
@@ -2113,7 +2125,9 @@ flowchart LR
 ```
 
 All three venue message paths converge on the same quote tick stream. Deduplication compares prices
-and sizes with the last emitted quote regardless of which message type produced it.
+and sizes with the cached quote regardless of which message type produced it. An unchanged
+`book` or `price_change` quote updates the cached timestamp without publication, so older quotes
+are rejected, including for quote-only subscriptions.
 
 ##### `best_bid_ask` handling
 
@@ -2128,7 +2142,10 @@ follows:
 - Without effective deltas, or while book updates are gated pending a valid snapshot, a side
   keeps the previous quote size when its top price matches. A moved or unknown side has zero size.
 
-The adapter ignores events older than the last emitted quote or, with effective deltas, the local
+An unchanged `best_bid_ask` quote does not advance the cached timestamp. Its sizes come from older
+messages, so a size update with a slightly earlier venue timestamp is still accepted.
+
+The adapter ignores events older than the cached quote or, with effective deltas, the local
 book. It also rejects locked, crossed, out-of-range, and off-grid events.
 
 With a book delta subscription, both modes also discard snapshots older than the book's retained
@@ -2157,13 +2174,15 @@ The next accepted snapshot emits a full `CLEAR` reseed, including with effective
 
 After exhausting its retry budget, recovery retries at intervals that double from one to fifteen minutes.
 
-Hashed snapshots can omit preimage fields such as `tick_size` and `last_trade_price`. After accepting a
-verified snapshot, the adapter reuses its metadata only if the new hash matches. Missing or unverifiable
-hashes then require recovery. Before a verified preimage is available, snapshots with missing fields or
-no hash pass without verification.
+[Polymarket book messages](https://docs.polymarket.com/market-data/realtime-data) can omit hash inputs
+such as `tick_size` and `last_trade_price`. Instrument metadata supplies missing `min_order_size` and
+`neg_risk`. If the hash or any required input remains unavailable, the adapter accepts the snapshot
+without verification, including after a verified baseline. It does not fill missing mutable inputs
+from earlier snapshots: a mismatch against stale metadata does not prove corrupt depth.
 
-Trades leave stored hash metadata unchanged. A changed `last_trade_price` can require a fresh snapshot
-despite correct levels. Recovery pauses book output; independent `price_change` quotes remain available.
+An accepted snapshot can resume gated book output even when its hash is unverifiable. Complete-input
+hash mismatches still require recovery, which pauses book output; independent `price_change` quotes
+remain available.
 
 #### Price change bursts
 
@@ -2181,18 +2200,13 @@ that leave the book uncrossed, including a book locked at one price, pass throug
 A missing `best_bid` or `best_ask` leaves its side unpruned, and an invalid one skips pruning. The
 adapter logs a warning whenever normalization leaves the local book crossed.
 
-After a verified snapshot, both output modes check incremental hashes against the full book.
-Frames sharing a timestamp and hash can describe one final state. Their normalized deltas, including
-generated deletes, stay buffered until the hash matches, then emit one batch with `F_LAST` on its final record.
+Incremental messages omit mutable hash inputs, so both output modes process them without hash
+verification or buffering. Each consecutive hash group emits its normalized deltas with `F_LAST` on
+its final record. Hash changes and empty incremental hashes do not trigger recovery.
 
-An unresolved group requests recovery without emission when:
-
-- Its timestamp or hash changes.
-- `book_snapshot_timeout_secs` expires, unless zero.
-- It exceeds 4,096 deltas.
-
-Valid late or oversized bursts also require a fresh snapshot. Discarding a group drops local comparison
-state, so the next accepted snapshot emits a full `CLEAR` reseed in both modes.
+Polymarket supplies no sequence linking these updates. Missing depth can therefore remain undetected
+until a fresh snapshot replaces it; timestamp filtering and crossed-book normalization do not prove
+complete incremental integrity.
 
 #### Live recovery validation
 
@@ -2245,15 +2259,14 @@ CARGO_BUILD_JOBS=16 bash scripts/strip-adapter-env.bash \
   and checks that each book recovers. Books without venue updates isolate deadline-driven recovery;
   include quiet books with `--tokens`. Requires a positive `--timeout`.
 
-`--timeout` sets snapshot and hash-group deadlines in seconds; `0` disables them. `--rounds` defaults to 12.
+`--timeout` sets snapshot deadlines in seconds; `0` disables them. `--rounds` defaults to 12.
 Use `--tokens` with comma-separated outcome IDs from six distinct open, order-accepting markets instead
 of the most traded markets. Include populated quiet books and empty books to cover recovery without ongoing traffic.
 
 Two venue behaviors limit what the harness can force:
 
-- Polymarket never rejects a subscription. Before verified hash metadata is available, an unverifiable
-  `book` event can complete recovery before a corrupted replacement arrives. The harness therefore
-  withholds replacement snapshots instead.
+- Polymarket never rejects a subscription. An unverifiable `book` event can complete recovery
+  before a corrupted replacement arrives. The harness therefore withholds replacement snapshots instead.
 - Reconnect replay also resubscribes a recovering book, so the ceiling reconnect check shows prompt
   recovery without isolating the ceiling wake.
 
@@ -2266,13 +2279,13 @@ and output format.
 `compute_effective_deltas` defaults to `false`. Enable it to trade extra processing for smaller
 snapshot batches (see [Data client options](#data-client-options)):
 
-- With published comparison state and no buffered updates, snapshots emit only net changes: `ADD` for new levels,
+- With published comparison state, snapshots emit only net changes: `ADD` for new levels,
   `UPDATE` for resized levels, and `DELETE` with the last known size for removed levels. No-op snapshots emit
   nothing; the final record carries `F_LAST`.
 - Without a usable comparison baseline, the adapter emits the full snapshot with `CLEAR` and `F_SNAPSHOT`.
   This includes initial subscription, a shard reconnect, a book-delta unsubscribe, and a
-  [tick size change](#tick-size-change-handling). Failed hash validation or discarding unverified changes
-  also removes the baseline. Replacing buffered changes requires the same full reseed.
+  [tick size change](#tick-size-change-handling). A complete-input snapshot hash mismatch or an
+  incremental parsing error while the latest accepted snapshot is verified also removes the baseline.
 - Incremental `price_change` batches follow [price change bursts](#price-change-bursts) handling
   and update the local comparison state.
 - When book deltas are subscribed, the maintained comparison book can supply matching sizes to
@@ -2492,6 +2505,11 @@ Gamma can report a newly listed market before usable `clob_token_ids` are availa
 lookup. Auto-load retries these Gamma results and fetch failures with bounded exponential backoff plus
 jitter. It does not query CLOB `GET /markets/{cid}` to classify hydration.
 
+Only market protocol `v1` can enter this retry path. A market with protocol `v2`, a missing version,
+or an unknown version is skipped with a warning. Once identified as unsupported, it receives no further
+retry or closed-market probe. An initial closed-market probe can discover an unsupported market that
+the default Gamma lookup omits.
+
 Tune the cadence with `auto_load_max_retries` (default 12), `auto_load_retry_delay_initial_secs` (default
 5.0), and `auto_load_retry_delay_max_secs` (default 15.0). The default retry delays total approximately three
 minutes. HTTP requests and rate-limit waits add to elapsed time. Set `auto_load_max_retries=0` to disable
@@ -2685,6 +2703,11 @@ Before starting its WebSocket or initializing account state, the execution clien
 startup with an unsupported-version error. A missing, malformed, or errored response stops startup with a
 version-query failure.
 
+This service version is separate from the market protocol. Before submitting or modifying an order,
+the client requires instrument metadata `info["market_version"]` to be `"v1"`. Otherwise it emits
+`OrderDenied` for a submission or `OrderModifyRejected` for a modification. Reload instruments from
+discovery if cached instruments lack that metadata.
+
 The execution adapter subscribes once to an account-wide `user` channel for order and trade events.
 It does not open market-channel subscriptions for instruments seen during trading.
 
@@ -2875,7 +2898,7 @@ Class/struct: `PolymarketDataClientConfig`.
 | `resolve_poll_grace_secs`             | `10`      | Delay in seconds after expiry before polling begins.                                          |
 | `resolve_poll_max_wait_secs`          | `1,800`   | Pause automatic polling after this many seconds from expiration.                              |
 | `transport_backend`                   | `Sockudo` | WebSocket transport implementation.                                                           |
-| `book_snapshot_timeout_secs`          | `10`      | Snapshot and unverified hash-group wait in seconds; `0` disables these deadlines.             |
+| `book_snapshot_timeout_secs`          | `10`      | Snapshot wait in seconds; `0` disables these deadlines.                                       |
 | `book_stale_check_interval_secs`      | `5`       | Book feed staleness check interval in seconds.                                                |
 | `book_stale_threshold_secs`           | `0`       | Maximum book feed silence in seconds before reporting stale; `0` disables the monitor.        |
 
@@ -2950,8 +2973,13 @@ Pass the same `PolymarketInstrumentProviderConfig` as `instrument_config` on the
 config and the execution client config.
 
 `load_ids` is the only reconciliation scope. When that set is non-empty, unmapped records
-outside it are expected absences. When `load_ids` is unset or empty, every unmapped open
-order and position is in scope and fails the report request.
+outside it are expected absences. When `load_ids` is unset or empty, every open order and position
+is in scope.
+
+For unmapped open orders and positions inside either scope, the adapter checks the market protocol on
+CLOB after applying account ownership, instrument filters, and position dust and resolved-balance
+exclusions. It skips rows for unsupported markets with a warning. An unmapped market protocol `v1` row
+or a failed version lookup still fails the report request.
 
 `event_slugs`, `market_slugs`, `series_ids`, `filters`, and `event_slug_builder` discover instruments. They do
 not classify unmapped records. A node that scopes discovery with those fields and still wants scoped
@@ -3139,7 +3167,7 @@ winner = next(
 
 ### Event loading
 
-An event factory returns one loader for each market in the event:
+An event factory returns one loader for each market in a supported event:
 
 ```python
 loaders = await PolymarketDataLoader.from_event_slug(
@@ -3150,6 +3178,8 @@ loaders = await PolymarketDataLoader.from_event_slug(
 
 A negative token index or an index outside a market's token list raises `ValueError`. Construction
 also fails clearly when Gamma has no matching slug or CLOB has not populated usable token IDs.
+Both Gamma and CLOB must identify the market as protocol `v1`. If any market in an event is
+unsupported, the event factory raises `ValueError` and returns no loaders.
 
 ### Public discovery
 

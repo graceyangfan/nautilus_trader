@@ -1407,6 +1407,7 @@ pub fn parse_futures_position_status_report(
         avg_px_open,
         avg_px_open_reconciliation: AvgPxReconciliation::default(),
         avg_px_open_precision: None,
+        liquidation_price: None,
     })
 }
 
