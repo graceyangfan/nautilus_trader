@@ -8206,7 +8206,7 @@ fn test_pending_filled_within_quantity_does_not_pre_update(
 #[rstest]
 #[case::pending_cancel(OrderStatus::PendingCancel)]
 #[case::pending_update(OrderStatus::PendingUpdate)]
-fn test_pending_filled_quantity_decrease_does_not_pre_update(
+fn test_pending_filled_matched_quantity_decrease_pre_updates(
     instrument: InstrumentAny,
     #[case] pending_status: OrderStatus,
 ) {
@@ -8225,11 +8225,97 @@ fn test_pending_filled_quantity_decrease_does_not_pre_update(
 
     let events =
         generate_reconciliation_order_pre_fill_events(&order, &report, UnixNanos::default());
+    let [OrderEventAny::Updated(updated)] = events.as_slice() else {
+        panic!("expected terminal quantity update, found {events:?}");
+    };
+    assert!(updated.reconciliation);
+    assert_eq!(updated.quantity, report.filled_qty);
+    let after = apply_events(&order, &events);
+    assert_eq!(after.quantity(), report.filled_qty);
+    assert!(after.filled_qty().is_zero());
     assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, OrderEventAny::Updated(_))),
-        "quantity decrease must stay on the current path, found {events:?}"
+        generate_reconciliation_order_pre_fill_events(&after, &report, UnixNanos::default())
+            .is_empty()
+    );
+}
+
+#[rstest]
+#[case::pending_cancel(OrderStatus::PendingCancel)]
+#[case::pending_update(OrderStatus::PendingUpdate)]
+fn test_pending_filled_normalization_closes_confirmed_fills_without_new_trade(
+    instrument: InstrumentAny,
+    #[case] pending_status: OrderStatus,
+) {
+    let mut order = pending_buy_order(&instrument, pending_status, "100");
+    let mut fill = create_test_fill_report(
+        instrument.id(),
+        order.venue_order_id().unwrap(),
+        TradeId::from("T-CONFIRMED"),
+        Quantity::from(80),
+        Price::from("0.58000"),
+    );
+    fill.account_id = order.account_id().unwrap();
+    fill.client_order_id = Some(order.client_order_id());
+    let event =
+        reconcile_fill_report(&order, &fill, &instrument, UnixNanos::default(), false).unwrap();
+    order.apply(event).unwrap();
+    // Re-establish the pending command after the execution overtook it.
+    let pending = if pending_status == OrderStatus::PendingCancel {
+        OrderEventAny::PendingCancel(
+            OrderPendingCancelSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(order.account_id().unwrap())
+                .venue_order_id(order.venue_order_id().unwrap())
+                .build(),
+        )
+    } else {
+        OrderEventAny::PendingUpdate(
+            OrderPendingUpdateSpec::builder()
+                .trader_id(order.trader_id())
+                .strategy_id(order.strategy_id())
+                .instrument_id(order.instrument_id())
+                .client_order_id(order.client_order_id())
+                .account_id(order.account_id().unwrap())
+                .venue_order_id(order.venue_order_id().unwrap())
+                .build(),
+        )
+    };
+    order.apply(pending).unwrap();
+    let mut report = create_test_order_report(
+        order.client_order_id(),
+        order.venue_order_id().unwrap(),
+        instrument.id(),
+        OrderType::Limit,
+        OrderStatus::Filled,
+        Quantity::from(80),
+        Quantity::from(80),
+    );
+    report.account_id = order.account_id().unwrap();
+    report.price = order.price();
+    let events = generate_reconciliation_order_events(
+        &order,
+        &report,
+        Some(&instrument),
+        UnixNanos::from(9),
+    );
+    assert!(matches!(events.as_slice(), [OrderEventAny::Updated(update)] if update.reconciliation));
+    let after = apply_events(&order, &events);
+    assert_eq!(after.status(), OrderStatus::Filled);
+    assert!(after.leaves_qty().is_zero());
+    assert_eq!(after.filled_qty(), Quantity::from(80));
+    assert_eq!(after.init_event().quantity, Quantity::from(100));
+    assert_eq!(after.trade_ids(), order.trade_ids());
+    assert!(
+        generate_reconciliation_order_events(
+            &after,
+            &report,
+            Some(&instrument),
+            UnixNanos::from(10)
+        )
+        .is_empty()
     );
 }
 

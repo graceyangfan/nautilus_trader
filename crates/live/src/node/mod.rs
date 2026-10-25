@@ -233,7 +233,7 @@ impl LiveNode {
         thread_owner: Rc<()>,
     ) -> Self {
         for client in &exec_clients {
-            exec_manager.register_submission_retention(client);
+            exec_manager.register_recovery_requirements(client);
         }
 
         Self {
@@ -2168,7 +2168,7 @@ impl LiveNode {
 
     fn process_reconciliation_events(&mut self, events: &[OrderEventAny]) {
         if events.is_empty() {
-            self.publish_submission_recovery_exhaustions();
+            self.publish_recovery_exhaustions();
             return;
         }
 
@@ -2194,10 +2194,23 @@ impl LiveNode {
             }
         }
 
-        self.publish_submission_recovery_exhaustions();
+        self.publish_recovery_exhaustions();
     }
 
-    fn publish_submission_recovery_exhaustions(&mut self) {
+    fn publish_recovery_exhaustions(&mut self) {
+        for diagnostic in self.exec_manager.take_command_recovery_exhaustions() {
+            log::warn!(
+                "Command recovery exhausted for {}: {} after {} checks; awaiting venue evidence",
+                diagnostic.client_order_id,
+                diagnostic.order_status,
+                diagnostic.retry_count,
+            );
+            msgbus::publish_any(
+                MessagingSwitchboard::command_recovery_exhausted_topic(),
+                &diagnostic,
+            );
+        }
+
         for diagnostic in self.exec_manager.take_submission_recovery_exhaustions() {
             log::warn!(
                 "Submission recovery exhausted for {}: {:?} after {} checks; submission remains unresolved pending venue evidence",
@@ -3725,6 +3738,7 @@ mod tests {
     struct OrderReportClient {
         client_id: ClientId,
         report: OrderStatusReport,
+        retain_commands: bool,
         targeted: bool,
         queries: Rc<RefCell<Vec<&'static str>>>,
     }
@@ -3741,6 +3755,10 @@ mod tests {
 
         fn account_id(&self) -> AccountId {
             self.report.account_id
+        }
+
+        fn retain_unresolved_commands(&self) -> bool {
+            self.retain_commands
         }
 
         fn venue(&self) -> Venue {
@@ -6373,13 +6391,37 @@ mod tests {
         let mut node = LiveNode::build("BatchCancelNode".to_string(), Some(config)).unwrap();
         let trader_id = TraderId::from("TESTER-001");
         let strategy_id = StrategyId::from("S-BATCH-CANCEL");
-        let account_id = AccountId::from("TEST-001");
+        let account_id = AccountId::from("STUB-001");
         let instrument = crypto_perpetual_ethusdt();
         let instrument_id = instrument.id();
         let child_ids = [
             ClientOrderId::from("O-BATCH-CANCEL-1"),
             ClientOrderId::from("O-BATCH-CANCEL-2"),
         ];
+        let client = LiveExecutionClient::new(Box::new(OrderReportClient {
+            client_id: ClientId::from("STUB"),
+            report: OrderStatusReport::new(
+                account_id,
+                instrument_id,
+                Some(child_ids[0]),
+                VenueOrderId::from("V-BATCH"),
+                Some(OrderSide::Buy),
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                OrderStatus::Accepted,
+                Quantity::from("10.0"),
+                Quantity::from(0),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                UnixNanos::default(),
+                None,
+            ),
+            retain_commands: true,
+            targeted: false,
+            queries: Rc::new(RefCell::new(Vec::new())),
+        }));
+        assert!(client.retain_unresolved_commands());
+        node.exec_manager.register_recovery_requirements(&client);
         node.kernel
             .cache
             .borrow_mut()
@@ -6453,21 +6495,46 @@ mod tests {
         node.observe_exec_command_before_dispatch(&command);
         advance_clock(Duration::from_millis(101)).await;
         let result = node.exec_manager.check_inflight_orders();
-        let timed_out_ids = result
-            .events
-            .iter()
-            .map(OrderEventAny::client_order_id)
-            .collect::<IndexSet<_>>();
-
-        assert_eq!(timed_out_ids, IndexSet::from(child_ids));
-        assert_eq!(result.events.len(), child_ids.len());
         assert!(
-            result
-                .events
-                .iter()
-                .all(|event| matches!(event, OrderEventAny::Canceled(_))),
-            "batch-cancel children must time out as Canceled events",
+            result.events.is_empty(),
+            "unknown cancellations cannot close orders"
         );
+        assert!(result.queries.is_empty());
+        let observed = Rc::new(RefCell::new(Vec::new()));
+        let handler = ShareableMessageHandler::from_typed({
+            let observed = observed.clone();
+            let cache = node.kernel.cache.clone();
+            move |diagnostic: &crate::execution::command::CommandRecoveryExhausted| {
+                let current = cache
+                    .borrow()
+                    .order_owned(&diagnostic.client_order_id)
+                    .unwrap();
+                assert_eq!(current.status(), OrderStatus::PendingCancel);
+                assert!(!current.is_closed());
+                assert_eq!(current.quantity(), Quantity::from("10.0"));
+                assert!(current.filled_qty().is_zero());
+                observed.borrow_mut().push(diagnostic.clone());
+            }
+        });
+        let topic = MessagingSwitchboard::command_recovery_exhausted_topic();
+        msgbus::subscribe_any(topic.into(), handler.clone(), None);
+        node.process_reconciliation_events(&result.events);
+        assert_eq!(observed.borrow().len(), child_ids.len());
+        assert_eq!(
+            observed
+                .borrow()
+                .iter()
+                .map(|event| event.client_order_id)
+                .collect::<IndexSet<_>>(),
+            IndexSet::from(child_ids)
+        );
+        node.process_reconciliation_events(&[]);
+        assert_eq!(
+            observed.borrow().len(),
+            child_ids.len(),
+            "exhaustion publishes once per command budget"
+        );
+        msgbus::unsubscribe_any(topic.into(), &handler);
     }
 
     #[rstest]
@@ -11696,6 +11763,7 @@ mod tests {
         let queries = Rc::new(RefCell::new(Vec::new()));
         let client = OrderReportClient {
             client_id,
+            retain_commands: false,
             report: OrderStatusReport::new(
                 account_id,
                 instrument.id(),
@@ -11906,6 +11974,7 @@ mod tests {
         let queries = Rc::new(RefCell::new(Vec::new()));
         let client = OrderReportClient {
             client_id,
+            retain_commands: false,
             report: OrderStatusReport::new(
                 account_id,
                 order.instrument_id(),

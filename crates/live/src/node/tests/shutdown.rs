@@ -336,7 +336,7 @@ fn shutdown_node(
     let account_id = client.account_id();
     let client_id = client.client_id();
     let strategy_id = StrategyId::from("SHUTDOWN-001");
-    node.exec_manager.register_submission_retention(&client);
+    node.exec_manager.register_recovery_requirements(&client);
     node.kernel
         .exec_engine
         .borrow_mut()

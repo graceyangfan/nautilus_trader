@@ -53,8 +53,8 @@ use super::{
 /// otherwise close the order under the stale local quantity. The `Updated`
 /// step is suppressed for pending venue states so a still-unconfirmed amend
 /// cannot mutate the local projection ahead of venue confirmation. A confirmed `Filled`
-/// report whose filled quantity exceeds the local order quantity still raises that quantity
-/// while a cancel or modify is in flight, so the fill can apply.
+/// report can raise the quantity to accommodate an overfill or normalize it to confirmed
+/// fills while a cancel or modify is in flight.
 #[must_use]
 pub fn generate_reconciliation_order_events(
     order: &OrderAny,
@@ -1416,9 +1416,13 @@ fn pending_terminal_quantity_update(order: &OrderAny, report: &OrderStatusReport
         return true;
     }
 
+    // A venue terminal can normalize its working quantity to real confirmed
+    // fills. Apply that reconciliation update even while cancellation is pending;
+    // no inferred trade is needed when the confirmed cumulative quantity matches.
     report.order_status == OrderStatus::Filled
-        && report.filled_qty > order.quantity()
+        && !report.filled_qty.is_zero()
         && report.quantity >= report.filled_qty
+        && (report.filled_qty > order.quantity() || report.quantity == report.filled_qty)
 }
 
 fn should_accept_before_reconciliation(order: &OrderAny, report: &OrderStatusReport) -> bool {

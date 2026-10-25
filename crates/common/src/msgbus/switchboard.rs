@@ -63,6 +63,7 @@ static PORTFOLIO_ACCOUNT_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static PORTFOLIO_ORDER_ENDPOINT: OnceLock<MStr<Endpoint>> = OnceLock::new();
 static SYSTEM_SHUTDOWN_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static SUBMISSION_RECOVERY_EXHAUSTED_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
+static COMMAND_RECOVERY_EXHAUSTED_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_ORDER_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_FILL_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
 static RECONCILIATION_RAW_POSITION_REPORT_TOPIC: OnceLock<MStr<Topic>> = OnceLock::new();
@@ -295,6 +296,14 @@ macro_rules! define_switchboard {
             pub fn submission_recovery_exhausted_topic() -> MStr<Topic> {
                 *SUBMISSION_RECOVERY_EXHAUSTED_TOPIC
                     .get_or_init(|| "reconciliation.SubmissionRecoveryExhausted".into())
+            }
+
+            /// Pub/sub topic carrying pending cancel/modify recovery exhaustion diagnostics.
+            #[inline]
+            #[must_use]
+            pub fn command_recovery_exhausted_topic() -> MStr<Topic> {
+                *COMMAND_RECOVERY_EXHAUSTED_TOPIC
+                    .get_or_init(|| "reconciliation.CommandRecoveryExhausted".into())
             }
 
             /// Pub/sub topic carrying raw `OrderStatusReport`s that arrived from

@@ -20,6 +20,7 @@
 //! [`context`], [`failure`], [`reports`], and [`emitter`] provide the shared adapter interfaces.
 //! The manager coordinates individual reconciliation operations; the live node schedules them.
 
+pub mod command;
 pub mod config;
 pub mod context;
 pub mod emitter;

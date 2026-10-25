@@ -121,6 +121,14 @@ pub trait ExecutionClient {
         false
     }
 
+    /// Returns whether pending cancel/modify commands require venue evidence before local closure.
+    ///
+    /// `LiveNode` registers this requirement automatically. Recovery exhaustion retains the
+    /// pending state and publishes a diagnostic instead of synthesizing cancellation.
+    fn retain_unresolved_commands(&self) -> bool {
+        false
+    }
+
     /// Returns venue order ID histories for startup reconciliation, keyed by client order ID.
     ///
     /// Each history covers one proven logical order: at least two IDs, oldest first and current last.

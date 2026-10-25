@@ -430,6 +430,10 @@ impl ExecutionClient for LiveExecutionClient {
         self.client.borrow().retain_unresolved_submissions()
     }
 
+    fn retain_unresolved_commands(&self) -> bool {
+        self.client.borrow().retain_unresolved_commands()
+    }
+
     fn venue_order_ids(
         &self,
         mass_status: &ExecutionMassStatus,

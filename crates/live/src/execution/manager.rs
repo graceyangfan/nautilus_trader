@@ -95,15 +95,8 @@ pub(crate) use super::reconciliation::{
     TargetedOrderQuery, TargetedOrderReportResult, request_targeted_order_reports,
     resolve_position_report_client_coverage,
 };
-pub use super::{
-    config::ExecutionManagerConfig,
-    reconciliation::{
-        ExternalOrderMetadata, InflightCheckResult, InstrumentAccountKey, PositionFillReportPlan,
-        PositionFillReportPreparation, PositionFillReportQuery, PositionReportCheck,
-        ReconciliationResult, ReportClientCoverage,
-    },
-};
 use super::{
+    command::CommandRecoveryExhausted,
     recency::RecencyMap,
     reconciliation::{
         FillKey, InflightCheck, PositionQuantityComparison, PositionReconciliationState,
@@ -115,6 +108,14 @@ use super::{
         sort_reconciliation_events, terminal_report_has_missing_fills,
     },
     submission::{SubmissionRecoveryExhausted, SubmissionRecoveryPolicy, SubmissionRecoverySource},
+};
+pub use super::{
+    config::ExecutionManagerConfig,
+    reconciliation::{
+        ExternalOrderMetadata, InflightCheckResult, InstrumentAccountKey, PositionFillReportPlan,
+        PositionFillReportPreparation, PositionFillReportQuery, PositionReportCheck,
+        ReconciliationResult, ReportClientCoverage,
+    },
 };
 
 /// Tag for orders originating from venue (external orders).
@@ -158,7 +159,9 @@ pub struct ExecutionManager {
     order_inflight_checks: IndexMap<ClientOrderId, InflightCheck>,
     submissions: IndexMap<ClientOrderId, SubmissionRecoveryState>,
     submission_exhaustions: Vec<SubmissionRecoveryExhausted>,
+    command_exhaustions: Vec<CommandRecoveryExhausted>,
     submission_retention: IndexMap<ClientId, AccountId>,
+    command_retention: IndexMap<ClientId, AccountId>,
     order_query_recency: RecencyMap<ClientOrderId>,
     order_query_pending: IndexSet<ClientOrderId>,
     order_recon_retries: IndexMap<ClientOrderId, u32>,
@@ -187,7 +190,9 @@ impl Debug for ExecutionManager {
             .field("order_inflight_checks", &self.order_inflight_checks)
             .field("submissions", &self.submissions)
             .field("submission_exhaustions", &self.submission_exhaustions)
+            .field("command_exhaustions", &self.command_exhaustions)
             .field("submission_retention", &self.submission_retention)
+            .field("command_retention", &self.command_retention)
             .field("order_query_recency", &self.order_query_recency)
             .field("order_query_pending", &self.order_query_pending)
             .field("order_recon_retries", &self.order_recon_retries)
@@ -226,7 +231,9 @@ impl ExecutionManager {
             order_inflight_checks: IndexMap::new(),
             submissions: IndexMap::new(),
             submission_exhaustions: Vec::new(),
+            command_exhaustions: Vec::new(),
             submission_retention: IndexMap::new(),
+            command_retention: IndexMap::new(),
             order_query_recency: RecencyMap::default(),
             order_query_pending: IndexSet::new(),
             order_recon_retries: IndexMap::new(),
@@ -489,6 +496,14 @@ impl ExecutionManager {
     /// not an authoritative venue outcome.
     pub fn take_submission_recovery_exhaustions(&mut self) -> Vec<SubmissionRecoveryExhausted> {
         std::mem::take(&mut self.submission_exhaustions)
+    }
+
+    /// Takes diagnostics for pending commands which exhausted automatic recovery.
+    ///
+    /// Hosts publish these after processing reconciliation events. Draining does not
+    /// change cached order state or establish a venue outcome.
+    pub fn take_command_recovery_exhaustions(&mut self) -> Vec<CommandRecoveryExhausted> {
+        std::mem::take(&mut self.command_exhaustions)
     }
 
     /// Records local activity for the specified order.
@@ -1931,8 +1946,9 @@ impl ExecutionManager {
     /// Checks inflight orders and returns terminal events and intermediate venue queries.
     ///
     /// For retries below `inflight_max_retries`, generates `QueryOrder` commands to poll
-    /// the venue for the order's current status. At max retries, generates terminal events
-    /// (rejection or cancellation) based on the order's status. Orders never accepted are
+    /// the venue for the order's current status. At max retries, clients requiring venue
+    /// evidence retain pending cancel/modify commands and generate recovery diagnostics.
+    /// Other clients keep local timeout resolution. Orders never accepted are
     /// retained when the recovery policy or their client requires definitive venue evidence.
     pub fn check_inflight_orders(&mut self) -> InflightCheckResult {
         let mut result = InflightCheckResult::default();
@@ -2009,8 +2025,27 @@ impl ExecutionManager {
                                 result.events.push(event);
                             }
                         }
+                        OrderStatus::PendingUpdate | OrderStatus::PendingCancel
+                            if self.client_retention_enabled(
+                                &self.command_retention,
+                                client_order_id,
+                                None,
+                            ) =>
+                        {
+                            self.command_exhaustions.push(CommandRecoveryExhausted {
+                                trader_id: order.trader_id(),
+                                client_id: self.cache.borrow().client_id(&client_order_id).copied(),
+                                account_id: order.account_id(),
+                                strategy_id: order.strategy_id(),
+                                instrument_id: order.instrument_id(),
+                                client_order_id,
+                                venue_order_id: order.venue_order_id(),
+                                order_status: order.status(),
+                                retry_count,
+                                ts_event: ts_now,
+                            });
+                        }
                         OrderStatus::PendingUpdate | OrderStatus::PendingCancel => {
-                            // Generate cancellation for orders stuck in pending modify/cancel
                             result
                                 .events
                                 .push(create_reconciliation_canceled(&order, ts_now));
@@ -2045,9 +2080,14 @@ impl ExecutionManager {
         result
     }
 
-    pub(crate) fn register_submission_retention(&mut self, client: &dyn ExecutionClient) {
+    pub(crate) fn register_recovery_requirements(&mut self, client: &dyn ExecutionClient) {
         if client.retain_unresolved_submissions() {
             self.submission_retention
+                .insert(client.client_id(), client.account_id());
+        }
+
+        if client.retain_unresolved_commands() {
+            self.command_retention
                 .insert(client.client_id(), client.account_id());
         }
     }
@@ -2060,25 +2100,29 @@ impl ExecutionManager {
         if self.config.submission_recovery_policy == SubmissionRecoveryPolicy::RetainUnresolved {
             return true;
         }
+        self.client_retention_enabled(&self.submission_retention, client_order_id, client_id)
+    }
 
-        if self.submission_retention.is_empty() {
+    fn client_retention_enabled(
+        &self,
+        clients: &IndexMap<ClientId, AccountId>,
+        client_order_id: ClientOrderId,
+        client_id: Option<ClientId>,
+    ) -> bool {
+        if clients.is_empty() {
             return false;
         }
 
         let cache = self.cache.borrow();
 
         if let Some(client_id) = client_id.or_else(|| cache.client_id(&client_order_id).copied()) {
-            return self.submission_retention.contains_key(&client_id);
+            return clients.contains_key(&client_id);
         }
 
         cache
             .order_ref(&client_order_id)
             .and_then(|order| order.account_id())
-            .is_some_and(|account_id| {
-                self.submission_retention
-                    .values()
-                    .any(|id| *id == account_id)
-            })
+            .is_some_and(|account_id| clients.values().any(|id| *id == account_id))
     }
 
     fn submission_is_retained(&self, client_order_id: ClientOrderId) -> bool {
@@ -2186,7 +2230,7 @@ impl ExecutionManager {
         clients: &[&dyn ExecutionClient],
     ) -> OpenOrderReportCheck {
         for client in clients {
-            self.register_submission_retention(*client);
+            self.register_recovery_requirements(*client);
         }
 
         let filtered_orders = self.filtered_open_orders_for_reconciliation();
@@ -6798,6 +6842,119 @@ mod tests {
         assert_eq!(
             manager.order_query_pending.contains(&client_order_id),
             expect_inflight,
+        );
+    }
+
+    #[rstest]
+    #[case(OrderStatus::PendingUpdate, true)]
+    #[case(OrderStatus::PendingCancel, true)]
+    #[case(OrderStatus::PendingUpdate, false)]
+    #[case(OrderStatus::PendingCancel, false)]
+    fn test_command_recovery_exhaustion_preserves_pending_order(
+        #[case] pending_status: OrderStatus,
+        #[case] protected: bool,
+    ) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let client_order_id = ClientOrderId::from("O-EXHAUSTED-COMMAND");
+        let venue_order_id = VenueOrderId::from("V-EXHAUSTED-COMMAND");
+        let client_id = ClientId::from(if protected { "STRICT" } else { "LEGACY" });
+        let instrument_id = crypto_perpetual_ethusdt().id();
+        insert_accepted_limit_order(
+            &cache,
+            client_order_id,
+            venue_order_id,
+            instrument_id,
+            client_id,
+        );
+        let order = cache.borrow().order_owned(&client_order_id).unwrap();
+        let pending = if pending_status == OrderStatus::PendingCancel {
+            OrderEventAny::PendingCancel(
+                OrderPendingCancelSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(order.account_id().unwrap())
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            )
+        } else {
+            OrderEventAny::PendingUpdate(
+                OrderPendingUpdateSpec::builder()
+                    .trader_id(order.trader_id())
+                    .strategy_id(order.strategy_id())
+                    .instrument_id(instrument_id)
+                    .client_order_id(client_order_id)
+                    .account_id(order.account_id().unwrap())
+                    .venue_order_id(venue_order_id)
+                    .build(),
+            )
+        };
+        cache.borrow_mut().update_order(&pending).unwrap();
+        let before =
+            serde_json::to_value(cache.borrow().order_owned(&client_order_id).unwrap()).unwrap();
+        let mut manager = ExecutionManager::new(
+            Rc::new(RefCell::new(VirtualClock::new())),
+            cache.clone(),
+            ExecutionManagerConfig {
+                inflight_max_retries: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        manager.register_inflight(client_order_id);
+        manager
+            .command_retention
+            .insert(ClientId::from("STRICT"), order.account_id().unwrap());
+        manager
+            .order_inflight_checks
+            .get_mut(&client_order_id)
+            .unwrap()
+            .submitted_at = dst::time::Instant::now() - Duration::from_secs(60);
+        let result = manager.check_inflight_orders();
+
+        if !protected {
+            assert!(matches!(
+                result.events.as_slice(),
+                [OrderEventAny::Canceled(_)]
+            ));
+            assert!(result.queries.is_empty());
+            assert!(manager.take_command_recovery_exhaustions().is_empty());
+            return;
+        }
+        assert!(
+            result.events.is_empty(),
+            "timeout does not establish a venue outcome"
+        );
+        assert!(result.queries.is_empty());
+        let diagnostics = manager.take_command_recovery_exhaustions();
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        assert_eq!(diagnostic.client_order_id, client_order_id);
+        assert_eq!(diagnostic.venue_order_id, Some(venue_order_id));
+        assert_eq!(diagnostic.client_id, Some(client_id));
+        assert_eq!(diagnostic.account_id, order.account_id());
+        assert_eq!(diagnostic.order_status, pending_status);
+        assert_eq!(diagnostic.retry_count, 1);
+        assert_eq!(
+            serde_json::to_value(cache.borrow().order_owned(&client_order_id).unwrap()).unwrap(),
+            before
+        );
+        assert!(!cache.borrow().order(&client_order_id).unwrap().is_closed());
+        let repeated = manager.check_inflight_orders();
+        assert!(repeated.events.is_empty() && repeated.queries.is_empty());
+        assert!(manager.take_command_recovery_exhaustions().is_empty());
+        let current = cache.borrow().order_owned(&client_order_id).unwrap();
+        let canceled = TestOrderEventStubs::canceled(
+            &current,
+            current.account_id().unwrap(),
+            current.venue_order_id(),
+        );
+        cache.borrow_mut().update_order(&canceled).unwrap();
+        manager.observe_order_event(&canceled);
+        assert_eq!(
+            cache.borrow().order(&client_order_id).unwrap().status(),
+            OrderStatus::Canceled
         );
     }
 
