@@ -396,6 +396,14 @@ impl DeriveDataClient {
     }
 
     fn spawn_instrument_refresh(&self) -> anyhow::Result<()> {
+        if let Some(future) = self.instrument_refresh() {
+            self.session_tasks.spawn(future)?;
+        }
+
+        Ok(())
+    }
+
+    fn instrument_refresh(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
         let minutes = self.config.update_instruments_interval_mins;
         let currencies: Vec<_> = self
             .config
@@ -405,7 +413,7 @@ impl DeriveDataClient {
             .collect();
 
         if minutes == 0 || currencies.is_empty() {
-            return Ok(());
+            return None;
         }
 
         let interval = Duration::from_secs(minutes.saturating_mul(60));
@@ -416,7 +424,7 @@ impl DeriveDataClient {
         let sender = self.data_sender.clone();
         let subscription_lock = Arc::clone(&self.subscription_lock);
 
-        self.session_tasks.spawn(async move {
+        Some(async move {
             loop {
                 tokio::select! {
                     biased;
@@ -434,15 +442,21 @@ impl DeriveDataClient {
                     match result {
                         Ok(definitions) => {
                             let loaded = parse_instrument_definitions(definitions);
-                            cache_instruments(loaded, &instruments, &sender, &cancellation, &subscription_lock);
+                            cache_instruments(
+                                loaded,
+                                &instruments,
+                                &sender,
+                                &cancellation,
+                                &subscription_lock,
+                            );
                         }
-                        Err(e) => log::warn!("Failed to refresh Derive instruments for {currency}: {e}"),
+                        Err(e) => {
+                            log::warn!("Failed to refresh Derive instruments for {currency}: {e}");
+                        }
                     }
                 }
             }
-        })?;
-
-        Ok(())
+        })
     }
 
     fn handle_ws_message(message: DeriveWsMessage, ctx: &WsMessageContext) {
@@ -684,7 +698,10 @@ impl DeriveDataClient {
         if ctx.active_funding_subs.contains(&instrument_id) {
             match parse_funding_rate(msg, ts_init) {
                 Ok(Some(update)) => {
-                    if let Err(e) = ctx.data_sender.send(DataEvent::FundingRate(update)) {
+                    if let Err(e) = ctx
+                        .data_sender
+                        .send(DataEvent::Data(Data::FundingRate(update)))
+                    {
                         log::error!("Failed to send Derive funding rate: {e}");
                     }
                 }
@@ -696,7 +713,10 @@ impl DeriveDataClient {
         if ctx.active_greeks_subs.contains(&instrument_id) {
             match parse_option_greeks(msg, ts_init) {
                 Ok(Some(greeks)) => {
-                    if let Err(e) = ctx.data_sender.send(DataEvent::OptionGreeks(greeks)) {
+                    if let Err(e) = ctx
+                        .data_sender
+                        .send(DataEvent::Data(Data::OptionGreeks(greeks)))
+                    {
                         log::error!("Failed to send Derive option greeks: {e}");
                     }
                 }
@@ -2661,7 +2681,7 @@ fn cache_instruments(
     });
 
     for instrument in loaded {
-        if let Err(e) = sender.send(DataEvent::Instrument(instrument)) {
+        if let Err(e) = sender.send(DataEvent::Data(instrument.into())) {
             log::warn!("Failed to send Derive instrument: {e}");
         }
     }
@@ -2847,6 +2867,10 @@ fn truncated_payload_snippet(raw: &str) -> String {
 
     format!("{}...(truncated)", &raw[..end])
 }
+
+#[cfg(test)]
+#[path = "../tests/integration/data_client.rs"]
+mod data_client_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4270,7 +4294,7 @@ mod tests {
         );
 
         match rx.try_recv().unwrap() {
-            DataEvent::FundingRate(update) => {
+            DataEvent::Data(Data::FundingRate(update)) => {
                 assert_eq!(update.instrument_id, instrument_id);
                 assert_eq!(update.rate, "0.0002".parse().unwrap());
             }
@@ -4326,7 +4350,7 @@ mod tests {
         DeriveDataClient::handle_ws_message(DeriveWsMessage::Subscription(payload), &ctx);
 
         match rx.try_recv().unwrap() {
-            DataEvent::OptionGreeks(greeks) => {
+            DataEvent::Data(Data::OptionGreeks(greeks)) => {
                 assert_eq!(greeks.instrument_id, instrument_id);
                 assert!((greeks.greeks.delta - 0.55).abs() < 1e-9);
                 assert!((greeks.greeks.gamma - 0.0008).abs() < 1e-9);
@@ -4383,7 +4407,7 @@ mod tests {
                         "duplicate IndexPriceUpdate emission"
                     );
                 }
-                DataEvent::FundingRate(f) => {
+                DataEvent::Data(Data::FundingRate(f)) => {
                     assert!(
                         funding.replace(f).is_none(),
                         "duplicate FundingRate emission"

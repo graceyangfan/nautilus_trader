@@ -71,6 +71,35 @@ than once.
 **Input ownership**: Clearing or modifying the original Python list after `add_data()` does not
 change the loaded stream.
 
+### Equal-timestamp replay ordering
+
+For built-in market data and `CustomData`, the engine replays data in ascending `ts_init` order.
+When items have the same `ts_init`:
+
+- **Across streams**: The stream registered by the earlier `add_data()` call takes priority.
+- **Within a stream**: Items retain their order in the input list.
+
+The engine dispatches each item before advancing to the next. Equal timestamps do not mean that
+all data at that timestamp has reached the strategy before `on_bar` runs.
+
+To use same-timestamp custom data in `on_bar`, add its stream before the bars. Assume `flows` is a
+list of `CustomData` points, `bars` is a list of external `Bar` objects, and the engine already has
+the required venue, instrument, and a strategy subscribed to both:
+
+```python
+engine.add_data(flows)
+engine.add_data(bars)
+engine.run()
+```
+
+At each shared `ts_init`, `on_data` receives the flow points before `on_bar` receives the bars.
+State updated by `on_data` is then available to `on_bar`. Reversing the two `add_data()` calls makes
+`on_bar` run first, before that state includes the same-timestamp flow points.
+
+Set custom data's `ts_init` to its actual availability time. Stream registration order only breaks
+ties; a point with a later `ts_init` still arrives after the bar. For bar timestamps, see the
+[bar timestamp convention](bar-execution.md#bar-timestamp-convention).
+
 ### Streaming batches manually
 
 Use **streaming mode** when the complete dataset does not fit in memory:
@@ -107,11 +136,12 @@ Build the node before adding strategies through its run-specific methods:
 ```python
 from decimal import Decimal
 
+from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
-from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BookType
@@ -131,7 +161,7 @@ venue = BacktestVenueConfig(
 )
 data = BacktestDataConfig(
     data_type=NautilusDataType.QuoteTick,
-    catalog_path="/data/catalog",
+    catalog=DataCatalogConfig(path="/data/catalog"),
     instrument_id=instrument_id,
 )
 config = BacktestRunConfig(
@@ -186,7 +216,7 @@ Set `batch_deltas=False` to replay each delta individually:
 ```python
 data = BacktestDataConfig(
     data_type=NautilusDataType.OrderBookDelta,
-    catalog_path="/data/catalog",
+    catalog=DataCatalogConfig(path="/data/catalog"),
     instrument_id=instrument_id,
     batch_deltas=False,
 )

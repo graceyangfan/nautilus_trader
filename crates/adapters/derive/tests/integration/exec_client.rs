@@ -89,7 +89,7 @@ use nautilus_live::{
 };
 use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
-    data::QuoteTick,
+    data::{Data, QuoteTick},
     enums::{
         AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
         PositionSide, TimeInForce, TriggerType,
@@ -1300,8 +1300,8 @@ fn test_config(rest: SocketAddr, ws: SocketAddr) -> DeriveExecutionClientConfig 
         wallet_address: Some(TEST_WALLET.to_string()),
         session_key: Some(TEST_SESSION_KEY.into()),
         subaccount_id: Some(TEST_SUBACCOUNT),
-        base_url_rest: Some(rest_url(rest)),
-        base_url_ws: Some(ws_url(ws)),
+        base_url_rest: Some(rest_url(rest).into()),
+        base_url_ws: Some(ws_url(ws).into()),
         proxy_url: None,
         environment: DeriveEnvironment::Testnet,
         http_timeout_secs: 5,
@@ -1674,14 +1674,14 @@ async fn test_connect_observes_native_portfolio_instruments_before_private_strea
     let observed = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(tc.client.connect(), async {
             let event = data_rx.recv().await.unwrap();
-            let DataEvent::Instrument(instrument) = event else {
+            let DataEvent::Data(Data::Instrument(instrument)) = event else {
                 panic!("Expected required instrument definition");
             };
             let before_stream = ws_state.login_frames.lock().await.is_empty();
             let raw = instrument.info().unwrap().clone();
             let id = instrument.id();
             let precision = (instrument.price_precision(), instrument.size_precision());
-            cache.borrow_mut().add_instrument(instrument).unwrap();
+            cache.borrow_mut().add_instrument(*instrument).unwrap();
             (before_stream, id, precision, raw)
         })
     })

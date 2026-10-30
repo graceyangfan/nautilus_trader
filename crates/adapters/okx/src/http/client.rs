@@ -319,9 +319,24 @@ mod tests {
     use super::{
         Method, OKX_GLOBAL_RATE_KEY, OKXEnvironment, OKXHttpClient, OKXHttpError,
         OKXInstrumentDefinitionError, OKXRawHttpClient, Timestamp, deserialize_okx_response,
-        parse_retry_after, resolve_okx_error_code, resolve_okx_error_message,
+        parse_retry_after, reconciliation_history_page_limit, resolve_okx_error_code,
+        resolve_okx_error_message,
     };
     use crate::http::models::OKXFeeRate;
+
+    #[rstest]
+    #[case::default(None, 50)]
+    #[case::disabled(Some(0), 0)]
+    #[case::below_cap(Some(49), 49)]
+    #[case::at_cap(Some(50), 50)]
+    #[case::above_cap(Some(51), 50)]
+    #[case::maximum(Some(u32::MAX), 50)]
+    fn test_reconciliation_history_page_limit(
+        #[case] max_pages: Option<u32>,
+        #[case] expected: usize,
+    ) {
+        assert_eq!(reconciliation_history_page_limit(max_pages), expected);
+    }
 
     #[rstest]
     fn test_is_spread_prefers_cached_future(mut crypto_future_btcusdt: CryptoFuture) {
@@ -6691,6 +6706,7 @@ impl OKXHttpClient {
         let okx_side = OKXSide::from(order_side);
 
         let instrument_type = okx_instrument_type_from_symbol(instrument_id.symbol.as_str());
+
         let tgt_ccy = okx_algo_target_currency(
             instrument_type,
             td_mode,
@@ -6698,7 +6714,7 @@ impl OKXHttpClient {
             order_type,
             quote_quantity,
         )
-        .map_err(OKXHttpError::ValidationError)?;
+        .map_err(OKXHttpError::from_order_denial)?;
 
         validate_algo_trigger_type(instrument_type, td_mode, order_type, trigger_type)
             .map_err(OKXHttpError::ValidationError)?;

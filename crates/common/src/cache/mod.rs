@@ -485,17 +485,22 @@ impl Cache {
 
     /// Loads all core caches from the database.
     ///
-    /// The loaded instrument closes replace all closes already held in memory. This includes values
-    /// added directly before the persistent cache is loaded.
+    /// The loaded instrument closes, Greeks, and yield curves replace their corresponding maps in
+    /// memory, including values added directly before the persistent cache is loaded.
     ///
     /// # Errors
     ///
-    /// Returns an error if loading cache data fails.
+    /// Returns an error if loading cache data fails or a loaded yield curve fails
+    /// [`YieldCurve::validate`].
     pub async fn cache_all(&mut self) -> anyhow::Result<()> {
         let mut cache_map = match &self.database {
             Some(db) => db.load_all().await?,
             None => CacheMap::default(),
         };
+
+        for curve in cache_map.yield_curves.values() {
+            curve.validate()?;
+        }
 
         // An adapter registers the loaded currencies before decoding their dependents; repeating
         // it here keeps the cached map consistent with the registry whatever the adapter did.
@@ -504,6 +509,8 @@ impl Cache {
         self.instruments = cache_map.instruments;
         self.instrument_closes = cache_map.instrument_closes;
         self.synthetics = cache_map.synthetics;
+        self.greeks = cache_map.greeks;
+        self.yield_curves = cache_map.yield_curves;
         self.accounts = cache_map
             .accounts
             .into_iter()
@@ -2284,11 +2291,7 @@ impl Cache {
     pub fn add_funding_rates(&mut self, funding_rates: &[FundingRateUpdate]) -> anyhow::Result<()> {
         check_slice_not_empty(funding_rates, stringify!(funding_rates))?;
 
-        let instrument_id = funding_rates[0].instrument_id;
-        log::debug!(
-            "Adding `FundingRateUpdate`[{}] {instrument_id}",
-            funding_rates.len()
-        );
+        log::debug!("Adding `FundingRateUpdate`[{}]", funding_rates.len());
 
         if self.config.save_market_data
             && let Some(database) = &mut self.database
@@ -2298,12 +2301,11 @@ impl Cache {
             }
         }
 
-        let funding_rate_deque = self
-            .funding_rates
-            .entry(instrument_id)
-            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
-
         for funding_rate in funding_rates {
+            let funding_rate_deque = self
+                .funding_rates
+                .entry(funding_rate.instrument_id)
+                .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
             funding_rate_deque.push_front(*funding_rate);
         }
         Ok(())
@@ -2379,8 +2381,7 @@ impl Cache {
     pub fn add_quotes(&mut self, quotes: &[QuoteTick]) -> anyhow::Result<()> {
         check_slice_not_empty(quotes, stringify!(quotes))?;
 
-        let instrument_id = quotes[0].instrument_id;
-        log::debug!("Adding `QuoteTick`[{}] {instrument_id}", quotes.len());
+        log::debug!("Adding `QuoteTick`[{}]", quotes.len());
 
         if self.config.save_market_data
             && let Some(database) = &mut self.database
@@ -2390,12 +2391,11 @@ impl Cache {
             }
         }
 
-        let quotes_deque = self
-            .quotes
-            .entry(instrument_id)
-            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
-
         for quote in quotes {
+            let quotes_deque = self
+                .quotes
+                .entry(quote.instrument_id)
+                .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
             quotes_deque.push_front(*quote);
         }
         Ok(())
@@ -2431,8 +2431,7 @@ impl Cache {
     pub fn add_trades(&mut self, trades: &[TradeTick]) -> anyhow::Result<()> {
         check_slice_not_empty(trades, stringify!(trades))?;
 
-        let instrument_id = trades[0].instrument_id;
-        log::debug!("Adding `TradeTick`[{}] {instrument_id}", trades.len());
+        log::debug!("Adding `TradeTick`[{}]", trades.len());
 
         if self.config.save_market_data
             && let Some(database) = &mut self.database
@@ -2442,12 +2441,11 @@ impl Cache {
             }
         }
 
-        let trades_deque = self
-            .trades
-            .entry(instrument_id)
-            .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
-
         for trade in trades {
+            let trades_deque = self
+                .trades
+                .entry(trade.instrument_id)
+                .or_insert_with(|| BoundedVecDeque::new(self.config.tick_capacity));
             trades_deque.push_front(*trade);
         }
         Ok(())
@@ -2486,8 +2484,7 @@ impl Cache {
     pub fn add_bars(&mut self, bars: &[Bar]) -> anyhow::Result<()> {
         check_slice_not_empty(bars, stringify!(bars))?;
 
-        let bar_type = bars[0].bar_type;
-        log::debug!("Adding `Bar`[{}] {bar_type}", bars.len());
+        log::debug!("Adding `Bar`[{}]", bars.len());
 
         if self.config.save_market_data
             && let Some(database) = &mut self.database
@@ -2497,12 +2494,11 @@ impl Cache {
             }
         }
 
-        let bars_deque = self
-            .bars
-            .entry(bar_type)
-            .or_insert_with(|| BoundedVecDeque::new(self.config.bar_capacity));
-
         for bar in bars {
+            let bars_deque = self
+                .bars
+                .entry(bar.bar_type)
+                .or_insert_with(|| BoundedVecDeque::new(self.config.bar_capacity));
             insert_bar(bars_deque, *bar);
         }
         Ok(())
@@ -2535,16 +2531,19 @@ impl Cache {
 
     /// Adds the `greeks` data to the cache.
     ///
+    /// With market-data persistence enabled, the adapter accepts the write before memory is updated.
+    /// Queued adapters can log later database failures without rolling back the cached value.
+    ///
     /// # Errors
     ///
-    /// Returns an error if persisting the greeks data to the backing database fails.
+    /// Returns an error if the adapter cannot accept the greeks data for persistence.
     pub fn add_greeks(&mut self, greeks: GreeksData) -> anyhow::Result<()> {
         log::debug!("Adding `GreeksData` {}", greeks.instrument_id);
 
         if self.config.save_market_data
-            && let Some(_database) = &mut self.database
+            && let Some(database) = &mut self.database
         {
-            // TODO: Implement database.add_greeks(&greeks) when database adapter is updated
+            database.add_greeks(&greeks)?;
         }
 
         self.greeks.insert(greeks.instrument_id, greeks);
@@ -2570,20 +2569,23 @@ impl Cache {
 
     /// Adds the `yield_curve` data to the cache.
     ///
+    /// With market-data persistence enabled, the adapter accepts the write before memory is updated.
+    /// Queued adapters can log later database failures without rolling back the cached value.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The yield curve fails [`YieldCurve::validate`].
-    /// - Persisting the yield curve data to the backing database fails.
+    /// - The adapter cannot accept the yield curve data for persistence.
     pub fn add_yield_curve(&mut self, yield_curve: YieldCurve) -> anyhow::Result<()> {
         yield_curve.validate()?;
 
         log::debug!("Adding `YieldCurve` {}", yield_curve.curve_name);
 
         if self.config.save_market_data
-            && let Some(_database) = &mut self.database
+            && let Some(database) = &mut self.database
         {
-            // TODO: Implement database.add_yield_curve(&yield_curve) when database adapter is updated
+            database.add_yield_curve(&yield_curve)?;
         }
 
         self.yield_curves
@@ -3268,8 +3270,7 @@ impl Cache {
 
         self.index.position_oms.insert(position_id, oms_type);
         self.index.positions.insert(position_id);
-        self.index.positions_open.insert(position_id);
-        self.index.positions_closed.remove(&position_id); // Cleanup for NETTING reopen
+        self.refresh_position_indexes(&position_cell.borrow());
         self.index.strategies.insert(strategy_id);
         self.index.strategy_orders.entry(strategy_id).or_default();
 

@@ -78,18 +78,19 @@ implementation details.
 
 ### Module roots and declarations
 
-Preserve the surrounding module-root style when adding child modules. In each contiguous
-declaration block in a `mod.rs` file, order out-of-line module declarations by these sections:
+Preserve the surrounding module-root style when adding child modules.
+
+In each contiguous declaration block in a hand-written Rust file, order top-level out-of-line module
+declarations by these sections:
 
 1. `#[macro_use]` modules.
-1. Public modules.
-1. Restricted modules such as `pub(crate)`.
-1. Non-test `#[cfg(...)]`-gated modules.
-1. Private modules.
+1. Unconditional modules: public, restricted (such as `pub(crate)`), then private.
+1. Non-test `#[cfg(...)]`-gated modules: public, restricted, then private.
 1. Test-only modules.
 
-Alphabetize declarations within each section and leave one blank line between sections. The
-formatting hook enforces this order in `mod.rs` files.
+Alphabetize declarations in each visibility group, the `#[macro_use]` section, and the test-only section.
+Leave one blank line between groups and sections. The formatting hook enforces this order in all
+hand-written Rust files, including `lib.rs` and `mod.rs`.
 
 Use the narrowest visibility that serves the caller. The workspace denies unreachable `pub` items.
 
@@ -253,9 +254,14 @@ The formatting hook:
 
 - Checks existing control-flow, spawn, and module-ordering rules at changed boundaries.
 - Compares staged and unstaged changes against `HEAD`, or against the merge base with `CHANGED_BASE_SHA` when set.
-- Falls back to checking all tracked Rust files when a CI base is unavailable.
+- Checks all tracked Rust files under `crates`, `examples`, and `docs` when the configured base cannot be resolved.
 - Reads complete changed files for context and includes lines used by exemption checks when selecting diagnostics.
 - Does not modify files.
+
+`make pre-commit` checks committed, staged, and unstaged Rust changes against the merge base with the
+local `origin/develop` ref, then runs prek if formatting passes. Set `CHANGED_BASE_SHA` to select
+another base. The default applies only to this formatting check. Commit-time hooks and direct
+`prek run --all-files` compare against `HEAD` unless `CHANGED_BASE_SHA` is set.
 
 These remain review conventions:
 
