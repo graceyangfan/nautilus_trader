@@ -5,11 +5,15 @@ Released on TBD (UTC).
 ### Enhancements
 
 - Added `HttpClient` certificate support through `certs_dir`
+- Added sandbox execution matching against `OrderBookDepth` snapshots (#5436), thanks @graceyangfan
 - Added Betfair certificate login through `certs_dir`
 - Added Deribit routed spot metadata and local order and market data capability checks
 
 ### Breaking Changes
 
+- Removed Python `RedisCacheDatabase` and `PostgresCacheDatabase`; configure cache persistence through node factories
+- Removed Python `RedisMessageBusBacking`; configure external message bus backing through node factories
+- Changed `PostgresCacheDatabase::connect` to take `PostgresCacheConfig`; replace individual connection arguments
 - Changed `CacheDatabaseAdapter` Greek and yield-curve defaults to errors; override supported reads and writes
 - Changed `Cache::cache_all` to replace preloaded Greeks and yield curves; add transient values after loading
 - Changed raw `Price` and `Quantity` construction and decoding to reject digits beyond precision; rescale or round first
@@ -47,6 +51,7 @@ Released on TBD (UTC).
 
 - Fixed `Cache` indexing closed positions as open and excluding them from purging after insertion
 - Fixed mixed-key market data batches being cached under the first row's instrument or bar type
+- Fixed `ExecTester` panicking on unsupported `GTD` brackets
 - Fixed Postgres cache not persisting or restoring Greeks and yield curves with `save_market_data`
 - Fixed Binance Futures instrument `ts_event` and `ts_init` defaulting to zero
 - Fixed Bybit execution client omitting trigger prices from HTTP and WebSocket amendments
@@ -57,6 +62,7 @@ Released on TBD (UTC).
 - Fixed Databento option strikes rejecting values finer than the strike currency precision
 - Fixed Databento price scaling at explicitly selected 17- and 18-decimal precision
 - Fixed Deribit instrument loading panicking on invalid spot definitions
+- Fixed Deribit single-order recovery treating failed lookups as missing orders
 - Fixed Kraken Futures order-update cancellations closing tracked orders before their fills arrive
 - Fixed OKX order commands rejected before being written during WebSocket reconnects
 - Fixed OKX repeated logins preventing authentication recovery after interrupted reconnects
@@ -70,13 +76,18 @@ Released on TBD (UTC).
 - Improved Docker publishing with temporary digest directories isolated per job
 - Refined Polymarket limit submit responses and venue order ID lookup
 - Standardized module ordering checks to place unconditional modules before cfg-gated modules
-- Upgraded `socket-cli` tool to v1.10.1
+- Upgraded `cargo-codspeed` tool to v6.0.0
+- Upgraded `cargo-nextest` tool to v0.9.150
+- Upgraded `socket-cli` tool to v1.11.1
+- Upgraded `arrow` and `parquet` crates to v59.3.2
 - Upgraded `hypersync-client` crate to v2.0.0
-- Upgraded `ty` package (dev) to v0.0.90
+- Upgraded `ruff` package (dev) to v0.17.3
+- Upgraded `ty` package (dev) to v0.0.91
 
 ### Documentation Updates
 
 - Improved Polymarket setup and configuration troubleshooting guidance
+- Updated Kraken Futures Maker Protection rollout and split-amendment guidance
 - Updated Python Polymarket examples with scoped reconciliation, risk checks, and 30-second shutdown waits
 
 ---
