@@ -386,7 +386,8 @@ mod tests {
 
     use nautilus_model::{
         data::{BookOrder, OrderBookDelta},
-        enums::{BookAction, OrderSide, RecordFlag},
+        enums::{BookAction, BookType, OrderSide, RecordFlag},
+        orderbook::OrderBook,
         types::{Price, Quantity},
     };
     use rstest::rstest;
@@ -588,6 +589,59 @@ mod tests {
 
         assert!(recovery.is_none());
         assert!(received(&mut rx).is_empty());
+    }
+
+    #[rstest]
+    #[case::spot(DepthSequencing::Spot)]
+    #[case::futures(DepthSequencing::Futures)]
+    fn recovery_preserves_earlier_diff_timestamps_after_later_rest_snapshot(
+        #[case] sequencing: DepthSequencing,
+    ) {
+        let (tracker, mut rx) = tracker(sequencing);
+        tracker.subscribe(instrument_id());
+        let update = |first, last, previous| match sequencing {
+            DepthSequencing::Spot => spot_update(first, last),
+            DepthSequencing::Futures => futures_update(first, last, previous),
+        };
+        let recovery = tracker
+            .handle_update(instrument_id(), update(95, 100, 90))
+            .unwrap();
+        let first = update(101, 101, 100);
+        let second = update(102, 102, 101);
+        tracker.handle_update(instrument_id(), first.clone());
+        tracker.handle_update(instrument_id(), second.clone());
+        let mut baseline = snapshot(100, matches!(sequencing, DepthSequencing::Futures));
+
+        for row in &mut baseline.deltas.deltas {
+            row.ts_init = 300_000.into();
+        }
+        baseline.deltas = OrderBookDeltas::new(instrument_id(), baseline.deltas.deltas);
+
+        accept(&tracker, &recovery, baseline).unwrap();
+        let mut live = update(103, 103, 102);
+        let mut frame = live.deltas.take().unwrap();
+
+        for row in &mut frame.deltas {
+            row.ts_init = 400_000.into();
+        }
+        live.deltas = Some(OrderBookDeltas::new(instrument_id(), frame.deltas));
+        assert!(tracker.handle_update(instrument_id(), live).is_none());
+        let frames = received(&mut rx);
+
+        assert!(recovery.is_accepted());
+        assert_eq!(sequences(&frames), vec![100, 101, 102, 103]);
+        assert_eq!(frames[0].ts_init.as_u64(), 300_000);
+        assert_eq!(frames[1], first.deltas.unwrap());
+        assert_eq!(frames[2], second.deltas.unwrap());
+        assert_eq!(frames[3].ts_init.as_u64(), 400_000);
+        let mut book = OrderBook::new(instrument_id(), BookType::L2_MBP);
+
+        for frame in &frames {
+            book.apply_deltas(frame).unwrap();
+        }
+        assert_eq!(book.sequence, 103);
+        assert_eq!(book.best_bid_price(), Some(Price::from("100.00")));
+        assert_eq!(book.best_ask_price(), Some(Price::from("101.00")));
     }
 
     #[rstest]
