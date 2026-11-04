@@ -81,7 +81,9 @@ use crate::{
             AX_FILLS_MAX_LOOKBACK_DAYS, AX_POST_ONLY_REJECT, AX_VENUE,
         },
         credential::Credential,
-        enums::{AxCancelRejectionReason, AxOrderSide, AxOrderStatus, AxTimeInForce},
+        enums::{
+            AxCancelRejectionReason, AxOrderSide, AxOrderStatus, AxSelfTradeBehavior, AxTimeInForce,
+        },
         parse::{
             ax_timestamp_stn_to_unix_nanos, cid_to_client_order_id, client_order_id_to_cid,
             quantity_to_contracts,
@@ -280,7 +282,11 @@ impl AxExecutionClient {
         });
     }
 
-    fn submit_order_internal(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
+    fn submit_order_internal(
+        &self,
+        cmd: &SubmitOrder,
+        self_trade: Option<AxSelfTradeBehavior>,
+    ) -> anyhow::Result<()> {
         let (
             order_for_task,
             client_order_id,
@@ -399,6 +405,7 @@ impl AxExecutionClient {
                     submit_time_in_force,
                     price,
                     submit_post_only,
+                    self_trade,
                 )
                 .await;
 
@@ -434,12 +441,27 @@ impl AxExecutionClient {
         let client_order_id = cmd.client_order_id;
         let venue_order_id = cmd.venue_order_id;
 
-        // `OrderCancelRejected` comes only from the WS CancelRejected event;
-        // local send failures leave the outcome to reconciliation.
+        let emitter = self.emitter.clone();
+        let clock = self.clock;
+        let strategy_id = cmd.strategy_id;
+        let instrument_id = cmd.instrument_id;
+        let command_id = cmd.command_id;
+
         self.spawn_task("cancel_order", async move {
             if let Err(e) = ws_orders.cancel_order(client_order_id, venue_order_id).await {
                 match classify_ax_ws_failure(&e) {
-                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                    CommandFailure::NotSent(reason) => {
+                        emitter.emit_order_cancel_denied_event(
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            venue_order_id,
+                            &reason,
+                            clock.get_time_ns(),
+                            Some(command_id),
+                        );
+                    }
+                    CommandFailure::VenueRejected(reason) => {
                         log::warn!("Cancel command failed for {client_order_id}: {reason}");
                     }
                     CommandFailure::Ambiguous(reason) => {
@@ -906,7 +928,7 @@ impl ExecutionClient for AxExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        {
+        let self_trade = {
             let cache = self.core.cache();
             let order = cache.try_order(&cmd.client_order_id)?;
 
@@ -915,18 +937,24 @@ impl ExecutionClient for AxExecutionClient {
                 return Ok(());
             }
 
-            if let Err(e) = validate_order_for_ax_submit(&order)
+            let self_trade = match validate_order_for_ax_submit(&order)
                 .and_then(|()| validate_order_init_instructions(&cmd.order_init))
+                .and_then(|()| self_trade_from_params(cmd.params.as_ref()))
             {
-                self.emitter.emit_order_denied(&order, &e.to_string());
-                return Ok(());
-            }
+                Ok(self_trade) => self_trade,
+                Err(e) => {
+                    self.emitter.emit_order_denied(&order, &e.to_string());
+                    return Ok(());
+                }
+            };
 
             log::debug!("OrderSubmitted client_order_id={}", order.client_order_id());
             self.emitter.emit_order_submitted(&order);
-        }
 
-        self.submit_order_internal(&cmd)
+            self_trade
+        };
+
+        self.submit_order_internal(&cmd, self_trade)
     }
 
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
@@ -957,7 +985,7 @@ impl ExecutionClient for AxExecutionClient {
 
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         if cmd.trigger_price.is_some() {
-            emit_ax_modify_rejected(
+            emit_ax_modify_denied(
                 &self.emitter,
                 self.clock,
                 cmd.strategy_id,
@@ -965,6 +993,7 @@ impl ExecutionClient for AxExecutionClient {
                 cmd.client_order_id,
                 cmd.venue_order_id,
                 "AX does not support venue-native trigger prices",
+                cmd.command_id,
             );
             return Ok(());
         }
@@ -978,7 +1007,7 @@ impl ExecutionClient for AxExecutionClient {
         let venue_order_id = match tracked_venue_order_id.or(cmd.venue_order_id) {
             Some(voi) => voi,
             None => {
-                emit_ax_modify_rejected(
+                emit_ax_modify_denied(
                     &self.emitter,
                     self.clock,
                     cmd.strategy_id,
@@ -986,6 +1015,7 @@ impl ExecutionClient for AxExecutionClient {
                     cmd.client_order_id,
                     None,
                     "missing venue_order_id",
+                    cmd.command_id,
                 );
                 return Ok(());
             }
@@ -995,7 +1025,7 @@ impl ExecutionClient for AxExecutionClient {
             Some(quantity) => match quantity_to_contracts(quantity) {
                 Ok(contracts) => Some(contracts),
                 Err(e) => {
-                    emit_ax_modify_rejected(
+                    emit_ax_modify_denied(
                         &self.emitter,
                         self.clock,
                         cmd.strategy_id,
@@ -1003,6 +1033,7 @@ impl ExecutionClient for AxExecutionClient {
                         cmd.client_order_id,
                         Some(venue_order_id),
                         &e.to_string(),
+                        cmd.command_id,
                     );
                     return Ok(());
                 }
@@ -1011,7 +1042,7 @@ impl ExecutionClient for AxExecutionClient {
         };
 
         if !self.core.is_connected() {
-            emit_ax_modify_rejected(
+            emit_ax_modify_denied(
                 &self.emitter,
                 self.clock,
                 cmd.strategy_id,
@@ -1019,6 +1050,7 @@ impl ExecutionClient for AxExecutionClient {
                 cmd.client_order_id,
                 Some(venue_order_id),
                 "AX execution client is not connected",
+                cmd.command_id,
             );
             return Ok(());
         }
@@ -1070,7 +1102,20 @@ impl ExecutionClient for AxExecutionClient {
                 // No replace failure is an unambiguous rejection (see
                 // `classify_ax_http_failure`); leave the order pending.
                 Err(e) => match classify_ax_http_failure(&e) {
-                    CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                    CommandFailure::NotSent(reason) => {
+                        complete_pending_modify(&caches, venue_order_id);
+                        emit_ax_modify_denied(
+                            &emitter,
+                            clock,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            Some(venue_order_id),
+                            &reason,
+                            cmd.command_id,
+                        );
+                    }
+                    CommandFailure::VenueRejected(reason) => {
                         complete_pending_modify(&caches, venue_order_id);
                         emit_ax_modify_rejected(
                             &emitter,
@@ -1080,6 +1125,7 @@ impl ExecutionClient for AxExecutionClient {
                             client_order_id,
                             Some(venue_order_id),
                             &reason,
+                            Some(cmd.command_id),
                         );
                     }
                     CommandFailure::Ambiguous(reason) => {
@@ -1764,6 +1810,36 @@ fn add_special_fill_order_reports(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Failure emission retains order identity and command correlation"
+)]
+fn emit_ax_modify_denied(
+    emitter: &ExecutionEventEmitter,
+    clock: &'static AtomicTime,
+    strategy_id: StrategyId,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    venue_order_id: Option<VenueOrderId>,
+    reason: &str,
+    causation_id: UUID4,
+) {
+    log::warn!("AX modify denied for {client_order_id}: {reason}");
+    emitter.emit_order_modify_denied_event(
+        strategy_id,
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        reason,
+        clock.get_time_ns(),
+        Some(causation_id),
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Failure emission retains order identity and command correlation"
+)]
 fn emit_ax_modify_rejected(
     emitter: &ExecutionEventEmitter,
     clock: &'static AtomicTime,
@@ -1772,6 +1848,7 @@ fn emit_ax_modify_rejected(
     client_order_id: ClientOrderId,
     venue_order_id: Option<VenueOrderId>,
     reason: &str,
+    causation_id: Option<UUID4>,
 ) {
     log::warn!("AX modify rejected for {client_order_id}: {reason}");
     emitter.emit_order_modify_rejected_event(
@@ -1781,6 +1858,7 @@ fn emit_ax_modify_rejected(
         venue_order_id,
         reason,
         clock.get_time_ns(),
+        causation_id,
     );
 }
 
@@ -2100,6 +2178,7 @@ fn dispatch_order_event(
                         client_order_id,
                         Some(active_venue_order_id),
                         reason,
+                        None,
                     );
 
                     if let Some(order) = &msg.o
@@ -3118,6 +3197,20 @@ fn validate_order_instructions(
     }
 
     Ok(())
+}
+
+// Maps the optional strategy `st` order param onto the venue's self-trade behavior.
+// Unknown keys are ignored; an invalid value is denied by the caller before submission.
+fn self_trade_from_params(params: Option<&Params>) -> anyhow::Result<Option<AxSelfTradeBehavior>> {
+    let Some(value) = params.and_then(|params| params.get("st")) else {
+        return Ok(None);
+    };
+
+    let value = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid self-trade behavior value: expected a string"))?;
+
+    AxSelfTradeBehavior::parse_wire(value).map(Some)
 }
 
 // The AX HTTP API documents only a bare 400 with no error schema, so no venue
@@ -5877,6 +5970,56 @@ mod tests {
             .quantity(quantity)
             .price(Price::from("1.10"))
             .build()
+    }
+
+    #[rstest]
+    fn test_self_trade_from_params_parses_wire_alias() {
+        let params = Params::new([("st".to_string(), serde_json::json!("xb"))].into());
+
+        assert_eq!(
+            self_trade_from_params(Some(&params)).unwrap(),
+            Some(AxSelfTradeBehavior::CancelBoth)
+        );
+    }
+
+    #[rstest]
+    fn test_self_trade_from_params_ignores_unknown_keys() {
+        let params = Params::new(
+            [
+                (
+                    "execution_instruction".to_string(),
+                    serde_json::json!("anything"),
+                ),
+                ("tag".to_string(), serde_json::json!("ignored")),
+            ]
+            .into(),
+        );
+
+        assert_eq!(self_trade_from_params(Some(&params)).unwrap(), None);
+    }
+
+    #[rstest]
+    fn test_self_trade_from_params_rejects_unknown_value() {
+        let params = Params::new([("st".to_string(), serde_json::json!("cancel"))].into());
+
+        let err = self_trade_from_params(Some(&params)).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("Unsupported self-trade behavior")
+        );
+    }
+
+    #[rstest]
+    fn test_self_trade_from_params_rejects_non_string_value() {
+        let params = Params::new([("st".to_string(), serde_json::json!(1))].into());
+
+        let err = self_trade_from_params(Some(&params)).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Invalid self-trade behavior value: expected a string"
+        );
     }
 
     #[rstest]

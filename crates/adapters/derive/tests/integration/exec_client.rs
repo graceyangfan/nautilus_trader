@@ -91,8 +91,8 @@ use nautilus_model::{
     accounts::{AccountAny, MarginAccount},
     data::{Data, QuoteTick},
     enums::{
-        AccountType, ContingencyType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType,
-        PositionSide, TimeInForce, TriggerType,
+        AccountType, AvgPxReconciliation, ContingencyType, LiquiditySide, OmsType, OrderSide,
+        OrderStatus, OrderType, PositionSide, TimeInForce, TriggerType,
     },
     events::{
         AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderEventType,
@@ -109,6 +109,7 @@ use nautilus_model::{
 };
 use nautilus_network::{http::HttpClient, websocket::TransportBackend};
 use rstest::rstest;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
 use ustr::Ustr;
@@ -3858,6 +3859,82 @@ async fn test_submit_order_jsonrpc_rejection_emits_order_rejected() {
 }
 
 #[rstest]
+#[case(OrderType::StopMarket)]
+#[case(OrderType::StopLimit)]
+#[case(OrderType::MarketIfTouched)]
+#[case(OrderType::LimitIfTouched)]
+#[tokio::test]
+async fn test_submit_trigger_session_key_expiry_emits_actionable_rejection(
+    #[case] order_type: OrderType,
+    #[values(OrderSide::Buy, OrderSide::Sell)] side: OrderSide,
+) {
+    let ws_state = WsState::default();
+    let response: Value = serde_json::from_str(include_str!(
+        "../../test_data/ws_error_session_key_expiry.json"
+    ))
+    .unwrap();
+    *ws_state.trigger_order_reply.lock().await = Some(response);
+    let mut tc = build_client(RestState::default(), ws_state.clone()).await;
+    tc.client.connect().await.unwrap();
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let client_order_id = ClientOrderId::from("STRAT-KEY-EXPIRY");
+    let mut builder = OrderTestBuilder::new(order_type);
+    builder
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(StrategyId::from("S-1"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(side)
+        .quantity(Quantity::from("1.000"))
+        .trigger_price(Price::from("3600.00"))
+        .trigger_type(TriggerType::MarkPrice);
+
+    if matches!(order_type, OrderType::StopLimit | OrderType::LimitIfTouched) {
+        builder.price(Price::from("3600.00"));
+    }
+
+    let order = builder.build();
+    tc.cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    tc.client.submit_order(submit_cmd(&order)).unwrap();
+    let _ = drain_until(
+        &mut tc.rx,
+        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::Submitted(_))),
+        "OrderSubmitted",
+    )
+    .await;
+    let event = drain_until(
+        &mut tc.rx,
+        |e| matches!(e, ExecutionEvent::Order(_)),
+        "expiry rejection",
+    )
+    .await;
+
+    let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = event else {
+        panic!("expected rejection: {event:?}")
+    };
+
+    assert_eq!(rejected.client_order_id, client_order_id);
+    assert_eq!(rejected.instrument_id, instrument_id);
+    assert_eq!(rejected.strategy_id, StrategyId::from("S-1"));
+    assert_eq!(rejected.trader_id, TraderId::from("TRADER-001"));
+    assert_eq!(rejected.account_id, AccountId::from("DERIVE-001"));
+    assert_eq!(
+        rejected.reason.as_str(),
+        "14038: Signature expires at 1796263075s, session key expires at 1793728835s; use a key valid through the signature expiry",
+    );
+    assert!(!rejected.due_post_only);
+    assert!(!rejected.reconciliation);
+    assert_eq!(rejected.causation_id, None);
+    assert_eq!(ws_state.submitted_trigger_orders.lock().await.len(), 1);
+    assert!(ws_state.submitted_orders.lock().await.is_empty());
+    tc.client.disconnect().await.unwrap();
+}
+
+#[rstest]
 #[case::ioc(TimeInForce::Ioc, "ioc")]
 #[case::fok(TimeInForce::Fok, "fok")]
 #[tokio::test]
@@ -5289,7 +5366,7 @@ async fn test_cancel_trigger_order_without_venue_id_resolves_label() {
     2
 )]
 #[tokio::test]
-async fn test_cancel_trigger_order_without_venue_id_rejects_lookup_failure(
+async fn test_cancel_trigger_order_without_venue_id_denies_lookup_failure(
     #[case] trigger_orders_response: Value,
     #[case] expected_reason: &str,
     #[case] expected_calls: usize,
@@ -5331,13 +5408,8 @@ async fn test_cancel_trigger_order_without_venue_id_rejects_lookup_failure(
 
     let event = drain_until(
         &mut tc.rx,
-        |event| {
-            matches!(
-                event,
-                ExecutionEvent::Order(OrderEventAny::CancelRejected(_))
-            )
-        },
-        "OrderCancelRejected from trigger lookup",
+        |event| matches!(event, ExecutionEvent::Order(OrderEventAny::CancelDenied(_))),
+        "OrderCancelDenied from trigger lookup",
     )
     .await;
 
@@ -5350,7 +5422,7 @@ async fn test_cancel_trigger_order_without_venue_id_rejects_lookup_failure(
     assert!(ws_state.cancelled_trigger_orders.lock().await.is_empty());
     assert!(ws_state.cancelled_labels.lock().await.is_empty());
 
-    if let ExecutionEvent::Order(OrderEventAny::CancelRejected(rejected)) = event {
+    if let ExecutionEvent::Order(OrderEventAny::CancelDenied(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert!(rejected.venue_order_id.is_none());
         assert!(rejected.reason.contains(expected_reason));
@@ -6313,7 +6385,7 @@ async fn test_modify_order_posts_replace_and_emits_order_updated(
 
 #[rstest]
 #[tokio::test]
-async fn test_modify_order_rejects_missing_cached_order_with_canonical_reason() {
+async fn test_modify_order_denies_missing_cached_order_with_canonical_reason() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut tc = build_client(rest_state, ws_state).await;
@@ -6340,12 +6412,12 @@ async fn test_modify_order_rejects_missing_cached_order_with_canonical_reason() 
 
     let event = drain_until(
         &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))),
-        "OrderModifyRejected event",
+        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyDenied(_))),
+        "OrderModifyDenied event",
     )
     .await;
 
-    if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+    if let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = event {
         assert_eq!(rejected.client_order_id, client_order_id);
         assert_eq!(rejected.reason, ORDER_NOT_FOUND);
         assert_eq!(
@@ -6370,7 +6442,7 @@ async fn test_modify_order_rejects_missing_cached_order_with_canonical_reason() 
 )]
 #[case(i64::MAX as u64, "exceeds the Derive maximum")]
 #[tokio::test]
-async fn test_modify_order_rejects_invalid_signature_ttl_before_posting_replace(
+async fn test_modify_order_denies_invalid_signature_ttl_before_posting_replace(
     #[case] signature_expiry_secs: u64,
     #[case] reason_fragment: &str,
 ) {
@@ -6424,12 +6496,12 @@ async fn test_modify_order_rejects_invalid_signature_ttl_before_posting_replace(
 
     let event = drain_until(
         &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))),
-        "OrderModifyRejected event",
+        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyDenied(_))),
+        "OrderModifyDenied event",
     )
     .await;
 
-    if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+    if let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = event {
         let reason = rejected.reason.as_str();
         assert!(
             reason.contains("replace expiry validation failed") && reason.contains(reason_fragment),
@@ -7280,7 +7352,7 @@ async fn test_modify_order_jsonrpc_ambiguous_does_not_emit_modify_rejected(#[cas
 #[case::no_venue_order_id(None, true, "venue_order_id is required")]
 #[case::order_not_in_cache(Some(VenueOrderId::from("ord-x")), false, "order not found in cache")]
 #[tokio::test]
-async fn test_modify_order_rejects_invalid_command(
+async fn test_modify_order_denies_invalid_command(
     #[case] venue_order_id: Option<VenueOrderId>,
     #[case] pre_insert_order: bool,
     #[case] reason_fragment: &str,
@@ -7333,12 +7405,12 @@ async fn test_modify_order_rejects_invalid_command(
 
     let event = drain_until(
         &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))),
-        "OrderModifyRejected event",
+        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyDenied(_))),
+        "OrderModifyDenied event",
     )
     .await;
 
-    if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+    if let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = event {
         assert!(
             rejected.reason.contains(reason_fragment),
             "expected reason to contain `{reason_fragment}`, was `{}`",
@@ -7358,7 +7430,7 @@ async fn test_modify_order_rejects_invalid_command(
 
 #[rstest]
 #[tokio::test]
-async fn test_modify_order_rejects_trigger_order() {
+async fn test_modify_order_denies_trigger_order() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
     let mut tc = build_client(rest_state, ws_state.clone()).await;
@@ -7398,12 +7470,12 @@ async fn test_modify_order_rejects_trigger_order() {
 
     let event = drain_until(
         &mut tc.rx,
-        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))),
-        "OrderModifyRejected event",
+        |e| matches!(e, ExecutionEvent::Order(OrderEventAny::ModifyDenied(_))),
+        "OrderModifyDenied event",
     )
     .await;
 
-    if let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = event {
+    if let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = event {
         assert_eq!(
             rejected.reason,
             "Derive trigger orders cannot be modified; cancel and resubmit",
@@ -10237,41 +10309,63 @@ async fn test_generate_mass_status_normalizes_duplicate_labels() {
 }
 
 #[rstest]
-#[case::current_lifecycle(false)]
-#[case::prior_closed_lifecycle(true)]
+#[case::perp("ETH-PERP", dec!(2553.01), dec!(2553.87589666777), dec!(0.086589666777), dec!(2552.59), dec!(0.08658522))]
+#[case::option("ETH-20261106-2225-C", dec!(98.8), dec!(104.48782069511), dec!(0.56878207), dec!(98.4), dec!(0.5))]
 #[tokio::test]
 async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
-    #[case] prior_closed_lifecycle: bool,
+    #[case] symbol: &str,
+    #[case] entry_px: Decimal,
+    #[case] venue_average: Decimal,
+    #[case] opening_fee: Decimal,
+    #[case] close_px: Decimal,
+    #[case] closing_fee: Decimal,
+    #[values(false, true)] prior_closed_lifecycle: bool,
 ) {
     let state = RestState::default();
     let cid = ClientOrderId::from("FEE-AVERAGE-ENTRY");
-    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let instrument_id = InstrumentId::from(format!("{symbol}.DERIVE"));
+
+    let quantity = if symbol == "ETH-PERP" {
+        Quantity::from("0.100")
+    } else {
+        Quantity::from("0.10")
+    };
+
+    let entry_price = Price::from(entry_px.to_string());
+    let close_price = Price::from(close_px.to_string());
+    let opening_commission = Money::from_decimal(opening_fee, Currency::USDC()).unwrap();
+    let closing_commission = Money::from_decimal(closing_fee, Currency::USDC()).unwrap();
+    let total_commission = opening_commission + closing_commission;
     let venue_order_id = VenueOrderId::from("fee-average-entry");
     let trade_id = TradeId::from("fee-average-fill");
     let mut order = order_json_with(
         venue_order_id.as_str(),
         cid.as_str(),
         "buy",
-        "ETH-PERP",
+        symbol,
         1_700_000_002_000,
         "filled",
     );
     order["amount"] = json!("0.1");
     order["filled_amount"] = json!("0.1");
-    order["average_price"] = json!("2553.01");
-    order["limit_price"] = json!("2554.00");
-    order["order_fee"] = json!("0.086589666777");
+    order["average_price"] = json!(entry_px.to_string());
+    order["limit_price"] = json!(entry_px.to_string());
+    order["order_fee"] = json!(opening_fee.to_string());
     let mut trade = trade_json_with_label(
         trade_id.as_str(),
         venue_order_id.as_str(),
-        "ETH-PERP",
+        symbol,
         cid.as_str(),
     );
     trade["trade_amount"] = json!("0.1");
-    trade["trade_price"] = json!("2553.01");
+    trade["trade_price"] = json!(entry_px.to_string());
     trade["trade_fee"] = order["order_fee"].clone();
-    let mut position = sample_position_json("ETH-PERP", "0.1");
-    position["average_price"] = json!("2553.87589666777");
+    let mut position = sample_position_json(symbol, "0.1");
+    position["average_price"] = json!(venue_average.to_string());
+    if symbol != "ETH-PERP" {
+        position["instrument_type"] = json!("option");
+    }
+
     position["average_price_excl_fees"] = trade["trade_price"].clone();
     position["total_fees"] = trade["trade_fee"].clone();
     *state.open_orders_response.lock().await =
@@ -10297,14 +10391,14 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
             ),
         ] {
             let mut previous =
-                order_json_with(label, label, direction, "ETH-PERP", timestamp, "filled");
+                order_json_with(label, label, direction, symbol, timestamp, "filled");
             previous["amount"] = json!("0.2");
             previous["filled_amount"] = json!("0.2");
             previous["average_price"] = json!(price);
             previous["limit_price"] = json!(price);
             previous["order_fee"] = json!(fee);
             orders.push(previous);
-            let mut previous = trade_json_with_label(label, label, "ETH-PERP", label);
+            let mut previous = trade_json_with_label(label, label, symbol, label);
             previous["direction"] = json!(direction);
             previous["trade_amount"] = json!("0.2");
             previous["trade_price"] = json!(price);
@@ -10321,6 +10415,18 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
     *state.positions_response.lock().await =
         json!({"positions": [position], "subaccount_id": TEST_SUBACCOUNT});
     let mut tc = build_report_client(state, WsState::default()).await;
+
+    if symbol != "ETH-PERP" {
+        let mut definition = option_instrument_json(symbol, "C", "2225");
+        definition["tick_size"] = json!("0.1");
+        let raw: DeriveInstrument = serde_json::from_value(definition).unwrap();
+        let instrument = parse_derive_instrument_any(&raw, UnixNanos::default())
+            .unwrap()
+            .unwrap();
+        tc.client.cache_instrument(raw).unwrap();
+        tc.cache.borrow_mut().add_instrument(instrument).unwrap();
+    }
+
     tc.client.connect().await.unwrap();
     let mass = tc.client.generate_mass_status(None).await.unwrap().unwrap();
     tc.client.disconnect().await.unwrap();
@@ -10368,7 +10474,7 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
 
         assert_eq!(
             mass.position_reports()[&instrument_id][0].avg_px_open,
-            Some(dec!(2553.87589666777))
+            Some(venue_average)
         );
         assert_eq!(
             cache.orders(None, None, None, None, None).len(),
@@ -10379,38 +10485,34 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
             }
         );
         assert_eq!(order.status(), OrderStatus::Filled);
-        assert_eq!(order.quantity(), Quantity::from("0.100"));
-        assert_eq!(order.filled_qty(), Quantity::from("0.100"));
-        assert_eq!(order.avg_px(), Some(dec!(2553.01)));
+        assert_eq!(order.quantity(), quantity);
+        assert_eq!(order.filled_qty(), quantity);
+        assert_eq!(order.avg_px(), Some(entry_px));
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].venue_order_id, venue_order_id);
         assert_eq!(fills[0].trade_id, trade_id);
         assert_eq!(fills[0].order_side, OrderSide::Buy);
-        assert_eq!(fills[0].last_qty, Quantity::from("0.100"));
-        assert_eq!(fills[0].last_px, Price::from("2553.01"));
-        assert_eq!(fills[0].commission, Some(Money::from("0.08658967 USDC")));
+        assert_eq!(fills[0].last_qty, quantity);
+        assert_eq!(fills[0].last_px, entry_price);
+        assert_eq!(fills[0].commission, Some(opening_commission));
         assert_eq!(
             fills[0].ts_event,
             UnixNanos::from(1_700_000_002_000_000_000_u64)
         );
         assert_eq!(positions.len(), 1);
-        assert_eq!(positions[0].quantity, Quantity::from("0.100"));
+        assert_eq!(positions[0].instrument_id, instrument_id);
+        assert_eq!(positions[0].side, PositionSide::Long);
+        assert_eq!(positions[0].quantity, quantity);
         assert_eq!(positions[0].signed_decimal_qty(), dec!(0.1));
-        assert_eq!(positions[0].avg_px_open, dec!(2553.01));
+        assert_eq!(positions[0].avg_px_open, entry_px);
         assert_eq!(
             positions[0].trade_ids.iter().copied().collect::<Vec<_>>(),
             vec![trade_id]
         );
+        assert_eq!(positions[0].commissions(), vec![opening_commission]);
+        assert_eq!(positions[0].realized_pnl, Some(-opening_commission));
         assert_eq!(
-            positions[0].commissions(),
-            vec![Money::from("0.08658967 USDC")]
-        );
-        assert_eq!(
-            positions[0].realized_pnl,
-            Some(Money::from("-0.08658967 USDC"))
-        );
-        assert_eq!(
-            positions[0].unrealized_pnl(Price::from("2553.01")).unwrap(),
+            positions[0].unrealized_pnl(entry_price).unwrap(),
             Money::from("0.00000000 USDC")
         );
     }
@@ -10423,8 +10525,8 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
     close_order.client_order_id = Some(close_cid);
     close_order.venue_order_id = close_order_id;
     close_order.order_side = Some(OrderSide::Sell);
-    close_order.price = Some(Price::from("2552.59"));
-    close_order.avg_px = Some(dec!(2552.59));
+    close_order.price = Some(close_price);
+    close_order.avg_px = Some(close_px);
     close_order.ts_accepted = close_ts;
     close_order.ts_last = close_ts;
     let mut close_fill = mass.fill_reports()[&venue_order_id][0].clone();
@@ -10432,8 +10534,8 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
     close_fill.venue_order_id = close_order_id;
     close_fill.trade_id = close_trade_id;
     close_fill.order_side = OrderSide::Sell;
-    close_fill.last_px = Price::from("2552.59");
-    close_fill.commission = Money::from("0.08658522 USDC");
+    close_fill.last_px = close_price;
+    close_fill.commission = closing_commission;
     close_fill.ts_event = close_ts;
 
     let flat = PositionStatusReport::new(
@@ -10480,26 +10582,26 @@ async fn test_mass_status_fee_inclusive_average_keeps_real_fills(
         );
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].quantity, Quantity::from("0.000"));
-        assert_eq!(positions[0].avg_px_open, dec!(2553.01));
-        assert_eq!(positions[0].avg_px_close, Some(dec!(2552.59)));
+        assert_eq!(positions[0].avg_px_open, entry_px);
+        assert_eq!(positions[0].avg_px_close, Some(close_px));
         assert_eq!(
             positions[0].trade_ids,
             [trade_id, close_trade_id].into_iter().collect()
         );
-        assert_eq!(
-            positions[0].commissions(),
-            vec![Money::from("0.17317489 USDC")]
-        );
+        assert_eq!(positions[0].commissions(), vec![total_commission]);
         assert_eq!(
             positions[0].realized_pnl,
-            Some(Money::from("-0.21517489 USDC"))
+            Some(
+                Money::from_decimal((close_px - entry_px) * dec!(0.1), Currency::USDC()).unwrap()
+                    - total_commission
+            )
         );
-        assert_eq!(close_order.filled_qty(), Quantity::from("0.100"));
-        assert_eq!(close_order.avg_px(), Some(dec!(2552.59)));
+        assert_eq!(close_order.filled_qty(), quantity);
+        assert_eq!(close_order.avg_px(), Some(close_px));
         assert_eq!(fills.len(), 1);
-        assert_eq!(fills[0].last_px, Price::from("2552.59"));
-        assert_eq!(fills[0].last_qty, Quantity::from("0.100"));
-        assert_eq!(fills[0].commission, Some(Money::from("0.08658522 USDC")));
+        assert_eq!(fills[0].last_px, close_price);
+        assert_eq!(fills[0].last_qty, quantity);
+        assert_eq!(fills[0].commission, Some(closing_commission));
         assert_eq!(fills[0].trade_id, close_trade_id);
         assert_eq!(fills[0].venue_order_id, close_order_id);
         assert_eq!(fills[0].ts_event, close_ts);
@@ -13204,6 +13306,10 @@ async fn test_generate_position_status_reports_option_position() {
     assert_eq!(reports[0].position_side, PositionSide::Short);
     assert_eq!(reports[0].signed_decimal_qty, dec!(-2));
     assert_eq!(reports[0].avg_px_open, Some(dec!(80)));
+    assert_eq!(
+        reports[0].avg_px_open_reconciliation,
+        AvgPxReconciliation::OpeningOnly
+    );
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -14945,7 +15051,7 @@ async fn test_startup_refuses_unproved_replacement_before_private_connection(
     "requested quantity is below native cumulative fills"
 )]
 #[tokio::test]
-async fn test_modify_order_rejects_invalid_native_replacement_chain_before_write(
+async fn test_modify_order_denies_invalid_native_replacement_chain_before_write(
     #[case] invalid_field: &str,
     #[case] expected_reason: &str,
 ) {
@@ -15045,7 +15151,7 @@ async fn test_modify_order_rejects_invalid_native_replacement_chain_before_write
         ))
         .unwrap();
 
-    let ExecutionEvent::Order(OrderEventAny::ModifyRejected(rejected)) = drain_until(
+    let ExecutionEvent::Order(OrderEventAny::ModifyDenied(rejected)) = drain_until(
         &mut tc.rx,
         |event| matches!(event, ExecutionEvent::Order(_)),
         "native chain rejection",
@@ -16911,7 +17017,7 @@ async fn test_reports_defer_unproved_tracked_replacement_binding(#[case] operati
         }
 
         if operation == 7 || operation == 8 {
-            assert_unresolved_command_rejection(&mut tc, operation, cid, old_id).await;
+            assert_unresolved_command_denial(&mut tc, operation, cid, old_id).await;
         }
     }
 
@@ -16995,7 +17101,7 @@ async fn test_reports_defer_unproved_tracked_replacement_binding(#[case] operati
     assert!(ws_state.replace_orders.lock().await.is_empty());
 }
 
-async fn assert_unresolved_command_rejection(
+async fn assert_unresolved_command_denial(
     tc: &mut TestClient,
     operation: u8,
     cid: ClientOrderId,
@@ -17009,7 +17115,7 @@ async fn assert_unresolved_command_rejection(
     .await;
 
     match event {
-        ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) if operation == 7 => {
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(event)) if operation == 7 => {
             assert_eq!(event.client_order_id, cid);
             assert_eq!(event.venue_order_id, Some(old_id));
             assert_eq!(
@@ -17017,7 +17123,7 @@ async fn assert_unresolved_command_rejection(
                 "unresolved Derive venue binding for COLD-BINDING"
             );
         }
-        ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) if operation == 8 => {
+        ExecutionEvent::Order(OrderEventAny::ModifyDenied(event)) if operation == 8 => {
             assert_eq!(event.client_order_id, cid);
             assert_eq!(event.venue_order_id, Some(old_id));
             assert_eq!(
@@ -17025,7 +17131,7 @@ async fn assert_unresolved_command_rejection(
                 "unresolved Derive venue binding for COLD-BINDING"
             );
         }
-        other => panic!("expected matching local command rejection, received {other:?}"),
+        other => panic!("expected matching local command denial, received {other:?}"),
     }
 }
 

@@ -46,13 +46,13 @@ use nautilus_binance::{
             BINANCE_UNEXPECTED_RESPONSE_CODE, BINANCE_VENUE,
         },
         encoder::encode_broker_id,
-        enums::BinanceProductType,
+        enums::{BinanceEnvironment, BinanceProductType},
         parse::parse_usdm_instrument,
     },
     config::{BinanceExecutionClientConfig, BinanceInstrumentProviderConfig},
     futures::{
         execution::{BINANCE_VENUE_ORDER_ID_IS_ALGO_ID_PARAM, BinanceFuturesExecutionClient},
-        http::models::BinanceFuturesUsdExchangeInfo,
+        http::{client::BinanceRawFuturesHttpClient, models::BinanceFuturesUsdExchangeInfo},
     },
 };
 use nautilus_common::{
@@ -86,7 +86,7 @@ use nautilus_model::{
     },
     events::{
         AccountState, OrderAccepted, OrderCanceled, OrderEventAny, OrderFilled, OrderUpdated,
-        order::spec::{OrderFilledSpec, OrderPendingUpdateSpec},
+        order::spec::{OrderFilledSpec, OrderPendingCancelSpec, OrderPendingUpdateSpec},
     },
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, StrategyId, TradeId,
@@ -106,6 +106,8 @@ use parking_lot::Mutex;
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use serde_json::json;
+
+const SEED_CLIENT_ORDER_ID: &str = "completed-seed";
 
 fn has_auth_headers(headers: &HeaderMap) -> bool {
     headers.contains_key("x-mbx-apikey")
@@ -150,6 +152,7 @@ fn exchange_info_coinm_response() -> serde_json::Value {
 enum CommandResponse {
     Success,
     AmbiguousFailure,
+    Throttled { status: u16 },
     BatchPerOrderReject { code: i64, msg: &'static str },
     VenueReject { code: i64, msg: &'static str },
 }
@@ -200,6 +203,10 @@ type CapturedWsTradingMessages = Arc<parking_lot::Mutex<Vec<serde_json::Value>>>
 
 #[derive(Clone, Copy, Debug)]
 enum ReportFixtureMode {
+    Completed,
+    CompletedAlgo,
+    CompletedAlgoMissingChild,
+    HistoryFailure,
     ClosePosition,
     Delivery,
     Empty,
@@ -348,6 +355,7 @@ fn create_exec_test_router() -> Router {
 
 fn create_exec_test_router_with_command_responses(state: CommandResponseState) -> Router {
     Router::new()
+        .route("/fapi/v1/cooldown", post(handle_cooldown))
         .route("/fapi/v1/ping", get(|| async { json_response(&json!({})) }))
         .route("/dapi/v1/ping", get(|| async { json_response(&json!({})) }))
         .route(
@@ -421,6 +429,22 @@ fn create_exec_test_router_with_command_responses(state: CommandResponseState) -
         .with_state(state)
 }
 
+async fn handle_cooldown(Query(query): Query<HashMap<String, String>>) -> Response {
+    let status = query["status"].parse::<u16>().unwrap();
+    let mut headers = HeaderMap::new();
+    if !query.contains_key("unknown") {
+        headers.insert("Retry-After", "2".parse().unwrap());
+    }
+
+    (
+        StatusCode::from_u16(status).unwrap(),
+        headers,
+        json!({"code": if status == 429 { -1015 } else { -1003 }, "msg": "test cooldown"})
+            .to_string(),
+    )
+        .into_response()
+}
+
 async fn handle_hedge_mode_query(
     State(state): State<CommandResponseState>,
     headers: HeaderMap,
@@ -469,6 +493,15 @@ async fn handle_position_risk_query(
     }
     record_query(&state, "positionRisk", query);
     match state.report_fixture_mode {
+        ReportFixtureMode::Completed
+        | ReportFixtureMode::CompletedAlgo
+        | ReportFixtureMode::CompletedAlgoMissingChild => {
+            let mut positions = load_fixture("position_risk.json");
+            positions[0]["positionAmt"] = json!("0.001");
+            positions[0]["entryPrice"] = json!("50000.00");
+            positions[0]["positionSide"] = json!(if state.hedge_mode { "LONG" } else { "BOTH" });
+            json_response(&positions)
+        }
         ReportFixtureMode::Empty | ReportFixtureMode::FillsOnly | ReportFixtureMode::Gtd => {
             json_response(&json!([]))
         }
@@ -532,6 +565,7 @@ async fn handle_position_risk_query(
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::PreBoundaryFill
+        | ReportFixtureMode::HistoryFailure
         | ReportFixtureMode::Populated
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => json_response(&load_fixture("position_risk.json")),
@@ -548,6 +582,9 @@ async fn handle_open_orders_query(
     }
     record_query(&state, "openOrders", query);
     match state.report_fixture_mode {
+        ReportFixtureMode::Completed
+        | ReportFixtureMode::CompletedAlgo
+        | ReportFixtureMode::CompletedAlgoMissingChild => json_response(&json!([])),
         ReportFixtureMode::ClosePosition
         | ReportFixtureMode::Empty
         | ReportFixtureMode::FillsOnly
@@ -570,6 +607,7 @@ async fn handle_open_orders_query(
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::PreBoundaryFill
+        | ReportFixtureMode::HistoryFailure
         | ReportFixtureMode::Populated
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
@@ -588,6 +626,9 @@ async fn handle_open_algo_orders_query(
     }
     record_query(&state, "openAlgoOrders", query);
     match state.report_fixture_mode {
+        ReportFixtureMode::Completed
+        | ReportFixtureMode::CompletedAlgo
+        | ReportFixtureMode::CompletedAlgoMissingChild => json_response(&json!([])),
         ReportFixtureMode::Empty
         | ReportFixtureMode::FillsOnly
         | ReportFixtureMode::HedgePositions
@@ -664,6 +705,7 @@ async fn handle_open_algo_orders_query(
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::PreBoundaryFill
+        | ReportFixtureMode::HistoryFailure
         | ReportFixtureMode::Populated
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => json_response(&load_fixture("open_algo_orders.json")),
@@ -727,12 +769,64 @@ async fn handle_all_algo_orders_query(
     if !has_auth_headers(&headers) {
         return unauthorized_response();
     }
+
     let requested_algo_id = query
         .get("algoId")
-        .and_then(|value| value.parse::<i64>().ok())
-        .unwrap_or_default();
+        .and_then(|value| value.parse::<i64>().ok());
+    let bulk_history = query.contains_key("startTime");
     record_query(&state, "allAlgoOrders", query);
+
+    if matches!(
+        state.report_fixture_mode,
+        ReportFixtureMode::CompletedAlgo | ReportFixtureMode::CompletedAlgoMissingChild
+    ) {
+        let mut orders = load_fixture("open_algo_orders.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 30_000;
+        orders[0]["positionSide"] = json!(if state.hedge_mode { "LONG" } else { "BOTH" });
+        orders[0]["algoId"] = json!(98765);
+        orders[0]["clientAlgoId"] = json!(encode_broker_id(
+            &ClientOrderId::from(SEED_CLIENT_ORDER_ID),
+            BINANCE_NAUTILUS_FUTURES_BROKER_ID
+        ));
+        orders[0]["actualOrderId"] = json!("8886774");
+        orders[0]["actualQty"] = json!("0.001");
+        orders[0]["actualPrice"] = json!("50000.00");
+        orders[0]["algoStatus"] = json!("FINISHED");
+        orders[0]["createTime"] = json!(now);
+        orders[0]["updateTime"] = json!(now);
+        if matches!(
+            state.report_fixture_mode,
+            ReportFixtureMode::CompletedAlgoMissingChild
+        ) {
+            orders[0]["clientAlgoId"] = json!(encode_broker_id(
+                &ClientOrderId::from("purged-child"),
+                BINANCE_NAUTILUS_FUTURES_BROKER_ID
+            ));
+            orders[0]["actualOrderId"] = json!("22542179");
+            orders[0]["actualQty"] = json!("0");
+            orders[0]["actualPrice"] = json!("0");
+            orders[0]["algoStatus"] = json!("CANCELED");
+        }
+
+        return json_response(&orders);
+    }
+
+    if bulk_history {
+        return json_response(&json!([]));
+    }
+
+    let Some(requested_algo_id) = requested_algo_id else {
+        return json_response(&json!([]));
+    };
+
     match state.report_fixture_mode {
+        ReportFixtureMode::Completed
+        | ReportFixtureMode::CompletedAlgo
+        | ReportFixtureMode::CompletedAlgoMissingChild => json_response(&json!([])),
         ReportFixtureMode::Delivery
         | ReportFixtureMode::ClosePosition
         | ReportFixtureMode::Empty
@@ -746,6 +840,7 @@ async fn handle_all_algo_orders_query(
         ReportFixtureMode::InvalidFill
         | ReportFixtureMode::PaginatedFills
         | ReportFixtureMode::PreBoundaryFill
+        | ReportFixtureMode::HistoryFailure
         | ReportFixtureMode::Populated
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
@@ -776,6 +871,50 @@ async fn handle_all_orders_query(
         return unauthorized_response();
     }
     record_query(&state, "allOrders", query);
+
+    if matches!(state.report_fixture_mode, ReportFixtureMode::HistoryFailure) {
+        return command_response(
+            CommandResponse::VenueReject {
+                code: -1121,
+                msg: "Historical source unavailable",
+            },
+            &json!([]),
+        );
+    }
+
+    if matches!(
+        state.report_fixture_mode,
+        ReportFixtureMode::Completed
+            | ReportFixtureMode::CompletedAlgo
+            | ReportFixtureMode::CompletedAlgoMissingChild
+    ) {
+        let mut order = load_fixture("order_response.json");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 30_000;
+        order["orderId"] = json!(8886774);
+        order["clientOrderId"] = json!(encode_broker_id(
+            &ClientOrderId::from(SEED_CLIENT_ORDER_ID),
+            BINANCE_NAUTILUS_FUTURES_BROKER_ID
+        ));
+
+        if matches!(state.report_fixture_mode, ReportFixtureMode::CompletedAlgo) {
+            order["clientOrderId"] = json!("venue-trigger-child");
+            order["type"] = json!("MARKET");
+            order["origType"] = json!("MARKET");
+        }
+
+        order["positionSide"] = json!(if state.hedge_mode { "LONG" } else { "BOTH" });
+        order["status"] = json!("FILLED");
+        order["executedQty"] = json!("0.001");
+        order["avgPrice"] = json!("50000.00");
+        order["time"] = json!(now);
+        order["updateTime"] = json!(now);
+        return json_response(&json!([order]));
+    }
+
     json_response(&json!([]))
 }
 
@@ -796,7 +935,18 @@ async fn handle_user_trades_query(
         .as_millis() as i64
         - 30_000;
     record_query(&state, "userTrades", query);
+
     match state.report_fixture_mode {
+        ReportFixtureMode::Completed
+        | ReportFixtureMode::CompletedAlgo
+        | ReportFixtureMode::CompletedAlgoMissingChild => {
+            let mut trade = load_fixture("user_trade.json");
+            trade["positionSide"] = json!(if state.hedge_mode { "LONG" } else { "BOTH" });
+            trade["price"] = json!("50000.00");
+            trade["quoteQty"] = json!("50.00");
+            trade["time"] = json!(trade_time);
+            json_response(&json!([trade]))
+        }
         ReportFixtureMode::ClosePosition
         | ReportFixtureMode::Delivery
         | ReportFixtureMode::Empty
@@ -830,6 +980,7 @@ async fn handle_user_trades_query(
             json_response(&json!([long, short]))
         }
         ReportFixtureMode::FillsOnly
+        | ReportFixtureMode::HistoryFailure
         | ReportFixtureMode::Populated
         | ReportFixtureMode::MismatchedAlgoId
         | ReportFixtureMode::DirectAlgo => {
@@ -1011,6 +1162,12 @@ fn batch_order_item_count(query: &HashMap<String, String>) -> usize {
 fn command_response(response: CommandResponse, success: &serde_json::Value) -> Response {
     match response {
         CommandResponse::Success => json_response(success),
+        CommandResponse::Throttled { status } => (
+            StatusCode::from_u16(status).unwrap(),
+            [("Retry-After", "1")],
+            json!({"code": -1003, "msg": "test throttle"}).to_string(),
+        )
+            .into_response(),
         CommandResponse::AmbiguousFailure => (
             StatusCode::SERVICE_UNAVAILABLE,
             [("content-type", "text/plain")],
@@ -1740,6 +1897,515 @@ fn test_client_creation_rejects_spot_product_type() {
     assert_eq!(
         e.to_string(),
         "BinanceFuturesExecutionClient requires UsdM or CoinM product type, was Spot",
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_unknown_ban_rejects_submit_without_transmission() {
+    let (addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let url = format!("http://{addr}");
+    let (mut client, mut rx, cache) =
+        create_test_execution_client(url.clone(), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let throttle = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Live,
+        Some("test_api_key".into()),
+        Some("test_api_secret".into()),
+        Some(url.clone()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let blocked = throttle
+        .post::<_, serde_json::Value>(
+            "cooldown",
+            Some(&HashMap::from([("status", 418), ("unknown", 1)])),
+            None,
+            true,
+            true,
+        )
+        .await;
+    let client_order_id = ClientOrderId::from("unknown-ban-submit-001");
+    let order = add_limit_order_to_cache(&cache, client_order_id);
+    client.submit_order(submit_order_command(&order)).unwrap();
+    let event = recv_until(&mut rx, |event| matches!(event,
+        ExecutionEvent::Order(OrderEventAny::Rejected(event)) if event.client_order_id == client_order_id
+    )).await;
+    let shutdown_error = client.disconnect().await.unwrap_err();
+
+    assert_eq!(
+        shutdown_error.to_string(),
+        "Binance Futures shutdown failed: failed to close listen key"
+    );
+    assert!(blocked.is_err());
+    assert_eq!(request_count.load(Ordering::Relaxed), 0);
+
+    let ExecutionEvent::Order(OrderEventAny::Rejected(event)) = event else {
+        panic!("expected rejection")
+    };
+
+    assert_eq!(event.client_order_id, client_order_id);
+    assert_eq!(event.instrument_id, order.instrument_id());
+    assert_eq!(event.strategy_id, order.strategy_id());
+    assert_eq!(
+        event.reason,
+        "submit-order-error: Request not sent: Binance cooldown or local quota blocks admission; wait for capacity or expiry, or verify clearance and restart if expiry is unknown"
+    );
+}
+
+#[rstest]
+#[case::cancel(false)]
+#[case::modify(true)]
+#[tokio::test]
+async fn test_cooldown_denies_pending_command_without_closing_order(#[case] modify: bool) {
+    let (addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let url = format!("http://{addr}");
+    let (mut client, mut rx, cache) =
+        create_test_execution_client(url.clone(), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let throttle = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Live,
+        Some("test_api_key".into()),
+        Some("test_api_secret".into()),
+        Some(url.clone()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let clock = Rc::new(RefCell::new(VirtualClock::new()));
+
+    let mut manager = ExecutionManager::new(
+        clock,
+        cache.clone(),
+        ExecutionManagerConfig {
+            inflight_threshold_ms: 500,
+            inflight_max_retries: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(manager.check_open_orders(&[&client]).await.is_empty());
+    let blocked = throttle
+        .post::<_, serde_json::Value>(
+            "cooldown",
+            Some(&HashMap::from([("status", 418)])),
+            None,
+            true,
+            true,
+        )
+        .await;
+    let expires = tokio::time::Instant::now() + Duration::from_millis(2100);
+    let client_order_id = ClientOrderId::from("cooldown-pending-001");
+    let order = add_limit_order_to_cache(&cache, client_order_id);
+    let account_id = AccountId::from("BINANCE-001");
+    let venue_order_id = VenueOrderId::from("12345");
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            venue_order_id,
+        ))
+        .unwrap();
+
+    let command_id = nautilus_core::UUID4::new();
+
+    let pending = if modify {
+        let mut event = OrderPendingUpdateSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(client_order_id)
+            .account_id(account_id)
+            .venue_order_id(venue_order_id)
+            .build();
+        event.causation_id = Some(command_id);
+        OrderEventAny::PendingUpdate(event)
+    } else {
+        let mut event = OrderPendingCancelSpec::builder()
+            .trader_id(order.trader_id())
+            .strategy_id(order.strategy_id())
+            .instrument_id(order.instrument_id())
+            .client_order_id(client_order_id)
+            .account_id(account_id)
+            .venue_order_id(venue_order_id)
+            .build();
+        event.causation_id = Some(command_id);
+        OrderEventAny::PendingCancel(event)
+    };
+
+    cache.borrow_mut().update_order(&pending).unwrap();
+    manager.register_inflight(client_order_id, command_id);
+    if modify {
+        let mut command = modify_order_command(client_order_id);
+        command.command_id = command_id;
+        client.modify_order(command).unwrap();
+    } else {
+        let mut command = cancel_order_command(client_order_id);
+        command.command_id = command_id;
+        client.cancel_order(command).unwrap();
+    }
+
+    let denied = tokio::time::timeout(Duration::from_millis(250), recv_until(&mut rx, |event| matches!(event,
+        ExecutionEvent::Order(OrderEventAny::ModifyDenied(event)) if event.client_order_id == client_order_id
+    ) || matches!(event,
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(event)) if event.client_order_id == client_order_id
+    ))).await.unwrap();
+
+    let ExecutionEvent::Order(denied) = denied else {
+        panic!("expected command denial")
+    };
+
+    cache.borrow_mut().update_order(&denied).unwrap();
+    manager.observe_order_event(&denied);
+    let before_expiry = request_count.load(Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let exhausted = manager.check_inflight_orders();
+    tokio::time::sleep_until(expires).await;
+    client.disconnect().await.unwrap();
+    let cached = cache.borrow().order_owned(&client_order_id).unwrap();
+
+    assert!(blocked.is_err());
+    assert!(!client.retain_unresolved_submissions());
+    assert_eq!(before_expiry, 0);
+    assert_eq!(request_count.load(Ordering::Relaxed), 0);
+    assert!(exhausted.events.is_empty());
+    assert!(exhausted.queries.is_empty());
+    assert_eq!(cached.status(), OrderStatus::Accepted);
+    assert_eq!(cached.venue_order_id(), Some(venue_order_id));
+    assert_eq!(cached.price(), Some(Price::from("50000.00")));
+    assert_eq!(cached.quantity(), Quantity::from("0.001"));
+
+    match denied {
+        OrderEventAny::ModifyDenied(event) if modify => {
+            assert_eq!(event.causation_id, Some(command_id));
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, order.instrument_id());
+            assert_eq!(event.strategy_id, order.strategy_id());
+            assert_eq!(
+                event.reason,
+                "modify-order-error: Request not sent: Binance cooldown or local quota blocks admission; wait for capacity or expiry, or verify clearance and restart if expiry is unknown"
+            );
+        }
+        OrderEventAny::CancelDenied(event) if !modify => {
+            assert_eq!(event.causation_id, Some(command_id));
+            assert_eq!(event.client_order_id, client_order_id);
+            assert_eq!(event.instrument_id, order.instrument_id());
+            assert_eq!(event.strategy_id, order.strategy_id());
+            assert_eq!(
+                event.reason,
+                "cancel-order-error: Request not sent: Binance cooldown or local quota blocks admission; wait for capacity or expiry, or verify clearance and restart if expiry is unknown"
+            );
+        }
+        event => panic!("unexpected denial: {event:?}"),
+    }
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_algo_cancel_keeps_throttle_outcome_when_fallback_blocked(
+    #[values(429_u16, 418)] status: u16,
+) {
+    let (addr, request_count) = start_exec_test_server_with_command_responses(CommandResponses {
+        algo_cancel: CommandResponse::Throttled { status },
+        ..Default::default()
+    })
+    .await;
+
+    let (mut client, mut rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    let client_order_id = ClientOrderId::from("throttled-algo-001");
+    let order = add_stop_market_order_to_cache(&cache, client_order_id, OrderSide::Buy, false);
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("12345"),
+        ))
+        .unwrap();
+    client
+        .cancel_order(cancel_order_command(client_order_id))
+        .unwrap();
+    wait_for_command_requests(&request_count, 1).await;
+    assert_no_order_event_matching(&mut rx, |event| {
+        matches!(event,
+            OrderEventAny::CancelRejected(event) if event.client_order_id == client_order_id
+        )
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    client.disconnect().await.unwrap();
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        cache.borrow().order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_algo_cancel_keeps_venue_error_when_fallback_not_sent(
+    #[values(-2011_i64, -2013)] code: i64,
+    #[values(false, true)] block_fallback: bool,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://{addr}");
+    let throttle = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Live,
+        None,
+        None,
+        Some(url.clone()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let router = create_exec_test_router_with_command_responses(CommandResponseState {
+        responses: CommandResponses::default(),
+        request_count: Arc::new(AtomicUsize::new(0)),
+        captured_queries: None,
+        captured_ws_trading_messages: None,
+        report_fixture_mode: ReportFixtureMode::Empty,
+        hedge_mode: false,
+    })
+    .layer(middleware::from_fn(move |request: Request, next: Next| {
+        let captured = captured.clone();
+        let throttle = throttle.clone();
+        async move {
+            let path = request.uri().path();
+
+            if matches!(path, "/fapi/v1/order" | "/fapi/v1/algoOrder") {
+                captured
+                    .lock()
+                    .push((request.method().clone(), path.to_string()));
+            }
+
+            if path == "/fapi/v1/algoOrder" && request.method() == Method::GET {
+                return json_response(&load_fixture("algo_order_response.json"));
+            }
+
+            if path == "/fapi/v1/algoOrder" && request.method() == Method::DELETE {
+                if block_fallback {
+                    let error = throttle
+                        .post::<(), serde_json::Value>("throttle", None, None, false, false)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(
+                        error.to_string(),
+                        "Binance error -1003 (HTTP 429): test throttle"
+                    );
+                }
+
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"code":code,"msg":"algo missing"})),
+                )
+                    .into_response();
+            }
+
+            if path == "/fapi/v1/order" && request.method() == Method::GET {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"code": -2013, "msg": "regular lookup missing"})),
+                )
+                    .into_response();
+            }
+
+            next.run(request).await
+        }
+    }))
+    .route(
+        "/fapi/v1/throttle",
+        post(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("Retry-After", "2")],
+                axum::Json(json!({"code":-1003,"msg":"test throttle"})),
+            )
+        }),
+    );
+
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (mut client, mut rx, cache) = create_test_execution_client(url, format!("ws://{addr}/ws"));
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    let client_order_id = ClientOrderId::from("O-20260922-160119-V2-000-8");
+    let order = add_stop_market_order_to_cache(&cache, client_order_id, OrderSide::Buy, false);
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+        .unwrap();
+    cache
+        .borrow_mut()
+        .update_order(&TestOrderEventStubs::accepted(
+            &order,
+            account_id,
+            VenueOrderId::from("12345"),
+        ))
+        .unwrap();
+    client
+        .cancel_order(cancel_order_command(client_order_id))
+        .unwrap();
+
+    let event = recv_until(&mut rx, |event| {
+        matches!(event,
+            ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) if event.client_order_id == client_order_id
+        )
+    })
+    .await;
+
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    client.disconnect().await.unwrap();
+    server.abort();
+
+    let ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) = event else {
+        panic!("Expected cancel rejection")
+    };
+
+    assert_eq!(
+        event.reason.as_str(),
+        format!("cancel-order-error: Binance error {code} (HTTP 400): algo missing")
+    );
+    let mut expected_requests = vec![
+        (Method::GET, "/fapi/v1/algoOrder".to_string()),
+        (Method::GET, "/fapi/v1/algoOrder".to_string()),
+        (Method::DELETE, "/fapi/v1/algoOrder".to_string()),
+    ];
+
+    if !block_fallback {
+        expected_requests.extend([
+            (Method::GET, "/fapi/v1/order".to_string()),
+            (Method::GET, "/fapi/v1/order".to_string()),
+        ]);
+    }
+
+    assert_eq!(*requests.lock(), expected_requests);
+    assert_eq!(
+        cache.borrow().order(&client_order_id).unwrap().status(),
+        OrderStatus::Accepted
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cooldown_rejects_submit_without_late_send(#[values(429_u16, 418)] status: u16) {
+    let (addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let url = format!("http://{addr}");
+    let (mut client, mut rx, cache) =
+        create_test_execution_client(url.clone(), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let throttle = BinanceRawFuturesHttpClient::new(
+        BinanceProductType::UsdM,
+        BinanceEnvironment::Live,
+        Some("test_api_key".into()),
+        Some("test_api_secret".into()),
+        Some(url.clone()),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let blocked = throttle
+        .post::<_, serde_json::Value>(
+            "cooldown",
+            Some(&HashMap::from([("status", status)])),
+            None,
+            true,
+            true,
+        )
+        .await;
+    let expires = tokio::time::Instant::now() + Duration::from_millis(2100);
+    let client_order_id = ClientOrderId::from("cooldown-submit-001");
+    let order = add_limit_order_to_cache(&cache, client_order_id);
+    client.submit_order(submit_order_command(&order)).unwrap();
+    let submitted = recv_until(&mut rx, |event| matches!(event,
+        ExecutionEvent::Order(OrderEventAny::Submitted(event)) if event.client_order_id == client_order_id
+    )).await;
+
+    let ExecutionEvent::Order(submitted) = submitted else {
+        panic!("expected submitted event")
+    };
+
+    cache.borrow_mut().update_order(&submitted).unwrap();
+    let rejected = tokio::time::timeout(Duration::from_millis(250), recv_until(&mut rx, |event| matches!(event,
+        ExecutionEvent::Order(OrderEventAny::Rejected(event)) if event.client_order_id == client_order_id
+    ))).await.unwrap();
+
+    let ExecutionEvent::Order(rejected @ OrderEventAny::Rejected(_)) = rejected else {
+        panic!("expected rejected event")
+    };
+
+    cache.borrow_mut().update_order(&rejected).unwrap();
+    let before_expiry = request_count.load(Ordering::Relaxed);
+    tokio::time::sleep_until(expires).await;
+    let after_expiry = request_count.load(Ordering::Relaxed);
+    let fresh = add_limit_order_to_cache(&cache, ClientOrderId::from("fresh-command-002"));
+    client.submit_order(submit_order_command(&fresh)).unwrap();
+    wait_for_command_requests(&request_count, 1).await;
+    client.disconnect().await.unwrap();
+
+    assert!(blocked.is_err());
+    assert!(!client.retain_unresolved_submissions());
+    assert_eq!(before_expiry, 0);
+    assert_eq!(after_expiry, 0);
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        cache.borrow().order(&client_order_id).unwrap().status(),
+        OrderStatus::Rejected
+    );
+
+    let OrderEventAny::Rejected(rejected) = rejected else {
+        unreachable!()
+    };
+
+    assert_eq!(rejected.client_order_id, client_order_id);
+    assert_eq!(rejected.instrument_id, order.instrument_id());
+    assert_eq!(rejected.strategy_id, order.strategy_id());
+    assert_eq!(
+        rejected.reason,
+        "submit-order-error: Request not sent: Binance cooldown or local quota blocks admission; wait for capacity or expiry, or verify clearance and restart if expiry is unknown"
     );
 }
 
@@ -5607,6 +6273,283 @@ async fn test_generate_mass_status_includes_stable_fill_identity(
 }
 
 #[rstest]
+#[case(ReportFixtureMode::Completed, OrderType::Limit)]
+#[case(ReportFixtureMode::CompletedAlgo, OrderType::StopMarket)]
+#[tokio::test]
+async fn test_generate_mass_status_restores_completed_seed_without_duplicate_exposure(
+    #[case] mode: ReportFixtureMode,
+    #[case] order_type: OrderType,
+    #[values(1, 5)] lookback_mins: u64,
+) {
+    let (addr, _) =
+        start_exec_test_server_with_query_capture_and_responses(CommandResponses::default(), mode)
+            .await;
+    let (client, _rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    let client: Box<dyn ExecutionClient> = Box::new(client);
+
+    #[cfg(feature = "python")]
+    let client = {
+        drop(client);
+        super::super::python::create_execution_client(
+            BinanceProductType::UsdM,
+            &format!("http://{addr}"),
+            &format!("ws://{addr}/ws"),
+            cache.clone(),
+        )
+    };
+
+    let mut client = client;
+    let account_id = AccountId::from("BINANCE-001");
+    let instrument_id = test_instrument_id();
+    let client_order_id = ClientOrderId::from(SEED_CLIENT_ORDER_ID);
+    let venue_order_id = VenueOrderId::from("8886774");
+    add_test_account_to_cache(&cache, account_id);
+    add_test_instrument_to_cache(&cache);
+    cache
+        .borrow_mut()
+        .register_external_order_claims(test_strategy_id(), &[instrument_id])
+        .unwrap();
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let status = client
+        .generate_mass_status(Some(lookback_mins))
+        .await
+        .unwrap()
+        .unwrap();
+    let orders = status.order_reports();
+    let fills = status.fill_reports();
+    assert_eq!(orders.len(), 1);
+    let report = &orders[&venue_order_id];
+    assert_eq!(report.client_order_id, Some(client_order_id));
+    assert_eq!(report.order_type, order_type);
+    assert_eq!(report.order_status, OrderStatus::Filled);
+    assert_eq!(report.quantity, Quantity::from("0.001"));
+    assert_eq!(report.filled_qty, Quantity::from("0.001"));
+    assert_eq!(report.avg_px, Some(dec!(50000)));
+    assert_eq!(report.venue_position_id, None);
+    assert_eq!(fills[&venue_order_id].len(), 1);
+    assert_eq!(
+        fills[&venue_order_id][0].trade_id,
+        TradeId::from("12345678")
+    );
+    assert_eq!(
+        fills[&venue_order_id][0].commission,
+        Money::from("0.01 USDT")
+    );
+    assert!(status.reports_complete());
+
+    let (mut manager, engine) =
+        super::super::execution_reconciliation(cache.clone(), test_trader_id(), client);
+    engine
+        .borrow_mut()
+        .register_oms_type(test_strategy_id(), OmsType::Netting);
+
+    let result = manager.reconcile_execution_mass_status(&status, &engine);
+    let replay = manager.reconcile_execution_mass_status(&status, &engine);
+    let cache = cache.borrow();
+    let order = cache.order(&client_order_id).unwrap();
+    let positions = cache.positions_open(None, None, None, None, None);
+
+    assert!(result.unresolved_positions.is_empty());
+    assert_eq!(result.external_orders.len(), 1);
+    assert!(replay.events.is_empty());
+    assert!(replay.unresolved_positions.is_empty());
+    assert_eq!(cache.orders(None, None, None, None, None).len(), 1);
+    assert_eq!(order.strategy_id(), test_strategy_id());
+    assert_eq!(order.account_id(), Some(account_id));
+    assert_eq!(order.instrument_id(), instrument_id);
+    assert_eq!(order.venue_order_id(), Some(venue_order_id));
+    assert_eq!(order.status(), OrderStatus::Filled);
+    assert_eq!(order.quantity(), Quantity::from("0.001"));
+    assert_eq!(order.filled_qty(), Quantity::from("0.001"));
+    assert_eq!(order.trade_ids(), vec![&TradeId::from("12345678")]);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].strategy_id, test_strategy_id());
+    assert_eq!(positions[0].account_id, account_id);
+    assert_eq!(positions[0].instrument_id, instrument_id);
+    assert_eq!(positions[0].quantity, Quantity::from("0.001"));
+    assert_eq!(positions[0].avg_px_open, dec!(50000));
+    assert_eq!(positions[0].events.len(), 1);
+    assert_eq!(positions[0].events[0].trade_id, TradeId::from("12345678"));
+}
+
+#[rstest]
+#[case::regular(ReportFixtureMode::Completed)]
+#[case::algo(ReportFixtureMode::CompletedAlgo)]
+#[tokio::test]
+async fn test_completed_history_respects_position_ids(
+    #[case] mode: ReportFixtureMode,
+    #[values(true, false)] use_position_ids: bool,
+) {
+    let (addr, _) = start_exec_test_server_with_query_capture_and_responses_and_hedge_mode(
+        CommandResponses::default(),
+        mode,
+        true,
+    )
+    .await;
+    let (mut client, _rx, cache) = create_test_execution_client_with_position_ids(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        use_position_ids,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    cache
+        .borrow_mut()
+        .register_external_order_claims(test_strategy_id(), &[test_instrument_id()])
+        .unwrap();
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let status = client.generate_mass_status(Some(1)).await.unwrap().unwrap();
+    let orders = status.order_reports();
+    let report = &orders[&VenueOrderId::from("8886774")];
+    let expected = use_position_ids.then(|| PositionId::from("BTCUSDT-PERP.BINANCE-LONG"));
+
+    assert_eq!(orders.len(), 1);
+    assert_eq!(
+        report.client_order_id,
+        Some(ClientOrderId::from(SEED_CLIENT_ORDER_ID))
+    );
+    assert_eq!(report.venue_position_id, expected);
+    assert_eq!(
+        status.fill_reports()[&report.venue_order_id][0].venue_position_id,
+        expected
+    );
+    assert!(status.reports_complete());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_mass_status_history_failure_preserves_successful_reports() {
+    let (addr, _) = start_exec_test_server_with_query_capture_and_responses(
+        CommandResponses::default(),
+        ReportFixtureMode::HistoryFailure,
+    )
+    .await;
+    let (mut client, _rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let status = client.generate_mass_status(Some(1)).await.unwrap().unwrap();
+    let orders = status.order_reports();
+    let fills = status.fill_reports();
+
+    assert!(!status.reports_complete());
+    assert_eq!(orders.len(), 2);
+    assert_eq!(
+        orders[&VenueOrderId::from("12345678")].order_status,
+        OrderStatus::Accepted
+    );
+    assert_eq!(fills.len(), 1);
+    assert_eq!(
+        fills[&VenueOrderId::from("8886774")][0].trade_id,
+        TradeId::from("12345678")
+    );
+    assert_eq!(status.position_reports()[&test_instrument_id()].len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_missing_algo_child_preserves_other_completed_history() {
+    let responses = CommandResponses {
+        actual_order_query: CommandResponse::VenueReject {
+            code: -2013,
+            msg: "Order does not exist",
+        },
+        ..Default::default()
+    };
+
+    let (addr, captured) = start_exec_test_server_with_query_capture_and_responses(
+        responses,
+        ReportFixtureMode::CompletedAlgoMissingChild,
+    )
+    .await;
+    let (mut client, _rx, cache) =
+        create_test_execution_client(format!("http://{addr}"), format!("ws://{addr}/ws"));
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let status = client.generate_mass_status(Some(1)).await.unwrap().unwrap();
+    let orders = status.order_reports();
+    let seed = &orders[&VenueOrderId::from("8886774")];
+    let canceled = &orders[&VenueOrderId::from("22542179")];
+
+    assert_eq!(orders.len(), 2);
+    assert_eq!(
+        seed.client_order_id,
+        Some(ClientOrderId::from(SEED_CLIENT_ORDER_ID))
+    );
+    assert_eq!(seed.order_status, OrderStatus::Filled);
+    assert_eq!(seed.filled_qty, Quantity::from("0.001"));
+    assert_eq!(
+        canceled.client_order_id,
+        Some(ClientOrderId::from("purged-child"))
+    );
+    assert_eq!(canceled.order_status, OrderStatus::Canceled);
+    assert_eq!(canceled.order_type, OrderType::StopMarket);
+    assert_eq!(canceled.quantity, Quantity::from("0.001"));
+    assert_eq!(canceled.filled_qty, Quantity::from("0.000"));
+    assert_eq!(
+        status.fill_reports()[&seed.venue_order_id][0].trade_id,
+        TradeId::from("12345678")
+    );
+    assert!(status.reports_complete());
+    assert_eq!(
+        captured
+            .lock()
+            .iter()
+            .filter(|query| query.path == "order")
+            .count(),
+        1
+    );
+}
+
+#[rstest]
+#[case("quotes", "USDT")]
+#[case("bases", "BTC")]
+#[case("contract_types", "PERPETUAL")]
+#[tokio::test]
+async fn test_broad_provider_filters_do_not_scan_futures_history(
+    #[case] filter: &str,
+    #[case] value: &str,
+) {
+    let (addr, captured) = start_exec_test_server_with_query_capture().await;
+
+    let provider = BinanceInstrumentProviderConfig {
+        filters: HashMap::from([(filter.to_string(), json!([value]))]),
+        ..Default::default()
+    };
+
+    let (mut client, _rx, cache) = create_test_execution_client_with_config(
+        format!("http://{addr}"),
+        format!("ws://{addr}/ws"),
+        BinanceProductType::UsdM,
+        None,
+        provider,
+        true,
+    );
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let status = client.generate_mass_status(Some(1)).await.unwrap().unwrap();
+    assert!(status.order_reports().is_empty());
+    assert!(status.fill_reports().is_empty());
+    assert!(status.reports_complete());
+    assert!(
+        captured
+            .lock()
+            .iter()
+            .all(|query| !matches!(query.path, "allOrders" | "allAlgoOrders" | "userTrades"))
+    );
+}
+
+#[rstest]
 #[tokio::test]
 async fn test_generate_mass_status_uses_execution_instruments_without_shared_cache() {
     let (addr, _captured_queries) = start_exec_test_server_with_query_capture_and_responses(
@@ -8841,7 +9784,7 @@ async fn test_tagged_ws_mutations_use_known_venue_identity(#[values(false, true)
 #[case::algo(false, true, false)]
 #[case::batch(false, false, true)]
 #[tokio::test]
-async fn test_tagged_lookup_failure_is_rejected_before_submission(
+async fn test_tagged_lookup_failure_denies_before_submission(
     #[case] modify: bool,
     #[case] algo: bool,
     #[case] batch: bool,
@@ -8918,25 +9861,34 @@ async fn test_tagged_lookup_failure_is_rejected_before_submission(
         add_limit_order_to_cache(&cache, client_order_id);
     }
 
+    let command_id = nautilus_core::UUID4::new();
+
     if modify {
         let mut command = modify_order_command(client_order_id);
+        command.command_id = command_id;
         command.venue_order_id = None;
         client.modify_order(command).unwrap();
     } else if batch {
+        let mut command = cancel_order_command_without_venue_id(client_order_id);
+        command.command_id = command_id;
         client
-            .batch_cancel_orders(batch_cancel_order_command_from_cancels(vec![
-                cancel_order_command_without_venue_id(client_order_id),
-            ]))
+            .batch_cancel_orders(batch_cancel_order_command_from_cancels(vec![command]))
             .unwrap();
     } else {
-        client
-            .cancel_order(cancel_order_command_without_venue_id(client_order_id))
-            .unwrap();
+        let mut command = cancel_order_command_without_venue_id(client_order_id);
+        command.command_id = command_id;
+        client.cancel_order(command).unwrap();
     }
 
     let event = recv_until(&mut rx, |event| match event {
+        ExecutionEvent::Order(OrderEventAny::ModifyDenied(event)) => {
+            modify && event.client_order_id == client_order_id
+        }
         ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) => {
             modify && event.client_order_id == client_order_id
+        }
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(event)) => {
+            !modify && event.client_order_id == client_order_id
         }
         ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
             !modify && event.client_order_id == client_order_id
@@ -8948,16 +9900,23 @@ async fn test_tagged_lookup_failure_is_rejected_before_submission(
     client.disconnect().await.unwrap();
     server.abort();
 
-    let (actual_id, reason, venue_id) = match event {
-        ExecutionEvent::Order(OrderEventAny::ModifyRejected(event)) => {
-            (event.client_order_id, event.reason, event.venue_order_id)
-        }
-        ExecutionEvent::Order(OrderEventAny::CancelRejected(event)) => {
-            (event.client_order_id, event.reason, event.venue_order_id)
-        }
-        _ => panic!("Expected rejection"),
+    let (actual_id, reason, venue_id, cause) = match event {
+        ExecutionEvent::Order(OrderEventAny::ModifyDenied(event)) if modify => (
+            event.client_order_id,
+            event.reason,
+            event.venue_order_id,
+            event.causation_id,
+        ),
+        ExecutionEvent::Order(OrderEventAny::CancelDenied(event)) if !modify => (
+            event.client_order_id,
+            event.reason,
+            event.venue_order_id,
+            event.causation_id,
+        ),
+        _ => panic!("Expected matching command refusal, was {event:?}"),
     };
 
+    assert_eq!(cause, Some(command_id));
     assert_eq!(actual_id, client_order_id);
     assert_eq!(venue_id, None);
 

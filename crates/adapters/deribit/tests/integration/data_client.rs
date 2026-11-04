@@ -25,6 +25,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
+    task::{Context, Wake, Waker},
     time::Duration,
 };
 
@@ -65,7 +66,6 @@ use nautilus_model::{
     types::Price,
 };
 use nautilus_network::http::HttpClient;
-use nautilus_testkit::events::drain_data_events;
 use parking_lot::Mutex;
 use rstest::rstest;
 use rust_decimal_macros::dec;
@@ -925,12 +925,14 @@ async fn test_data_client_request_instrument_refetches_when_cached() {
 
     wait_until_async(
         || async {
-            state.get_instrument_request_count.load(Ordering::Relaxed) >= 1 && !rx.is_empty()
+            state.get_instrument_request_count.load(Ordering::Relaxed) == 1
+                && client.command_tasks.all_finished()
         },
         TEST_TIMEOUT,
     )
     .await;
-    let events = drain_data_events(&mut rx, Duration::from_millis(200)).await;
+
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     let response = instrument_response(&events).expect("instrument response");
     assert_eq!(response.correlation_id, first_request_id);
     assert_eq!(response.client_id, *DERIBIT_CLIENT_ID);
@@ -951,12 +953,15 @@ async fn test_data_client_request_instrument_refetches_when_cached() {
         .expect("second request_instrument");
 
     wait_until_async(
-        || async { state.get_instrument_request_count.load(Ordering::Relaxed) >= 2 },
+        || async {
+            state.get_instrument_request_count.load(Ordering::Relaxed) == 2
+                && client.command_tasks.all_finished()
+        },
         TEST_TIMEOUT,
     )
     .await;
 
-    let events = drain_data_events(&mut rx, Duration::from_millis(300)).await;
+    let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(
         instrument_response(&events).is_none(),
         "request_instrument must not emit a stale cached response when Deribit returns an error; events were: {events:?}",
@@ -1970,6 +1975,7 @@ fn dispatch_subscribe(
     let client_id = Some(*DERIBIT_CLIENT_ID);
     let cmd_id = UUID4::new();
     let ts = UnixNanos::default();
+    let book_params = Params::new([("interval".to_string(), json!("100ms"))].into());
 
     match kind {
         SubscribeKind::Quotes => client.subscribe_quotes(SubscribeQuotes::new(
@@ -2000,7 +2006,7 @@ fn dispatch_subscribe(
             None,
             false,
             None,
-            None,
+            Some(book_params),
         )),
         SubscribeKind::BookDepth => client.subscribe_book_depth(SubscribeBookDepth::new(
             instrument_id,
@@ -2012,7 +2018,7 @@ fn dispatch_subscribe(
             None,
             false,
             None,
-            None,
+            Some(book_params),
         )),
         SubscribeKind::MarkPrices => client.subscribe_mark_prices(SubscribeMarkPrices::new(
             instrument_id,
@@ -2155,6 +2161,60 @@ async fn test_subscribe_funding_rates_rejects_non_perpetual() {
     );
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_connect_publishes_load_ids_missing_from_product_types() {
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.load_ids = Some(vec![InstrumentId::from("BTC_USDC.DERIBIT")]);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    client.connect().await.expect("connect");
+    let mut published = Vec::new();
+
+    while let Ok(event) = rx.try_recv() {
+        if let DataEvent::Data(Data::Instrument(instrument)) = event {
+            published.push(instrument.id());
+        }
+    }
+
+    client.disconnect().await.unwrap();
+
+    assert!(state.get_instrument_request_count.load(Ordering::Relaxed) >= 1);
+    assert!(published.contains(&InstrumentId::from("BTC_USDC.DERIBIT")));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_data_reset_republishes_cached_load_ids() {
+    let (addr, _state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.load_ids = Some(vec![InstrumentId::from("BTC_USDC.DERIBIT")]);
+    let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    client.connect().await.expect("connect");
+
+    while rx.try_recv().is_ok() {}
+    client.disconnect().await.unwrap();
+    client.reset().unwrap();
+    client.connect().await.expect("reconnect");
+    let mut republished = Vec::new();
+
+    while let Ok(event) = rx.try_recv() {
+        if let DataEvent::Data(Data::Instrument(instrument)) = event {
+            republished.push(instrument.id());
+        }
+    }
+
+    client.disconnect().await.unwrap();
+
+    assert!(republished.contains(&InstrumentId::from("BTC_USDC.DERIBIT")));
 }
 
 #[rstest]
@@ -2340,11 +2400,10 @@ async fn test_data_client_request_book_summaries_rejects_missing_currency() {
     ));
     assert!(result.is_err(), "missing currency must reject");
 
-    // No response should be emitted for the rejected request.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .is_err()
+    assert!(client.command_tasks.all_finished());
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
     );
 
     client.disconnect().await.unwrap();
@@ -2454,13 +2513,108 @@ async fn test_data_client_request_data_ignores_unsupported_custom_type() {
         None,
     ));
     assert!(result.is_ok(), "unsupported type is soft-ignored");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), rx.recv())
-            .await
-            .is_err()
+    assert!(client.command_tasks.all_finished());
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
     );
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[case::initial(false)]
+#[case::retry(true)]
+#[tokio::test]
+async fn test_instrument_refresh_waits_for_interval(#[case] retry: bool) {
+    let _capture = lock_log_capture().await;
+    let logger = install_capturing_debug_logger();
+    let (addr, state) = start_test_server().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    replace_data_event_sender(tx);
+    let mut config = create_test_config(addr);
+    config.update_instruments_interval_mins = 1;
+    let client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
+
+    tokio::time::pause();
+    let mut refresh = Box::pin(client.instrument_refresh().unwrap());
+    assert!(futures_util::poll!(refresh.as_mut()).is_pending());
+
+    if retry {
+        let mut failure = load_json("ws_error.json");
+        failure["error"]["code"] = json!(10000);
+        *state.instruments_response.lock().await = Some(failure);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::resume();
+
+        tokio::time::timeout(
+            TEST_TIMEOUT,
+            std::future::poll_fn(|cx| {
+                // Freeze the clock while polling so the next interval starts at a known time
+                tokio::time::pause();
+                assert!(refresh.as_mut().poll(cx).is_pending());
+
+                if logger.contains("Failed to refresh instruments for Future:") {
+                    std::task::Poll::Ready(())
+                } else {
+                    tokio::time::resume();
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .expect("refresh failure must rearm its timer");
+
+        *state.instruments_response.lock().await = None;
+    }
+
+    let wake = Arc::new(RefreshWake::default());
+    let waker = Waker::from(Arc::clone(&wake));
+    assert!(
+        refresh
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    // Observe timer expiry before polling can move the refresh into pending HTTP I/O
+    assert!(
+        tokio::time::timeout(Duration::from_secs(59), std::future::pending::<()>())
+            .await
+            .is_err()
+    );
+    assert!(!wake.0.load(Ordering::Acquire), "refresh timer fired early");
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        usize::from(retry)
+    );
+    assert_eq!(
+        rx.try_recv().unwrap_err(),
+        tokio::sync::mpsc::error::TryRecvError::Empty
+    );
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::resume();
+
+    let task = tokio::spawn(refresh);
+    let refreshed = recv_instrument(&mut rx, TEST_TIMEOUT).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    assert_eq!(refreshed.id().venue, *DERIBIT_VENUE);
+    assert_eq!(
+        state.get_instruments_request_count.load(Ordering::SeqCst),
+        1 + usize::from(retry)
+    );
+}
+
+#[derive(Default)]
+struct RefreshWake(AtomicBool);
+
+impl Wake for RefreshWake {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[rstest]
@@ -2475,12 +2629,9 @@ async fn test_scheduled_instrument_refresh_publishes_and_caches_definitions(
     config.update_instruments_interval_mins = 1;
     let mut client = DeribitDataClient::new(*DERIBIT_CLIENT_ID, config).unwrap();
     connect_with_refresh(&mut client).await;
-    let mut started = tokio::time::Instant::now();
-
     if reconnect {
         client.disconnect().await.unwrap();
         connect_with_refresh(&mut client).await;
-        started = tokio::time::Instant::now();
     }
 
     // A repeated connect while connected must not spawn a second refresh task
@@ -2514,17 +2665,7 @@ async fn test_scheduled_instrument_refresh_publishes_and_caches_definitions(
     rows.push(listing);
     *state.instruments_response.lock().await = Some(instruments_body(&rows));
 
-    advance_refresh_clock(Duration::from_secs(59).saturating_sub(started.elapsed())).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        state.get_instruments_request_count.load(Ordering::SeqCst),
-        initial_calls
-    );
-    advance_refresh_clock(Duration::from_secs(60).saturating_sub(started.elapsed())).await;
+    advance_refresh_clock(Duration::from_secs(60)).await;
     let mut refreshed = AHashMap::new();
     while refreshed.len() < 3 {
         let instrument = recv_instrument(&mut rx, Duration::from_secs(15)).await;
@@ -2675,7 +2816,6 @@ async fn test_scheduled_instrument_refresh_retries_after_failure() {
     )
     .await;
 
-    let retry_started = tokio::time::Instant::now();
     assert_eq!(
         state.get_instruments_request_count.load(Ordering::SeqCst),
         initial_calls + 1
@@ -2694,17 +2834,7 @@ async fn test_scheduled_instrument_refresh_retries_after_failure() {
     let mut rows = instrument_rows();
     instrument_row_mut(&mut rows, "BTC-PERPETUAL")["tick_size"] = json!(1.0);
     *state.instruments_response.lock().await = Some(instruments_body(&rows));
-    advance_refresh_clock(Duration::from_secs(59).saturating_sub(retry_started.elapsed())).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), rx.recv())
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        state.get_instruments_request_count.load(Ordering::SeqCst),
-        initial_calls + 1
-    );
-    advance_refresh_clock(Duration::from_secs(60).saturating_sub(retry_started.elapsed())).await;
+    advance_refresh_clock(Duration::from_secs(60)).await;
     let refreshed = recv_instrument(&mut rx, TEST_TIMEOUT).await;
 
     assert_eq!(refreshed.id().venue, *DERIBIT_VENUE);
@@ -3049,5 +3179,4 @@ async fn advance_refresh_clock(duration: Duration) {
     tokio::time::pause();
     tokio::time::advance(duration).await;
     tokio::time::resume();
-    tokio::task::yield_now().await;
 }

@@ -537,7 +537,8 @@ Use `get_account_instruments` to read the typed `OKXRpiPermission` value:
 The public instrument endpoint does not return account permissions. Raw fee responses expose `rpiMaker` as an
 optional `Decimal`. An empty value means RPI is not applicable.
 
-Responses may contain both RPI and ELP field names during the transition. The adapter prefers `rpi`
+Responses may contain both RPI and ELP field names during the transition, which ends with OKX's
+October 31, 2026 ELP name deprecation deadline. The adapter prefers `rpi`
 and `rpiMaker`, reads `elp` and `elpMaker` as response aliases, and sends only RPI names. Raw trade
 messages describe `source: "1"` as an RPI order.
 
@@ -755,6 +756,9 @@ order expiration by canceling the order at the specified expiry time.
 | Batch Modify | ✓                     | Modify multiple orders in single request. |
 | Batch Cancel | ✓                     | Cancel multiple orders in single request. |
 
+Regular-order batch cancels split repeated targets into separate WebSocket requests so each reply
+identifies one command UUID. Batches with distinct targets use up to 20 orders per request.
+
 ### Cancel-all orders
 
 `Strategy.cancel_all_orders` supports `order_side` in both strategy-only and cross-strategy mode.
@@ -778,8 +782,8 @@ response without a message produces `OKX error <code>` alone, and one that also 
 `subCode` appends it as `(subCode=<code>)`. A conditional order that fails after acceptance
 reports only its code, such as `OKX error 51008`, because OKX sends only a `failCode`.
 
-Rejections the adapter raises before contacting OKX, such as local validation failures, carry
-the adapter's own message and no OKX error code.
+Local modify and cancel refusals proven not sent produce `OrderModifyDenied` or `OrderCancelDenied`.
+They carry the adapter's own message and no OKX error code.
 
 ### Position management
 
@@ -859,6 +863,27 @@ Spot orders funded by cash use these trade modes (`tdMode`):
 | Futures               | `2`      | `cash`        |
 | Multi-currency margin | `3`      | `cross`       |
 | Portfolio margin      | `4`      | `cross`       |
+
+Spot market buys and sells use `quote_quantity=False` for base units and `True` for quote units.
+Single and batch submissions map this intent to the same quantity units.
+Base-sized sells use OKX's default base units; other explicit sizing requests use `tgtCcy`.
+Select the trade mode for the account from the table above; selecting quantity units does not change
+the trade mode.
+
+Both units work for cash-funded spot in Spot and Futures account modes and for spot orders in
+Multi-currency margin mode (`acctLv=3`) with `tdMode=cross`.
+In Futures mode, spot orders with `tdMode=cross` or `isolated` are native `MARGIN` orders.
+Market buys use quote units and market sells use base units. OKX rejects the opposite units with `59110`.
+Portfolio margin, borrowing-enabled Spot mode, and `spot_isolated` sizing require separate venue
+validation before use.
+
+Low-level `OKXWebSocketClient::batch_submit_orders` calls that pass `OKXInstrumentType::Margin`
+require quote units for market buys and base units for market sells. Other explicit units are rejected
+locally. This rule applies to that low-level argument, not the execution config's `instrument_types`.
+See OKX's [market order quantity units](https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order).
+
+For native Futures-mode margin orders over HTTP, use `place_order` with `ccy` set to the margin
+currency. `place_order_with_domain_types` omits `ccy`; requests with native quantity units reject with `50014`.
 
 Keep auto-borrow off in modes 3 and 4 to prevent borrowing beyond the cash balance.
 
@@ -986,7 +1011,7 @@ take-profit leg.
 
 Derivative algo orders require contract quantity; quote quantity is denied locally.
 These algo rules do not restrict ordinary market orders.
-Spot market orders in `tdMode=cash` also support quote-sized sells.
+Ordinary spot market orders also support quote-sized sells.
 Neither size unit guarantees a full fill. OKX documents balance-based size reduction for `trigger` orders.
 For Futures-mode spot-margin `STOP_MARKET` and `MARKET_IF_TOUCHED` buys, use quote quantity:
 OKX rejects `base_ccy` with `59110`. Use `tdMode=cash` in Futures mode for base-sized buys.
@@ -1026,8 +1051,8 @@ The [limits on amendments after restart](#modifying-conditional-orders) also app
 
 :::warning
 Pending amendments require tracked session context. Orders recovered after a restart or without
-that context emit `OrderModifyRejected` locally. Trailing-stop algo amendments also emit
-`OrderModifyRejected` locally.
+that context emit `OrderModifyDenied` locally. Trailing-stop algo amendments also emit
+`OrderModifyDenied` locally.
 :::
 
 #### Trigger price types
@@ -1409,6 +1434,45 @@ For historical funding rate requests, the adapter computes the interval from con
 funding timestamps returned by the
 [Get Funding Rate History](https://www.okx.com/docs-v5/en/#public-data-rest-api-get-funding-rate-history)
 endpoint.
+
+## Historical requests
+
+Bar, trade, and funding rate requests report whether OKX returned the whole requested window. The data
+client turns this coverage into one of three events:
+
+| Coverage   | Condition                                                  | Event                                      |
+| ---------- | ---------------------------------------------------------- | ------------------------------------------ |
+| Complete   | Pagination reached `start`.                                | Completed `DataResponseEnvelope`.          |
+| Truncated  | The page cap stopped pagination before `start` or `limit`. | `DataRequestFailed` with the rows fetched. |
+| Unverified | Any other result.                                          | Plain `DataResponse`.                      |
+
+A window the page cap did not stop is unverified when the request has no `start`, met its `limit`, or OKX
+returned no rows back to `start`.
+
+Only a complete window is written back to a catalog when the request sets `params={"update_catalog": True}`.
+The data engine rejects a request that sets both `update_catalog` and `limit` before it reaches OKX, so set
+`start` and leave `limit` unset. See [catalog write-back](../concepts/data/catalog.md#reading-data).
+
+A truncated request fails with the reason `OKX page limit reached before the start of the window`. For bars
+and funding rates, request the window again in smaller parts with both `start` and `end` set. An HTTP error,
+or a bar or funding rate that fails to parse, fails the request with the error as the reason and without rows.
+
+Each data type has its own page limits:
+
+- **Trades**: `GET /api/v5/market/history-trades` returns up to 100 trades a page. The adapter walks back
+  from the newest trade by trade ID and requests at most 500 pages, including pages newer than `end`. A
+  request therefore reaches at most the 50,000 most recent trades. A window older than that stays
+  truncated, and splitting it does not help. A trade that fails to parse makes an otherwise complete
+  window unverified.
+- **Bars**: the adapter walks back from `end`, or from the current time when `end` is not set. Pages less
+  than two hours old use `GET /api/v5/market/candles` with up to 300 bars a page. Older pages use
+  `GET /api/v5/market/history-candles` with up to 100 bars a page. The adapter requests at most 500 pages.
+  A window is complete when its oldest bar closes in the first bar slot at or after `start`. Monthly bars
+  and windows that hold an unconfirmed candle are never reported complete.
+- **Funding rates**: the adapter requests one page of `GET /api/v5/public/funding-rate-history`, up to
+  400 records, which is the OKX maximum and default. The window is complete when the page holds at least
+  two records and its oldest record is within one funding interval of `start`. A full page whose oldest
+  record is still after `start` is truncated. Any `limit` leaves the window unverified.
 
 ## Rate limiting
 

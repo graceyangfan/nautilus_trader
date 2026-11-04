@@ -101,7 +101,7 @@ use rust_decimal::Decimal;
 use ustr::Ustr;
 pub use view::CacheView; // Re-export
 
-use crate::xrate::get_exchange_rate;
+use crate::xrate::{get_exchange_rate, get_exchange_rate_with_alternates};
 
 /// A common in-memory `Cache` for market and execution related data.
 #[cfg_attr(
@@ -433,6 +433,12 @@ impl Cache {
         self.external_data_clients.contains(client_id)
     }
 
+    /// Returns whether any external data clients are registered.
+    #[must_use]
+    pub fn has_external_data_clients(&self) -> bool {
+        !self.external_data_clients.is_empty()
+    }
+
     /// Registers `client_id` as an external data client.
     ///
     /// Registrations survive [`Self::clear_index`] and [`Self::reset`].
@@ -505,6 +511,9 @@ impl Cache {
         // An adapter registers the loaded currencies before decoding their dependents; repeating
         // it here keeps the cached map consistent with the registry whatever the adapter did.
         register_loaded_currencies(&mut cache_map.currencies)?;
+        #[cfg(feature = "defi")]
+        self.defi.restore_currencies(&cache_map.currencies);
+
         self.currencies = cache_map.currencies;
         self.instruments = cache_map.instruments;
         self.instrument_closes = cache_map.instrument_closes;
@@ -544,12 +553,16 @@ impl Cache {
     ///
     /// Returns an error if loading currencies cache fails.
     pub async fn cache_currencies(&mut self) -> anyhow::Result<()> {
-        self.currencies = match &mut self.database {
+        let mut currencies = match &mut self.database {
             Some(db) => db.load_currencies().await?,
             None => AHashMap::new(),
         };
 
-        register_loaded_currencies(&mut self.currencies)?;
+        register_loaded_currencies(&mut currencies)?;
+        #[cfg(feature = "defi")]
+        self.defi.restore_currencies(&currencies);
+
+        self.currencies = currencies;
 
         log::info!("Cached {} currencies from database", self.currencies.len());
         Ok(())
@@ -959,6 +972,100 @@ impl Cache {
     #[must_use]
     pub const fn has_backing(&self) -> bool {
         self.database.is_some()
+    }
+
+    /// Loads an instrument from memory, falling back to the database and caching the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading the instrument fails.
+    pub fn load_instrument(
+        &mut self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<InstrumentAny>> {
+        if let Some(instrument) = self.instruments.get(instrument_id) {
+            return Ok(Some(instrument.clone()));
+        }
+
+        let Some(database) = &self.database else {
+            return Ok(None);
+        };
+
+        let instrument = database.load_instrument_sync(instrument_id)?;
+        if let Some(instrument) = &instrument {
+            self.instruments.insert(instrument.id(), instrument.clone());
+        }
+
+        Ok(instrument)
+    }
+
+    /// Loads a synthetic from memory, falling back to the database and caching the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ID is not synthetic or loading the instrument fails.
+    pub fn load_synthetic(
+        &mut self,
+        instrument_id: &InstrumentId,
+    ) -> anyhow::Result<Option<SyntheticInstrument>> {
+        anyhow::ensure!(
+            instrument_id.is_synthetic(),
+            "Instrument ID is not synthetic: {instrument_id}"
+        );
+
+        if let Some(synthetic) = self.synthetics.get(instrument_id) {
+            return Ok(Some(synthetic.clone()));
+        }
+
+        let Some(database) = &self.database else {
+            return Ok(None);
+        };
+
+        let synthetic = database.load_synthetic_sync(instrument_id)?;
+        if let Some(synthetic) = &synthetic {
+            self.synthetics.insert(synthetic.id, synthetic.clone());
+        }
+
+        Ok(synthetic)
+    }
+
+    /// Deletes persisted actor state. Does nothing without a database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deleting the state fails.
+    pub fn delete_actor(&self, actor_id: &ActorId) -> anyhow::Result<()> {
+        if let Some(database) = &self.database {
+            database.delete_actor(actor_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Deletes persisted strategy state. Does nothing without a database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if deleting the state fails.
+    pub fn delete_strategy(&self, strategy_id: &StrategyId) -> anyhow::Result<()> {
+        if let Some(database) = &self.database {
+            database.delete_strategy(strategy_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Persists the heartbeat timestamp. Does nothing without a database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the timestamp fails.
+    pub fn heartbeat(&self, timestamp: UnixNanos) -> anyhow::Result<()> {
+        if let Some(database) = &self.database {
+            database.heartbeat(timestamp)?;
+        }
+
+        Ok(())
     }
 
     /// Loads persisted actor state.
@@ -1473,7 +1580,18 @@ impl Cache {
     ///
     /// Only orders that have been closed for at least this amount of time will be purged.
     /// A value of 0 means purge all closed orders regardless of when they were closed.
-    pub fn purge_closed_orders(&mut self, ts_now: UnixNanos, buffer_secs: u64) {
+    ///
+    /// When `purge_from_database` is true, also requests deletion from the backing database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion cannot be queued.
+    pub fn purge_closed_orders(
+        &mut self,
+        ts_now: UnixNanos,
+        buffer_secs: u64,
+        purge_from_database: bool,
+    ) -> anyhow::Result<()> {
         log::debug!(
             "Purging closed orders{}",
             if buffer_secs > 0 {
@@ -1487,12 +1605,13 @@ impl Cache {
             log::warn!(
                 "Cannot purge closed orders: buffer_secs {buffer_secs} is not representable in `u64` nanoseconds"
             );
-            return;
+            return Ok(());
         };
         let purge_cutoff = ts_now.checked_sub(buffer_ns);
 
         let mut affected_order_list_ids: AHashSet<OrderListId> = AHashSet::new();
         let mut purged_client_order_ids: AHashSet<ClientOrderId> = AHashSet::new();
+        let mut result = Ok(());
 
         'outer: for client_order_id in self.index.orders_closed.clone() {
             let purge_target = self.orders.get(&client_order_id).and_then(|order_cell| {
@@ -1529,8 +1648,15 @@ impl Cache {
                 affected_order_list_ids.insert(order_list_id);
             }
 
-            if self.purge_order_except_aliases(client_order_id) {
-                purged_client_order_ids.insert(client_order_id);
+            match self.purge_order_checked(client_order_id, purge_from_database) {
+                Ok(true) => {
+                    purged_client_order_ids.insert(client_order_id);
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
             }
         }
 
@@ -1553,10 +1679,23 @@ impl Cache {
                 }
             }
         }
+
+        result
     }
 
     /// Purges all closed positions from the cache that are older than `buffer_secs`.
-    pub fn purge_closed_positions(&mut self, ts_now: UnixNanos, buffer_secs: u64) {
+    ///
+    /// When `purge_from_database` is true, also requests deletion from the backing database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion cannot be queued.
+    pub fn purge_closed_positions(
+        &mut self,
+        ts_now: UnixNanos,
+        buffer_secs: u64,
+        purge_from_database: bool,
+    ) -> anyhow::Result<()> {
         log::debug!(
             "Purging closed positions{}",
             if buffer_secs > 0 {
@@ -1570,7 +1709,7 @@ impl Cache {
             log::warn!(
                 "Cannot purge closed positions: buffer_secs {buffer_secs} is not representable in `u64` nanoseconds"
             );
-            return;
+            return Ok(());
         };
         let purge_cutoff = ts_now.checked_sub(buffer_ns);
 
@@ -1584,20 +1723,52 @@ impl Cache {
             });
 
             if should_purge {
-                self.purge_position(position_id);
+                self.purge_position(position_id, purge_from_database)?;
             }
         }
+
+        Ok(())
     }
 
     /// Purges the order with the `client_order_id` from the cache (if found).
     ///
     /// For safety, an order is prevented from being purged if it's open.
-    pub fn purge_order(&mut self, client_order_id: ClientOrderId) {
-        if self.purge_order_except_aliases(client_order_id) {
+    ///
+    /// When `purge_from_database` is true, also requests deletion from the backing database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion cannot be queued.
+    pub fn purge_order(
+        &mut self,
+        client_order_id: ClientOrderId,
+        purge_from_database: bool,
+    ) -> anyhow::Result<()> {
+        if self.purge_order_checked(client_order_id, purge_from_database)? {
             self.index
                 .venue_order_ids
                 .retain(|_, owner| owner != &client_order_id);
         }
+
+        Ok(())
+    }
+
+    fn purge_order_checked(
+        &mut self,
+        client_order_id: ClientOrderId,
+        purge_from_database: bool,
+    ) -> anyhow::Result<bool> {
+        if purge_from_database
+            && let Some(database) = &self.database
+            && self
+                .orders
+                .get(&client_order_id)
+                .is_none_or(|order| !order.borrow().is_open())
+        {
+            database.delete_order(&client_order_id)?;
+        }
+
+        Ok(self.purge_order_except_aliases(client_order_id))
     }
 
     /// Removes the order and its indexes, leaving the reverse venue order ID aliases for the
@@ -1837,7 +2008,17 @@ impl Cache {
     /// Purges the position with the `position_id` from the cache (if found).
     ///
     /// For safety, a position is prevented from being purged if it's open.
-    pub fn purge_position(&mut self, position_id: PositionId) {
+    ///
+    /// When `purge_from_database` is true, also requests deletion from the backing database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion cannot be queued.
+    pub fn purge_position(
+        &mut self,
+        position_id: PositionId,
+        purge_from_database: bool,
+    ) -> anyhow::Result<()> {
         // Keep the cell alive during index cleanup without cloning position history
         let position_cell = self.positions.get(&position_id).cloned();
         let position = position_cell.as_ref().map(|cell| cell.borrow());
@@ -1847,8 +2028,10 @@ impl Cache {
             && pos.is_open()
         {
             log::warn!("Position {position_id} found open when purging, skipping purge");
-            return;
+            return Ok(());
         }
+
+        self.delete_position_from_database(position_id, purge_from_database)?;
 
         // If position exists in cache, remove it and clean up position-specific indices
         if let Some(ref pos) = position {
@@ -1940,6 +2123,19 @@ impl Cache {
         // Always clean up position snapshots (even if position not in cache)
         self.position_snapshots.remove(&position_id);
         self.bump_position_snapshot_revision(position_id);
+        Ok(())
+    }
+
+    fn delete_position_from_database(
+        &self,
+        position_id: PositionId,
+        requested: bool,
+    ) -> anyhow::Result<()> {
+        if requested && let Some(database) = &self.database {
+            database.delete_position(&position_id)?;
+        }
+
+        Ok(())
     }
 
     /// Purges the instrument with the `instrument_id` from the cache (if found).
@@ -1967,8 +2163,8 @@ impl Cache {
     /// responsible for ensuring the instrument is no longer in use before purging.
     fn purge_instrument_inner(&mut self, instrument_id: InstrumentId, skip_order_guard: bool) {
         #[cfg(feature = "defi")]
-        let defi_found = self.defi.pools.contains_key(&instrument_id)
-            || self.defi.pool_profilers.contains_key(&instrument_id);
+        let defi_found =
+            self.pool(&instrument_id).is_some() || self.pool_profiler(&instrument_id).is_some();
         #[cfg(not(feature = "defi"))]
         let defi_found = false;
 
@@ -2026,10 +2222,7 @@ impl Cache {
             .retain(|bar_type, _| bar_type.instrument_id() != instrument_id);
 
         #[cfg(feature = "defi")]
-        {
-            self.defi.pools.remove(&instrument_id);
-            self.defi.pool_profilers.remove(&instrument_id);
-        }
+        self.defi.remove_instrument(&instrument_id);
 
         log::info!("Purged instrument {instrument_id}");
     }
@@ -2057,8 +2250,20 @@ impl Cache {
     /// Purges all account state events which are outside the lookback window.
     ///
     /// Only events which are outside the lookback window will be purged.
-    /// A value of 0 means purge all account state events.
-    pub fn purge_account_events(&mut self, ts_now: UnixNanos, lookback_secs: u64) {
+    /// A value of 0 purges all but the latest account state event.
+    ///
+    /// When `purge_from_database` is true, also requests deletion from the backing database.
+    /// Redis and PostgreSQL log the request and retain the full account history for replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database deletion cannot be queued.
+    pub fn purge_account_events(
+        &mut self,
+        ts_now: UnixNanos,
+        lookback_secs: u64,
+        purge_from_database: bool,
+    ) -> anyhow::Result<()> {
         log::debug!(
             "Purging account events{}",
             if lookback_secs > 0 {
@@ -2071,6 +2276,8 @@ impl Cache {
         for account_cell in self.accounts.values() {
             let mut account = account_cell.borrow_mut();
             let event_count = account.event_count();
+            let events_before =
+                (purge_from_database && self.database.is_some()).then(|| account.events());
             account.purge_account_events(ts_now, lookback_secs);
             let count_diff = event_count - account.event_count();
             if count_diff > 0 {
@@ -2079,8 +2286,42 @@ impl Cache {
                     count_diff,
                     account.id()
                 );
+
+                if let Some(database) = &self.database
+                    && let Some(events_before) = events_before
+                {
+                    Self::delete_purged_account_events(
+                        database.as_ref(),
+                        &account,
+                        &events_before,
+                    )?;
+                }
             }
         }
+
+        Ok(())
+    }
+
+    fn delete_purged_account_events(
+        database: &dyn CacheDatabaseAdapter,
+        account: &AccountAny,
+        events_before: &[AccountState],
+    ) -> anyhow::Result<()> {
+        let retained: AHashSet<_> = account
+            .events()
+            .iter()
+            .map(|event| event.event_id)
+            .collect();
+
+        for event in events_before {
+            if retained.contains(&event.event_id) {
+                continue;
+            }
+
+            database.delete_account_event(&account.id(), &event.event_id.to_string())?;
+        }
+
+        Ok(())
     }
 
     /// Clears the caches index.
@@ -2123,16 +2364,15 @@ impl Cache {
         self.yield_curves.clear();
 
         if self.config.drop_instruments_on_reset {
+            #[cfg(feature = "defi")]
+            self.defi.clear_currencies();
             self.currencies.clear();
             self.instruments.clear();
             self.synthetics.clear();
         }
 
         #[cfg(feature = "defi")]
-        {
-            self.defi.pools.clear();
-            self.defi.pool_profilers.clear();
-        }
+        self.defi.clear_pools();
 
         self.clear_index();
 
@@ -2608,6 +2848,21 @@ impl Cache {
     ///
     /// Returns an error if persisting the currency to the backing database fails.
     pub fn add_currency(&mut self, currency: Currency) -> anyhow::Result<()> {
+        #[cfg(feature = "defi")]
+        let token = nautilus_model::defi::currency::check(currency)?.is_some();
+        #[cfg(feature = "defi")]
+        if token {
+            if let Some(existing) = self.currencies.get(&currency.code) {
+                if !self.defi.contains_currency(&currency.code) {
+                    anyhow::bail!("Legacy currency occupies token code {}", currency.code);
+                }
+
+                nautilus_model::defi::currency::check(*existing)?;
+            }
+
+            Currency::register(currency, false)?;
+        }
+
         if self.currencies.contains_key(&currency.code) {
             return Ok(());
         }
@@ -2618,6 +2873,12 @@ impl Cache {
         }
 
         self.currencies.insert(currency.code, currency);
+
+        #[cfg(feature = "defi")]
+        if token {
+            self.defi.add_currency(currency.code);
+        }
+
         Ok(())
     }
 
@@ -2629,6 +2890,9 @@ impl Cache {
     pub fn add_instrument(&mut self, instrument: InstrumentAny) -> anyhow::Result<()> {
         log::debug!("Adding `Instrument` {}", instrument.id());
 
+        #[cfg(feature = "defi")]
+        let migration = self.check_instrument_migration(&instrument)?;
+
         // Ensure currencies exist in cache - safe to call repeatedly as add_currency is idempotent
         if let Some(base_currency) = instrument.base_currency() {
             self.add_currency(base_currency)?;
@@ -2637,6 +2901,14 @@ impl Cache {
         self.add_currency(instrument.settlement_currency())?;
 
         if let Some(database) = &mut self.database {
+            #[cfg(feature = "defi")]
+            if let Some(migration) = migration {
+                database.add_defi_instrument(&instrument, migration)?;
+            } else {
+                database.add_instrument(&instrument)?;
+            }
+
+            #[cfg(not(feature = "defi"))]
             database.add_instrument(&instrument)?;
         }
 
@@ -3823,10 +4095,7 @@ impl Cache {
             self.index.orders_closed.insert(client_order_id);
         }
 
-        // A cancel rejection resolves the outstanding cancel request
-        if matches!(order.last_event(), OrderEventAny::CancelRejected(_)) {
-            self.index.orders_pending_cancel.remove(&client_order_id);
-        }
+        self.refresh_order_pending_cancel(order);
 
         // Update emulation index
         if order.emulation_trigger().is_some() && !order.is_closed() {
@@ -3861,6 +4130,18 @@ impl Cache {
         }
 
         Ok(())
+    }
+
+    fn refresh_order_pending_cancel(&mut self, order: &OrderAny) {
+        if matches!(
+            order.last_event(),
+            OrderEventAny::CancelDenied(_) | OrderEventAny::CancelRejected(_)
+        ) && !order.has_pending_cancel_command()
+        {
+            self.index
+                .orders_pending_cancel
+                .remove(&order.client_order_id());
+        }
     }
 
     /// Updates the `order` as pending cancel locally.
@@ -6823,6 +7104,9 @@ impl Cache {
 
     /// Tries to calculate the exchange rate without logging calculation errors.
     ///
+    /// If preferred quotes cannot form a rate, tries alternate quote selections by replacement
+    /// count, then source preference. This can take exponential time in the number of alternates.
+    ///
     /// # Errors
     ///
     /// Returns an error if the cached quotes cannot form a valid exchange rate calculation.
@@ -6839,24 +7123,33 @@ impl Cache {
             return Ok(Some(Decimal::ONE));
         }
 
-        let (bid_quote, ask_quote) = self.build_quote_table(&venue);
+        let (bid_quote, ask_quote, alternates) = self.build_quote_table(&venue);
 
-        get_exchange_rate(
-            from_currency.code,
-            to_currency.code,
-            price_type,
-            bid_quote,
-            ask_quote,
-        )
+        if alternates.is_empty() {
+            get_exchange_rate(
+                from_currency.code,
+                to_currency.code,
+                price_type,
+                bid_quote,
+                ask_quote,
+            )
+        } else {
+            get_exchange_rate_with_alternates(
+                from_currency.code,
+                to_currency.code,
+                price_type,
+                &bid_quote,
+                &ask_quote,
+                &alternates,
+            )
+        }
     }
 
-    fn build_quote_table(
-        &self,
-        venue: &Venue,
-    ) -> (AHashMap<Ustr, Decimal>, AHashMap<Ustr, Decimal>) {
+    fn build_quote_table(&self, venue: &Venue) -> QuoteTable {
         let mut bid_quotes = AHashMap::new();
         let mut ask_quotes = AHashMap::new();
         let mut quote_sources = AHashMap::new();
+        let mut alternates = Vec::new();
         let mut bar_quotes = None;
         let mut pair_buffer = String::new();
 
@@ -6904,15 +7197,32 @@ impl Cache {
                 .get(&pair)
                 .is_some_and(|current| current >= &preference)
             {
+                alternates.push((
+                    preference,
+                    pair,
+                    bid_price.as_decimal(),
+                    ask_price.as_decimal(),
+                ));
                 continue;
             }
 
-            bid_quotes.insert(pair, bid_price.as_decimal());
-            ask_quotes.insert(pair, ask_price.as_decimal());
-            quote_sources.insert(pair, preference);
+            let previous = quote_sources.insert(pair, preference);
+            if let (Some(preference), Some(bid), Some(ask)) = (
+                previous,
+                bid_quotes.insert(pair, bid_price.as_decimal()),
+                ask_quotes.insert(pair, ask_price.as_decimal()),
+            ) {
+                alternates.push((preference, pair, bid, ask));
+            }
         }
 
-        (bid_quotes, ask_quotes)
+        alternates.sort_unstable_by_key(|entry| Reverse(entry.0));
+        let alternates = alternates
+            .into_iter()
+            .map(|(_, pair, bid, ask)| (pair, bid, ask))
+            .collect();
+
+        (bid_quotes, ask_quotes, alternates)
     }
 
     fn build_bar_quote_table(
@@ -7365,6 +7675,12 @@ impl Cache {
         log::debug!("Completed own books audit in {:?}", start.elapsed());
     }
 }
+
+type QuoteTable = (
+    AHashMap<Ustr, Decimal>,
+    AHashMap<Ustr, Decimal>,
+    Vec<(Ustr, Decimal, Decimal)>,
+);
 
 const POSITION_OMS_KEY_PREFIX: &str = "position_oms:";
 

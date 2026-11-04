@@ -139,13 +139,26 @@ Python class names. Python does not expose a factory registration API for separa
 #### Recovery
 
 - Startup restores supported, successfully persisted general data, currencies, instruments,
-  instrument closes, accounts, orders, and positions. Postgres also restores Greeks and yield curves.
+  instrument closes, synthetics, accounts, orders, and positions. Postgres also restores Greeks and yield curves.
 - Loading replaces Greeks and yield curves already in memory; Redis loads empty maps.
 - Instrument closes persist whenever a backing is configured, regardless of `save_market_data`:
   they are recovery snapshots rather than bounded history.
 - Startup does not restore bounded market-data histories or the running process.
 - A backing does not provide a complete event archive or synchronize nodes. Each node owns its
   in-memory cache, even when nodes share a database namespace.
+- With the `defi` feature, Redis and Postgres restore full token currency definitions before dependent
+  instruments. Instrument writes wait for persistent conflict checks, including legacy updates. Integrity
+  conflicts fail recovery. See [token currency recovery](../integrations/blockchain.md#token-currency-identity-and-recovery)
+  for legacy-data and instrument-replacement rules.
+
+#### Explicit database operations
+
+- `cache.load_instrument(instrument_id)` and `cache.load_synthetic(instrument_id)` check memory first,
+  then load from the backing and cache successful results. Fill handling also uses this instrument fallback
+  when processing order fills and orderless spread legs. Failed or missing reads leave memory unchanged.
+- `cache.delete_actor(actor_id)` and `cache.delete_strategy(strategy_id)` remove saved component state
+  without unregistering components.
+- `cache.heartbeat(timestamp)` persists a caller-supplied timestamp in UNIX nanoseconds.
 
 #### Postgres
 
@@ -155,8 +168,10 @@ Python class names. Python does not expose a factory registration API for separa
 - Orders, positions, their snapshots, and accounts belong to a trader. Two traders can reuse client order
   or position IDs.
 - Flushes, including `flush_on_start`, delete only the trader's rows. Currencies, instruments,
-  instrument closes, market data (including Greeks and yield curves), and general data stay shared.
-- Actor and strategy state persistence is unsupported; leave `load_state` and `save_state` disabled.
+  instrument closes, synthetics, market data (including Greeks and yield curves), and user general data stay shared.
+  The trader's saved actor and strategy state and heartbeat are also deleted.
+- Actor and strategy state persistence supports `load_state` and `save_state`.
+- The `cache-database:` key prefix is reserved for backing data. User entries with this prefix do not restore.
 
 Run `nautilus database init` to create the `greeks` and `yield_curve` tables before connecting,
 even with `save_market_data = false`.
@@ -450,7 +465,7 @@ class MarketDataStrategy(Strategy):
 
 Query orders by venue, strategy, instrument, account, or order side.
 
-##### Basic order access
+**Basic order access**:
 
 ```python
 # Get a specific order by its client order ID
@@ -469,7 +484,7 @@ orders_for_strategy = self.cache.orders(strategy_id=strategy_id)
 orders_for_instrument = self.cache.orders(instrument_id=instrument_id)
 ```
 
-##### Order state queries
+**Order state queries**:
 
 ```python
 # Orders currently active at the venue
@@ -507,7 +522,7 @@ order = self.cache.order(client_order_id)
 is_active_local = order is not None and order.is_active_local
 ```
 
-##### Order statistics
+**Order statistics**:
 
 ```python
 # Number of open orders
@@ -539,7 +554,7 @@ venue_orders_count = self.cache.orders_total_count(venue=venue)
 
 The `Cache` keeps positions until they are purged or reset and provides several ways to query them.
 
-##### Position access
+**Position access**:
 
 ```python
 # Get a specific position by its ID
@@ -567,7 +582,7 @@ strategy_positions = self.cache.positions(strategy_id=strategy_id)
 long_positions = self.cache.positions(side=PositionSide.LONG)
 ```
 
-##### Position state queries
+**Position state queries**:
 
 ```python
 # Checks if a position with the given ID exists
@@ -586,7 +601,7 @@ orders = self.cache.orders_for_position(position_id)
 position = self.cache.position_for_order(client_order_id)
 ```
 
-##### Position statistics
+**Position statistics**:
 
 ```python
 # Number of currently open positions
@@ -647,9 +662,17 @@ Long-running sessions accumulate closed orders, closed positions, account events
 unused instruments. The cache exposes targeted and bulk purge methods so strategies and
 the live trading engine can keep memory bounded without restarting the system.
 
+Purges change memory only by default. Pass `purge_from_database=True` to order and position purge methods
+in Python to queue deletion of their persisted histories and routine snapshots. Rust callers pass the
+boolean explicitly and handle the returned `Result`. A successful return confirms queue admission;
+the adapter logs later database failures. Encoded position snapshots used to replay corrections remain
+persisted as general data.
+Instrument purges change memory only.
+
 #### Targeted purges
 
-Use these to drop a single entity. Each refuses to purge while the entity is still active.
+Use these to drop a single entity. Order and position guards use in-memory state; direct purges can
+also target IDs absent from memory.
 
 - `cache.purge_order(client_order_id)`: removes the order and each order-keyed index entry. Skips open orders.
 - `cache.purge_position(position_id)`: removes the position, its snapshots, and position-keyed
@@ -679,7 +702,9 @@ lookback window in seconds.
 - `cache.purge_closed_positions(ts_now, buffer_secs)`: closed positions whose close timestamp
   is older than `buffer_secs`.
 - `cache.purge_account_events(ts_now, lookback_secs)`: account state events older than
-  `lookback_secs`. A value of `0` purges all events.
+  `lookback_secs`. The latest event always remains, including when the lookback is `0`.
+  With `purge_from_database=True`, Redis and Postgres log deletion requests and retain the full account
+  history for incremental balance, margin, and starting-balance replay.
 
 :::warning
 Keep the closed source position of a virtual `HEDGING` flip while its order can still receive fills.
@@ -690,8 +715,9 @@ Purging it removes the history needed to route later fills and can cause the eng
 
 `LiveExecutionEngineConfig` schedules the bulk purges on a timer. All purge intervals default to `None`, which
 disables the corresponding loop. Set an interval to enable a loop and set its buffer or lookback to control
-how recent entries stay protected. This example uses the recommended starting values from the live-trading
-configuration guide:
+how recent entries stay protected. Set `purge_from_database=True` to also delete persisted closed orders
+and positions. Redis and Postgres retain persisted account-event history. This example uses the recommended starting values
+from the live-trading configuration guide and keeps purges in memory:
 
 ```python
 from nautilus_trader.config import LiveExecutionEngineConfig

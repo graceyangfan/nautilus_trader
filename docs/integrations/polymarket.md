@@ -12,12 +12,28 @@ execution, signing, and WebSocket operations have the same behavior from Rust an
 The adapter handles order preparation and signing for several wallet configurations. This guide
 covers market data, trade execution, session key administration, and Deposit Wallet position operations.
 
-The adapter supports Conditional Tokens Framework (CTF) markets with market protocol `v1`. This is
-separate from CLOB service version `2` and the `CTFExchangeV2` order format. Markets with protocol `v2`,
-a missing version, or an unknown version are unsupported, even with populated `clobTokenIds`.
-Instrument providers skip these markets; the historical data loader rejects them. Unsupported markets
-are not retried while [waiting for CLOB metadata](#markets-awaiting-clob-metadata). See the
+The adapter supports market data and resolution for Conditional Tokens Framework (CTF) markets with
+protocol `v1` and Protocol V2 markets with protocol `v2`. Execution and account reconciliation support both
+protocols. Deposit Wallet split, merge, and redeem support both protocols. Market protocol is separate
+from CLOB service version `2` and the `CTFExchangeV2` signed order structure.
+
+The market's explicit `version` selects `clobTokenIds` (JSON text) for `v1` or `positionIds` (an array of
+decimal strings) for `v2`, even when both fields exist. Instrument IDs use
+`<condition_id>-<selected_id>.POLYMARKET`. Missing or unknown versions are unsupported: providers skip
+them, loaders reject them, and auto-load does not retry them while [waiting for CLOB metadata](#markets-awaiting-clob-metadata). See the
 [Protocol V2 migration guide](https://docs.polymarket.com/migrate/polymarket-v2/api-integrations).
+
+Order signatures and locally derived order IDs use the same validated exchange and domain:
+
+| Market protocol | Exchange              | EIP-712 domain version |
+| --------------- | --------------------- | ---------------------- |
+| `v1`, standard  | CTF Exchange          | `"2"`                  |
+| `v1`, neg-risk  | Neg Risk CTF Exchange | `"2"`                  |
+| `v2`, either    | `ExchangeV3`          | `"3"`                  |
+
+This selection also applies to Deposit Wallet owner and session signatures. The signed order fields,
+CLOB authentication, fixed Nautilus builder attribution, and zero builder fees stay the same.
+Combo products remain unsupported for execution and account reports.
 
 ## Installation
 
@@ -99,7 +115,8 @@ Use these Rust components together or separately for live market data and trade 
   builder).
 - `PolymarketExecutionClientFactory`: Factory for Polymarket execution clients (used by the live
   node builder).
-- `PolymarketPositionClient`: Deposit Wallet split, merge, and redeem operations.
+- `PolymarketPositionClient`: CTF and V2 [position operations](#position-operations),
+  plus [V2 trading approval submissions](#setting-smart-wallet-allowances) subject to Relayer policy.
 - `PolymarketSessionKeyClient`: Owner-operated session authorization, listing, and revocation.
 
 :::note
@@ -155,8 +172,8 @@ Fund your wallet with pUSD before submitting orders. An unfunded wallet produces
 
 ### Setting EOA allowances
 
-The adapter includes a direct on-chain allowance command for EOA accounts. Use it only when the
-funding wallet is the signer (`PolymarketSignatureType::Eoa`). Fund the EOA with POL for gas, set
+Without arguments, the allowance command submits CTF approvals from the EOA signer. Use this mode
+only when the funding wallet is the signer (`PolymarketSignatureType::Eoa`). Fund the EOA with POL for gas, set
 `POLYMARKET_PK`, and run:
 
 ```bash
@@ -173,20 +190,52 @@ or settlement flow needs the legacy approval.
 
 ### Setting smart-wallet allowances
 
-Do not run the EOA command for a proxy, Safe, or Deposit Wallet funder. It signs transactions from
-the EOA key and cannot grant approvals from a smart contract wallet.
+Do not use the command without arguments for a smart-wallet funder: it approves the EOA's assets.
+Proxy and Safe Wallets require their wallet-specific SDK approval payloads.
 
 Use Polymarket's [wallet and authentication flow](https://docs.polymarket.com/trading/wallets-auth)
 to submit the approvals from the account wallet. Deposit Wallet approvals use an ordered `WALLET`
-batch authorized by the signer and submitted through the Relayer. Safe and Proxy Wallet approvals
-need their wallet-specific SDK payloads.
+batch authorized by the signer and submitted through the Relayer.
+
+V2 trading requires an `ExchangeV3` pUSD allowance covering BUY spend plus fees and `PositionManager`
+operator permission for SELL. CTF approvals do not grant V2 permissions.
+
+:::warning
+The Relayer requires unlimited ExchangeV3 approvals and rejects the adapter's bounded ExchangeV3
+approval requests with HTTP 400. Deposit Wallet V2 trading therefore relies on existing approvals,
+such as those granted through Polymarket's wallet flow. The adapter does not fall back to an unlimited approval.
+
+A rejected submission blocks further position operations for that wallet in the same process, even
+if the client is recreated. Follow [submission recovery](#recover-an-unknown-submission) before
+restarting; a restart does not cancel a signed batch.
+:::
+
+The allowance command accepts an explicit pUSD limit:
+
+```bash
+cargo run -p nautilus-polymarket --bin polymarket-set-allowances -- --v2-pusd-limit 5
+```
+
+With `POLYMARKET_FUNDER` different from the signer address, this mode attempts submission from a verified Deposit
+Wallet through the Relayer and requires the [Relayer credentials](#relayer-credentials). Wallet
+verification refuses Safe and Proxy funders. Otherwise, it submits from the EOA signer.
+Callers can also use `PolymarketPositionClient::approve_v2_trading` in Rust or
+`PolymarketPositionClient.approve_v2_trading` in Python; both use the same blocked Deposit Wallet route.
+The explicit limit is in pUSD and includes fees. These approvals grant neither `Router` nor
+`AutoRedeemer` permission.
+BUY fills and fees consume this allowance. Calling approval again replaces the remaining limit;
+it does not add to it. The adapter sizes market BUYs against the pUSD balance, not the allowance.
+Refresh and check the remaining allowance before trading; an exhausted limit causes venue rejection.
+[AutoRedeemer permission](https://docs.polymarket.com/migrate/polymarket-v2/contract-integrations#enable-v2-automatic-redemption)
+is optional, does not schedule redemption, and is not required to trade.
 
 ### Refreshing and verifying allowances
 
 After the approval transaction confirms, refresh the CLOB cache. Rust callers can use
 `PolymarketClobHttpClient::update_balance_allowance` with `AssetType::Collateral` for pUSD. Use
-`AssetType::Conditional` with a conditional token ID for a conditional-token allowance. Both forms
-also need the account's signature type. The authenticated request maps to
+`AssetType::Conditional` with a CTF token ID or `AssetType::ConditionalV2` with a V2 position ID.
+The V2 wire value is exactly `CONDITIONAL-V2`. Every request also needs the maker's signature type.
+The authenticated request maps to
 `GET /balance-allowance/update`. Use `PolymarketSignatureType::Poly1271` for a Deposit Wallet.
 
 The balance-allowance endpoint has two decoding paths:
@@ -197,7 +246,11 @@ The balance-allowance endpoint has two decoding paths:
 | Internal balance-only projection                  | Account state refresh and market-buy fee adjustment. | Ignores allowance fields; its return type cannot expose or grant approval authority.                                                                                           | Balance only; required CLOB spender approvals remain unproven.                     |
 
 Use the strict path whenever a decision depends on allowance evidence so ambiguous wire data cannot
-become approval authority.
+become approval authority. After refreshing, read with the same asset ID and signature type, and check
+the selected exchange's allowance entry. Rust callers can use the public `EXCHANGE_V3`, `CTF_EXCHANGE`,
+and `NEG_RISK_CTF_EXCHANGE` constants in `signing::eip712` as spender addresses.
+API authentication identifies the signer; the balance and
+permissions belong to the maker holding the assets.
 
 ### Account balances
 
@@ -298,7 +351,7 @@ client requires them only for [PolyBolt reference-price subscriptions](#polybolt
 
 ### Relayer credentials
 
-Deposit Wallet split, merge, and redeem operations also require a Relayer API key. Create one under
+Deposit Wallet approvals, split, merge, and redeem operations require a Relayer API key. Create one under
 Settings > API Keys > Relayer API Keys, as described in
 [Connect your account](https://docs.polymarket.com/trading/wallets-auth#connect-your-account), then set:
 
@@ -493,33 +546,56 @@ that authorization remains active.
 ## Position operations
 
 `PolymarketPositionClient` splits pUSD into complete outcome-token sets, merges complete sets back
-to pUSD, and redeems resolved positions. The client supports Deposit Wallet (`PolymarketSignatureType::Poly1271`)
-only. Safe, Proxy, and EOA paths are not available. The client does not deploy wallets, batch
-unrelated calls, size a merge to `"max"`, or redeem positions automatically.
+to pUSD, and redeems resolved CTF and V2 positions. It also exposes [V2 trading approval submissions](#setting-smart-wallet-allowances),
+which Relayer policy blocks for bounded Deposit Wallet limits.
+The client supports Deposit Wallet (`PolymarketSignatureType::Poly1271`) only. Safe, Proxy, and EOA paths are not available. The client does not deploy wallets, batch
+unrelated calls, size a merge to `"max"`, or redeem positions automatically. Combo products are unsupported.
 
 ### Inputs and approvals
 
-Each operation looks up the market on the public CLOB by condition ID and requires market protocol `v1`
-and a present `neg_risk` value before encoding calldata. It then selects the canonical pUSD token and
-the standard or negative-risk collateral adapter. Callers pass a 0x-prefixed 32-byte condition ID and
-do not supply contract addresses.
+Each split, merge, or redeem call verifies the public CLOB market's explicit protocol, condition ID,
+and `neg_risk` value.
+CTF calls use the standard or negative-risk collateral adapter. V2 calls use
+[Router and PositionManager](https://docs.polymarket.com/migrate/polymarket-v2/contract-integrations)
+with verified binary or negative-risk position IDs. Callers do not supply contract addresses.
 
+- **Condition IDs**: Both protocols require a `0x` prefix. CTF requires a 32-byte value. V2 accepts native
+  31-byte IDs or 32-byte IDs with a zero final byte. Nonzero padding is rejected before narrowing.
 - **Split and merge amounts**: Positive pUSD decimals exactly representable at six decimal places, with no
   rounding. Amounts use pUSD units, never base units. `"max"` is not accepted.
-- **Redemption**: No amount argument. Redeems both binary index sets `[1, 2]`.
+- **CTF redemption**: `redeem_positions(condition_id)` redeems both binary index sets `[1, 2]` without
+  an amount argument.
+- **V2 redemption**: `redeem_position(condition_id, outcome_index, amount)` redeems an explicit positive
+  share amount exactly representable at six decimal places, with no rounding. The index is the position
+  ID's final byte (`0` or `1`), independent of CLOB token-array order. The CTF redeem-both call refuses V2.
+
+Split spends the specified pUSD amount and creates that amount of each outcome. Merge consumes the specified
+amount of each outcome and returns pUSD. V2 redemption burns only the selected outcome amount and returns
+its PositionManager payout. A valid zero losing payout is redeemable; a reverted or unavailable payout
+read prevents submission. For negative-risk markets, the payout read can reflect a derived result without
+an individual condition-resolution event. Refresh wallet balances after confirmation.
 
 **Approvals are not submitted automatically.** Grant them from the Deposit Wallet before submitting:
 
-| Operation       | Required approval for the market's collateral adapter |
-| --------------- | ----------------------------------------------------- |
-| Split           | Spend the wallet's pUSD                               |
-| Merge or redeem | Act as a Conditional Tokens operator                  |
+| Operation       | CTF collateral adapter approval       | V2 Router approval                 |
+| --------------- | ------------------------------------- | ---------------------------------- |
+| Split           | Spend the wallet's pUSD.              | Spend the wallet's pUSD.           |
+| Merge or redeem | Act as a Conditional Tokens operator. | Act as a PositionManager operator. |
 
-The standard collateral adapter is absent from the approval plan in `polymarket-set-allowances`. The
-negative-risk adapter is included. That command signs approvals from the EOA, so it cannot grant either
-approval for a Deposit Wallet. Use Polymarket's
-[wallet and authentication flow](https://docs.polymarket.com/trading/wallets-auth) to grant the
-position-operation approvals from the Deposit Wallet.
+V2 calls check balances and Router permissions on the Deposit Wallet holding the assets before submission.
+Merge checks both outcome balances. CTF and ExchangeV3 trading approvals do not authorize Router.
+Router pulls inputs from the wallet and returns outputs in the same transaction; no pre-transfer is needed.
+
+Grant Router permissions from the Deposit Wallet through the venue's
+[contract integration](https://docs.polymarket.com/migrate/polymarket-v2/contract-integrations).
+PositionManager operator approval covers **all V2 holdings**, without a per-position amount limit.
+A pUSD approval sets the remaining Router allowance; splits consume it.
+
+The standard collateral adapter is absent from the CTF approval plan in `polymarket-set-allowances`.
+The negative-risk adapter is included. The command's default mode submits CTF approvals from the EOA;
+its V2 mode requests ExchangeV3 trading permissions, not CTF or Router position-operation approvals.
+Use the [wallet and authentication flow](https://docs.polymarket.com/trading/wallets-auth)
+to grant CTF position-operation approvals from the Deposit Wallet.
 
 ### Submit and wait
 
@@ -537,10 +613,26 @@ transaction = await client.split_position(condition_id, Decimal("1"))
 outcome = await transaction.wait()
 ```
 
-`split_position` and `merge_positions` take the condition ID and a positive pUSD `Decimal`.
-`redeem_positions` takes only the condition ID. Each method returns a
-`PolymarketPositionTransaction` after Relayer submission. Call `wait()` once to poll until a
-`PolymarketPositionOutcome` is available. A second `wait()` on the same Python handle raises. The
+`split_position` and `merge_positions` take a condition ID and a positive pUSD `Decimal` for either protocol.
+To redeem V2 shares, set `v2_condition_id` to the market's actual condition ID:
+
+```rust tab="Rust"
+use rust_decimal::Decimal;
+
+let transaction = client.redeem_position(v2_condition_id, 1, Decimal::new(25, 2)).await?;
+let outcome = transaction.wait().await?;
+```
+
+```python tab="Python"
+transaction = await client.redeem_position(v2_condition_id, 1, Decimal("0.25"))
+outcome = await transaction.wait()
+```
+
+`approve_v2_trading` takes an explicit positive pUSD
+limit, which the Relayer rejects under the [approval policy](#setting-smart-wallet-allowances).
+After a successful Relayer submission, each method returns a `PolymarketPositionTransaction`.
+Call `wait()` once to poll until a `PolymarketPositionOutcome` is available.
+A second `wait()` on the same Python handle raises. The
 handle retains its `transaction_id` after waiting starts, including after cancellation or an error.
 
 ### Outcomes and errors
@@ -600,7 +692,8 @@ client emits a `Deposit Wallet submission` record containing:
 
 - Wallet address, reserved nonce, and signed deadline (Unix seconds).
 - Operation, target contract, and value.
-- Unsigned calldata identifying the condition and, for split or merge, the amount.
+- Unsigned calldata identifying the condition and, for split, merge, or V2 redemption, the amount.
+  V2 redemption also includes the outcome index.
 
 The record excludes signatures and credentials, but contains trading intent. Restrict access to retained logs.
 Keep the transaction ID from the returned handle when available.
@@ -685,7 +778,7 @@ Instrument loading also has two common controls:
 | Authentication rejection       | CLOB key, secret, passphrase, and signer   | Use the three credentials created for the signing key.                                                   |
 | Signature rejection            | Wallet type and funder                     | Match `signature_type` to the funding wallet; use the signer address for EOA mode.                       |
 | Balance or allowance rejection | Funding wallet and approvals               | Check pUSD, outcome-token balances for sells, and the required spender approvals.                        |
-| Empty discovery                | Instrument IDs, slugs, and market protocol | Check that IDs and slugs identify existing protocol `v1` CTF markets.                                    |
+| Empty discovery                | Instrument IDs, slugs, and market protocol | Check that IDs and slugs identify existing protocol `v1` or `v2` markets.                                |
 | Unmapped reconciliation record | Execution provider scope                   | Set `load_ids` for the instruments this node should reconcile and share the config with the data client. |
 
 See Polymarket's [error reference](https://docs.polymarket.com/resources/error-codes) for venue errors.
@@ -856,12 +949,12 @@ share minimum before and after cancellation. See [Order modification](#order-mod
 | Bracket/OCO orders | -              | *Not supported by Polymarket.*                          |
 | Iceberg orders     | -              | *Not supported by Polymarket.*                          |
 
-#### Order modification
+### Order modification
 
 Polymarket has no in-place modify endpoint. The execution client cancels the current venue order,
 reconciles its final confirmed fills, and signs a replacement for the remaining quantity.
 
-##### Replacement quantity and identity
+#### Replacement quantity and identity
 
 `ModifyOrder.quantity` sets the absolute target for the logical order, not the replacement leg.
 The replacement keeps the `ClientOrderId` and receives a new `VenueOrderId`.
@@ -869,12 +962,12 @@ The replacement keeps the `ClientOrderId` and receives a new `VenueOrderId`.
 The logical quantity uses the exact signed base quantity after venue precision normalization,
 so it can be slightly lower than the requested target.
 
-##### Size checks
+#### Size checks
 
 Before canceling, the adapter subtracts filled quantity and quantity voided without reopening from
-the target. It rejects a replacement below 0.01 shares.
+the target. A replacement below 0.01 shares produces `OrderModifyDenied`.
 
-When cached instrument `info["min_order_size"]` is present, the adapter also rejects the modify if:
+When cached instrument `info["min_order_size"]` is present, the adapter also emits `OrderModifyDenied` if:
 
 - The value is not a positive decimal string.
 - The signed replacement share quantity is below that minimum.
@@ -886,16 +979,18 @@ derived from the cent-truncated pUSD budget.
 After cancellation, the adapter repeats the size checks on the remaining quantity. It uses the
 market minimum captured at modify start, without a fresh order-book read.
 
-Fills during cancellation can leave an undersized remainder. The adapter does not post it: the
-modify is rejected and the order closes as canceled. A marketable replacement can still be rejected
-below 1 pUSD after cancellation.
+Fills during cancellation can leave an undersized remainder. The adapter does not post it: it emits
+`OrderModifyRejected`, and the order closes as canceled. A marketable replacement below 1 pUSD also
+produces `OrderModifyRejected` after cancellation. These failures are rejections because the cancel leg
+was already sent.
 
-##### Ambiguous outcomes
+#### Ambiguous outcomes
 
 The adapter submits no replacement unless the cancel response, canceled order state, and confirmed
 trade totals agree.
 
-- **Ambiguous cancel**: Emits `OrderModifyRejected`.
+- **Ambiguous cancel**: Retains the pending modification for venue reports or reconciliation.
+  This includes a response that omits the target from both `canceled` and `not_canceled`.
 - **Ambiguous replacement**: Stays in flight under its deterministic signed order hash. A later
   order update, fill, or reconciliation can establish it without a second `OrderAccepted`.
   Later modify and cancel commands remain blocked until then.
@@ -939,9 +1034,13 @@ Confirmed cancellations override conflicting rejection reasons for the same ID.
 
 If a chunk fails, results from earlier completed chunks still apply. For the remaining orders:
 
-- **Failed chunk**: Definitive failures emit `OrderCancelRejected`; ambiguous failures leave cancels in flight.
+- **Failed chunk**: Failures proven not sent emit `OrderCancelDenied`; venue rejections emit
+  `OrderCancelRejected`. Ambiguous failures leave cancels in flight.
 - **Beyond the failed chunk**: Cancels stay in flight if an earlier, larger attempt included those orders.
-- **Never attempted**: Orders receive `OrderCancelRejected` with a local not-sent reason.
+- **Never attempted**: Orders receive `OrderCancelDenied` with the actual command ID and a local not-sent reason.
+
+Each batch command retains its own UUID, including repeated targets. An unattempted command receives
+a denial even if an earlier command for the same order has an unknown outcome.
 
 In-flight cancels await reconciliation. See [Retry classification](#retry-classification).
 
@@ -1100,7 +1199,7 @@ For an unknown outcome, the adapter:
 - Defers a pending cancel until the expected venue order ID is known.
 - Registers fill tracking under that venue order ID.
 
-##### Order and trade reads
+**Order and trade reads**:
 
 The adapter reads the order and its trades from REST, retrying with backoff capped at 30 seconds
 until the venue state is known. Terminal trades apply through the settlement records first, then the
@@ -1111,12 +1210,12 @@ provisional or while confirmed trades do not yet cover the venue's matched quant
 They apply venue trade IDs directly, so buffered WebSocket trades and the later submit response do
 not repeat acceptance or count the same fill twice.
 
-##### Report gating
+**Report gating**:
 
 Reports that cover the order or its instrument fail until that read applies or reading stops, so
 reconciliation does not infer fills from partial venue state.
 
-##### Read timeout
+**Read timeout**:
 
 Reading stops after 10 minutes without applying the venue state. The adapter logs a warning, lifts
 the report gate, and leaves the order `Submitted`.
@@ -1135,13 +1234,13 @@ settlement report gate.
 
 ### Position management
 
-| Feature              | Binary options | Notes                                                                       |
-| -------------------- | -------------- | --------------------------------------------------------------------------- |
-| Query positions      | ✓              | Data API user positions, excluding resolved balances.                       |
-| Split, merge, redeem | ✓              | Deposit Wallet operations; see [Position operations](#position-operations). |
-| Position mode        | -              | Binary outcome positions only.                                              |
-| Leverage control     | -              | No leverage available.                                                      |
-| Margin mode          | -              | No margin trading.                                                          |
+| Feature              | Binary options | Notes                                                                                       |
+| -------------------- | -------------- | ------------------------------------------------------------------------------------------- |
+| Query positions      | ✓              | Data API user positions, excluding resolved balances.                                       |
+| Split, merge, redeem | ✓              | CTF (`v1`) and V2 through Deposit Wallets; see [Position operations](#position-operations). |
+| Position mode        | -              | Binary outcome positions only.                                                              |
+| Leverage control     | -              | No leverage available.                                                                      |
+| Margin mode          | -              | No margin trading.                                                                          |
 
 ### Order querying
 
@@ -1161,7 +1260,7 @@ settlement report gate.
 | Bracket orders     | -              | *Not supported by Polymarket*.                                            |
 | Conditional orders | -              | *Not supported by Polymarket*.                                            |
 
-### Precision limits
+## Precision limits
 
 Polymarket enforces different precision constraints based on tick size and `orderType`.
 Every Polymarket `BinaryOption` uses a canonical `price_precision` of 4, independent of its active
@@ -1171,14 +1270,14 @@ the venue tick decimals from that increment.
 Binary option instruments typically support up to six decimal places for amounts with a 0.0001 tick size.
 The signing rules also depend on the venue order type.
 
-#### Market order types: FAK and FOK
+### Market order types: FAK and FOK
 
 The direct maker amount is limited to **two decimal places**. The computed taker amount uses the market tick
 decimals plus two size decimals. A limit order submitted with `FAK` or `FOK` must also satisfy this stricter
 market-order amount validation. The venue rejects values that are valid for a resting order but not for that
 market-order type.
 
-##### Base-sized limit BUY orders
+#### Base-sized limit BUY orders
 
 `quantity` is the nominal share quantity at the limit price. With `FAK` or `FOK`, Polymarket spends
 a pUSD maker budget, so price improvement can return more shares.
@@ -1191,13 +1290,13 @@ to that signed quantity before posting. This applies to single and batch submiss
 A later fill can still raise the quantity to the actual matched size. A budget that truncates to
 zero is denied before signing.
 
-##### Collateral-sized limit BUY orders
+#### Collateral-sized limit BUY orders
 
 The adapter truncates the direct maker amount to cents. The computed share amount uses the market tick
 decimals plus two size decimals. The signed integer amounts must preserve the requested limit price
 exactly after this quantization.
 
-#### Resting limit order types: GTC and GTD
+### Resting limit order types: GTC and GTD
 
 Resting orders allow more flexible precision based on market tick size.
 
@@ -1311,14 +1410,52 @@ provisional statuses as settlement updates without emitting another fill. `CONFI
 finality and refreshes the account. Matched WebSocket fills retain the raw trade fields in the
 `info` field of the `OrderFilled` event.
 
+:::warning[Verify sellable inventory]
+In V1 and V2, `OrderFilled` does not guarantee sellable inventory. Before selling or closing newly
+bought shares, verify that the funding wallet's conditional-token balance covers the SELL quantity
+to avoid an insufficient-balance rejection. For execution tests, also wait for `CONFIRMED`.
+:::
+
+:::warning[Redact fill metadata]
+`OrderFilled.info` can expose API-key identifiers in `owner`, `trade_owner`, and nested maker-order
+owners. Before logging or exporting fills, select only needed fields or redact these identifiers,
+including those inside nested JSON.
+:::
+
+#### Remaining settlement limits
+
+[RFC #4876](https://github.com/nautechsystems/nautilus_trader/issues/4876) remains open for:
+
+- **Account scope**: The [trades API](https://docs.polymarket.com/api-reference/trade/get-trades)
+  documents authenticated-user scope, supported by participating-account reads. A same-trade check under
+  non-participating credentials remains blocked by the lack of a second account.
+- **Maker completeness**: Sampled REST legs agree with on-chain events, but no paired original REST and
+  user-stream capture covers several maker orders owned by the configured account. Admission assumes
+  complete payloads; the proposed multi-owned maker gate is unimplemented. Counting returned legs cannot
+  detect an omitted leg, and targeted REST also needs completeness evidence.
+- **Historical fees**: Retaining the first-admission local fee basis does not prove the venue's actual
+  charge. Cache-rebuilt and report-applied fills lack that basis and can conflict after a fee refresh.
+- **Unbound declined events**: Declined fills or voids without a settlement record only log an error.
+  Their fault policy remains undecided, separately from [retaining applied unbound fills](#unbound-fills).
+
+The provider checks also remain unverified for Protocol V2. Dedicated settlement signals and metrics
+are deferred pending a concrete consumer.
+
+If you can verify either provider check, could you share sanitized results in the RFC? Useful evidence
+is a same-trade read under both accounts with HTTP statuses and response shapes, paired original REST
+and user-stream payloads containing several owned maker legs, or explicit provider confirmation of the
+required guarantees. Identify the market protocol and trade status. Remove credentials and preserve
+ownership relationships with consistent aliases. Existing captures and read-only queries suffice;
+no new trades are requested.
+
 #### Failed trades and REST resolution
 
 A WebSocket `FAILED` update never voids a fill by itself. The adapter quarantines a trade and reads
 it by ID from the authenticated REST trades endpoint (`GET /data/trades`) when:
 
 - The WebSocket reports `FAILED`.
-- WebSocket evidence contradicts a fill the engine has not applied, such as changed fill values or a
-  missing owned order.
+- WebSocket evidence contradicts retained original venue evidence, including after the engine applies
+  a fill, such as changed fill values or a missing owned order.
 - A trade message fails validation.
 
 The first read starts immediately. Until REST returns a terminal status, the adapter retries after
@@ -1330,17 +1467,18 @@ with the same trade ID cannot release quarantine, even with status `CONFIRMED`.
 An invalid commission emits no fallback fill and applies no owned leg. Apply the Polymarket exception in
 [TC-E89](../developer_guide/spec_exec_testing.md#tc-e89-websocket-commission-failure) when testing recovery.
 
-The first terminal REST result is final. Another REST read starts for a contradictory WebSocket status or new
-or changed evidence for fills the engine has not applied. It never reverses the first result.
+The first terminal REST result is final. Another REST read starts for a contradictory WebSocket status or
+conflicting retained original venue evidence, including after application. Reconstructed and report-routed
+legs do not receive that stream comparison. A later read never reverses the first terminal result.
 
-##### REST `FAILED` result
+**REST `FAILED` result**:
 
 The adapter emits one `OrderFillVoided` for each fill the engine applied, including a fill the engine
 applies after the result arrives, and refreshes the account. Fills the adapter had not yet emitted
 are never emitted. The correction does not relist the failed quantity, but it preserves any
 maker-order remainder that was already working. An execution-complete order becomes `VOIDED`.
 
-##### REST `CONFIRMED` result
+**REST `CONFIRMED` result**:
 
 The adapter emits any of the account's fills that the engine has not applied, using the REST trade
 values, and refreshes the account.
@@ -1390,7 +1528,7 @@ A trade enters a hard fault when its venue outcome and the engine's state cannot
 - REST `CONFIRMED` values contradict an applied fill, or the terminal REST result omits one of the
   account's fills that the engine applied.
 
-##### Fills and reconciliation
+**Fills and reconciliation**:
 
 A hard-faulted trade admits no further fills or voids, except the one void owed for a fill applied
 after REST reported `FAILED`. The adapter logs the fault at error level, refreshes the account, and
@@ -1399,7 +1537,7 @@ client resets or the node restarts.
 
 The adapter publishes no dedicated quarantine or settlement-fault event or metric.
 
-##### Submissions
+**Submissions**:
 
 A hard fault blocks new single and batch orders and cancel-replace modifications for the account.
 The client stays connected for cancellations, account refreshes, and required correction voids.
@@ -1410,14 +1548,14 @@ old order canceled without a replacement. In-flight requests can still complete;
 outcomes require reconciliation. The block survives reconnects and stop/start. Reset the client or
 restart the node to clear it.
 
-##### Quantity and cancellation
+**Quantity and cancellation**:
 
 A hard fault withholds the quantity normalization and FAK remainder cancellation that confirmation would
 authorize, including the fully matched `associate_trades` update. The confirmed venue outcome stays in place,
 and an applied fill keeps its quantity, price, and commission apart from that owed void. A cancellation,
 expiry, or rejection that the venue reports still applies. One inferred from a `MATCHED` underfill does not.
 
-##### Settlement records
+**Settlement records**:
 
 The adapter keeps settlement records and unbound legs for the lifetime of the execution client. Adding
 an entry beyond the combined limit of 100,000 entries after connect faults the client closed: it reports
@@ -1458,7 +1596,8 @@ Rust callers can borrow the string with `info.get_str("gamma_event")` and iterat
 Indexing, `&Params` iteration, and the read-only `IndexMap` interface materialize and cache owned values.
 Python values and serialized contents stay the same; deserialization does not retain allocation sharing.
 Normalized metadata includes `market_version`, `token_id`, `condition_id`, `market_id`, and `event_id`
-when known. `market_version` records the accepted market protocol, `v1`.
+when known. `market_version` records the accepted market protocol, `v1` or `v2`. `token_id` contains the
+selected CTF token ID or V2 position ID used for books, historical trades, and subscriptions.
 
 These strings contain the received JSON objects before enrichment. Tick-size updates preserve them. Use the
 instrument's typed price increment for the current tick size. The adapter does not fetch additional related
@@ -1477,8 +1616,8 @@ market = json.loads(instrument.info["gamma_market"], parse_float=Decimal)
 The historical `PolymarketDataLoader` retains these JSON strings under `resolution_metadata["gamma_market"]`
 instead of `instrument.info`. For event loading, it also retains `resolution_metadata["gamma_event"]`. Fetched
 responses can contain terminal outcomes unknown during the historical period, so the loader keeps them in
-resolution metadata. Decode these strings with `json.loads` as above. They precede CLOB enrichment, so the raw
-token IDs and outcome labels can differ from the constructed instrument.
+resolution metadata. Decode these strings with `json.loads` as above. The instrument uses the selected
+Gamma outcome ID and label; CLOB metadata must match that pair.
 
 ## Numeric precision
 
@@ -1694,7 +1833,7 @@ through fills or settlement.
 
 ### Settlement precedence
 
-Order status, fill, position status, and mass-status reports fail instead of returning coverage
+Fill, position status, and mass-status reports fail instead of returning coverage
 that reconciliation could use to infer fills while:
 
 - A trade is quarantined, hard-faulted, awaiting a REST read after a reconnect, or waiting for the
@@ -1703,13 +1842,19 @@ that reconciliation could use to infer fills while:
   live during a WebSocket disconnect.
 - The adapter rebuilds its settlement records on connect.
 
+Order status reports fail for those conditions, except while a fill or void is only waiting for
+the engine to apply it. The report still includes the account's open orders. That order's reported
+filled quantity stays at the cached quantity until the engine applies the fill or void, even when
+another confirmed trade would otherwise raise it.
+
 Mass status checks the whole account. The other reports check the requested instrument or order. If a trade
 quarantined for message validation failure has no earlier admitted legs, it blocks every report. Otherwise the
 order and instrument scope of those legs applies. See [settlement updates](#settlement-updates) for how trades
 resolve.
 
-`QueryOrder` checks settlement before and after its venue reads. If settlement evidence for the
-order remains unresolved, the query emits no status report and leaves the local order unchanged.
+`QueryOrder` checks settlement before and after its venue reads. Waiting for the engine to apply
+a fill or void still leaves this query unresolved. If settlement evidence for the order remains
+unresolved, the query emits no status report and leaves the local order unchanged.
 Queries for an unacknowledged submission still use
 [unknown-outcome reconciliation](#unknown-outcome-reconciliation).
 
@@ -1785,6 +1930,22 @@ Mass status caps REST matched quantity using fills already applied in core and a
 `CONFIRMED` fill reports that pass settlement validation, counting each fill once. This prevents
 pending settlement from creating an inferred fill, with or without a lookback window. Applied fills
 outside the lookback window still contribute to the cap.
+
+#### Restarting after order modification
+
+Persist order and position history to retain `ClientOrderId`, logical quantity, and venue ID history.
+[Venue responses](https://docs.polymarket.com/trading/manage-orders) have no client order ID or
+predecessor link, so an empty-cache restart loses chain identity. With default reconciliation:
+
+- **Live successor**: Reconciliation adopts an external order with its venue ID as `ClientOrderId`
+  and its signed leg quantity. Queries and cancels target that venue ID.
+- **Predecessor fills**: These recover as separate market orders with real trade IDs and reconstructed
+  commissions when history matches wallet exposure or a bounded window has no position report.
+  `Filled` covers recovered fills only; original size, limit price, time in force, and cancellation
+  status stay unknown.
+- **History limits**: A complete window can omit older predecessor fills because recovery follows each
+  live order's own trade references. Synthetic fills can restore exposure, but holdings cannot recover
+  missing trade IDs, order terms, or historical commissions.
 
 #### Recovering fills outside the lookback
 
@@ -1864,7 +2025,8 @@ Cached orders do not offset unmapped, unowned maker, or untimestamped trades.
 
 Unsupported-market open orders and holdings are skipped, but confirmed trades still participate in
 these completeness checks. With no `load_ids` scope, an unmapped trade on an unsupported market makes
-the bounded window incomplete.
+the bounded window incomplete. Confirmed trades mapped to cached instruments without explicit `v1` or `v2`
+metadata fail report construction before these completeness checks.
 
 For an incomplete window, the adapter logs a warning listing each failing condition before the
 engine logs its incomplete-report warning. It emits no additional report for a cached closed order, so
@@ -1888,7 +2050,9 @@ ID. This recovers a cached order whose terminal WebSocket update was missed. It 
 resolving a local `ACCEPTED` order as `REJECTED`. That false rejection would discard fills that already
 happened at the venue.
 
-Only `CONFIRMED` trades contribute to recovered fills. Pending and failed settlement states do not.
+Only `CONFIRMED` trades contribute to recovered fills. Pending and failed settlement states do
+not. A fill or void still waiting for the engine does not contribute, even when REST reports that
+trade as `CONFIRMED`.
 
 The cached order is resolved via `client_order_id`, falling back to the cache's `venue_order_id` index when
 only the venue ID is known. When the request supplies or resolves to a `client_order_id`, the cached order
@@ -1903,8 +2067,11 @@ history alone:
   returns `Canceled` with the recovered `filled_qty`. Targeted reconciliation applies the associated
   fill reports before closing the remainder. If terminal quantity is still unaccounted for, the
   engine defers the terminal transition rather than discarding the missing fills.
-- Previously accepted cached order, no trades: returns `Canceled` with
-  `cancel_reason="ORDER_NOT_FOUND_AT_VENUE"`.
+- Previously accepted cached order, no trades, and no fill or void waiting for the engine:
+  returns `Canceled` with `cancel_reason="ORDER_NOT_FOUND_AT_VENUE"`.
+- Cached order with a fill or void still waiting for the engine: returns the cached status and
+  filled quantity, including when REST omits that trade or the fill is on a previous venue order
+  id. It is not `Canceled`.
 - Cached order that was never accepted, no trades: returns `None`, preserving its unresolved state.
 - Cached order with any `MATCHED`, `MINED`, or `RETRYING` trade: a singular order query preserves
   the locally applied matched quantity while terminal REST recovery waits for `CONFIRMED` or
@@ -1996,11 +2163,15 @@ See [BUY overfills](#buy-overfills) for how a BUY can receive more shares than i
 
 ### BUY overfills
 
-A Polymarket BUY is sized by the pUSD it spends, so it can receive more shares than it signed. A
-limit BUY is converted to signed shares before posting. A market BUY is posted in pUSD and updated
-to signed shares when the submit succeeds or its outcome is unknown. The adapter then keeps the
-venue fill quantity and raises the order to match. A SELL is sized in shares, and the venue does
-not credit more than signed.
+The CLOB's [order workflows](https://docs.polymarket.com/trading/place-orders) take a nominal share
+target for GTC and GTD limit BUYs and a pUSD amount for FOK and FAK BUYs. These request units do not
+impose an on-chain share cap: ExchangeV3 tracks actual collateral spent. A BUY can receive more
+shares than it signed.
+
+A limit BUY is converted to signed shares before posting. A market BUY is posted in pUSD and updated
+to signed shares when the submit succeeds or its outcome is unknown. The adapter keeps the venue
+fill quantity and raises the order to match. A SELL is sized in shares, and the venue does not credit
+more than signed.
 
 :::info
 A BUY order's quantity can increase after submission, through an `OrderUpdated` event. Treat its
@@ -2014,7 +2185,7 @@ exchange guarantees at least that ratio of shares per pUSD for whatever part exe
 the shares actually delivered. A partial execution spends less and receives proportionally fewer
 shares. A full execution receives more than `takerAmount` in two cases:
 
-- Price improvement: a limit BUY of 9 shares at 0.58 commits 5.22 pUSD. Filled entirely at 0.56, it
+- Price improvement: a FOK or FAK limit BUY of 9 shares at 0.58 commits 5.22 pUSD. Filled entirely at 0.56, it
   receives 9.321429 shares.
 - Signing precision: a market BUY signs shares truncated to the tick's decimal places plus two,
   while settlement uses six. A 5 pUSD market BUY at 0.66 signs 7.5757 shares and receives 7.575758.
@@ -2125,6 +2296,7 @@ that order, the position remains open at exactly 0.0075 shares.
 
 Treat close-on-stop as best-effort. Check the position and warning before assuming the account is
 flat. See the [position reporting limitation](#limitations-and-considerations) for sub-0.01-share venue reports.
+Before stopping after a BUY, follow the [settlement readiness warning](#settlement-updates).
 
 ## WebSockets
 
@@ -2202,7 +2374,7 @@ and sizes with the cached quote regardless of which message type produced it. An
 `book` or `price_change` quote updates the cached timestamp without publication, so older quotes
 are rejected, including for quote-only subscriptions.
 
-##### `best_bid_ask` handling
+#### `best_bid_ask` handling
 
 With `subscribe_new_markets` enabled, the venue also sends `best_bid_ask` events when an asset's top of book
 moves. Every market connection requests these asset-scoped events. Only the primary connection forwards global
@@ -2365,7 +2537,7 @@ snapshot batches (see [Data client options](#data-client-options)):
   `best_bid_ask` quote ticks. This can change those quote sizes and their unchanged-quote
   suppression, and the carried sizes can affect later `price_change` quotes. Trades are unchanged.
 
-#### PolyBolt reference prices
+### PolyBolt reference prices
 
 The data client also supports Polymarket's PolyBolt reference-price channels: crypto spot
 (`price.crypto`), 60-second Chainlink crypto TWAP (`price.crypto.twap`), and equity, ETF, forex,
@@ -2408,7 +2580,7 @@ strategy.subscribe_data(equity_type, client_id=POLYMARKET_CLIENT_ID)
 strategy.subscribe_data(twap_type, client_id=POLYMARKET_CLIENT_ID)
 ```
 
-##### Symbols and values
+#### Symbols and values
 
 Symbols are lowercase and USD-quoted, for example `btcusd`, `ethusd`, `aapl`, `eurusd`, or `xauusd`. Matching
 is case-insensitive and published symbols are lowercase. At subscription time, the adapter rejects legacy RTDS
@@ -2430,14 +2602,14 @@ Each sample also carries:
 Equity snapshot points omit venue receipt and carried-forward metadata. The adapter sets `received_at_ms=None`
 and `is_carried_forward=False`. These defaults do not imply a fresh value.
 
-##### Subscriptions, snapshots, and reconnects
+#### Subscriptions, snapshots, and reconnects
 
 The feed authenticates once per connection, waits for the venue's `authed` acknowledgement, and only then
 sends one subscription per `(channel, symbol)`. Every new subscription first receives a two-minute snapshot,
 emitted point by point in order, and then live updates. PolyBolt allows 64 subscriptions per connection. The
 65th distinct `(channel, symbol)` is rejected with an error.
 
-##### Reconnect replay
+#### Reconnect replay
 
 After reconnecting, the feed re-authenticates and replays retained subscriptions. A fresh snapshot
 can backfill the disconnect interval within its two-minute history. Consumers may receive a burst
@@ -2455,7 +2627,7 @@ The TWAP replay guard survives reconnects:
 
 TWAP snapshot processing stops at the first conflicting or invalid point and discards the rest of that frame.
 
-##### Authentication failures
+#### Authentication failures
 
 | Venue error                      | Adapter response                                                    |
 | -------------------------------- | ------------------------------------------------------------------- |
@@ -2470,7 +2642,7 @@ with corrected credentials, because reconnecting the same client retries the rej
 A transient auth outage never takes down the market data socket. The venue allows eight auth frames
 per connection, so a prolonged outage moves to a fresh connection before the ninth frame.
 
-##### Sequence gap recovery
+#### Sequence gap recovery
 
 Every envelope carries a dense per-channel `seq` that resets on each connection. A gap,
 regression, or positive `dropped` count triggers a warning and a fresh snapshot: every subscription
@@ -2483,7 +2655,7 @@ The replay guard keeps backfill free of duplicates. The live envelope revealing 
 emitted, so missing points at or before that symbol's newly emitted timestamp are suppressed.
 The fresh snapshot can backfill other symbols whose timestamps have not advanced past the missing points.
 
-##### Request pacing and close codes
+#### Request pacing and close codes
 
 Subscription and unsubscription requests share a quota that admits one frame every 53 ms,
 leaving room under the venue's combined 20-frame-per-second limit. The feed batches recovery for
@@ -2507,7 +2679,7 @@ The venue's close codes follow their documented recovery policies:
 
 Other close codes reconnect with the shared client's backoff.
 
-##### Migrating from RTDS
+#### Migrating from RTDS
 
 The RTDS price transport and its public types were removed without compatibility aliases. Update
 code and serialized configurations to the new names:
@@ -2574,14 +2746,14 @@ universes match.
 
 #### Markets awaiting CLOB metadata
 
-Gamma can report a newly listed market before usable `clob_token_ids` are available, or omit it from a
-lookup. Auto-load retries these Gamma results and fetch failures with bounded exponential backoff plus
-jitter. It does not query CLOB `GET /markets/{cid}` to classify hydration.
+Gamma can report a newly listed market before usable outcome IDs are available, or omit it from a
+lookup. The selected IDs are `clobTokenIds` for `v1` and `positionIds` for `v2`. Auto-load retries these
+Gamma results and fetch failures with bounded exponential backoff plus jitter. It does not query CLOB
+`GET /markets/{cid}` to classify hydration.
 
-Only market protocol `v1` can enter this retry path. A market with protocol `v2`, a missing version,
-or an unknown version is skipped with a warning. Once identified as unsupported, it receives no further
-retry or closed-market probe. An initial closed-market probe can discover an unsupported market that
-the default Gamma lookup omits.
+Both `v1` and `v2` can enter this retry path. A market with a missing or unknown version is skipped
+with a warning. Once identified as unsupported, it receives no further retry or closed-market probe.
+An initial closed-market probe can discover an unsupported market that the default Gamma lookup omits.
 
 Tune the cadence with `auto_load_max_retries` (default 12), `auto_load_retry_delay_initial_secs` (default
 5.0), and `auto_load_retry_delay_max_secs` (default 15.0). The default retry delays total approximately three
@@ -2636,6 +2808,13 @@ The shipped defaults use polling, without a resolution-only WebSocket subscripti
 polling does not enable WebSocket resolution: that path requires `subscribe_new_markets=true`.
 With both disabled, later recovery requires a manual request.
 
+WebSocket resolution for `v2` and pending instruments requires Gamma verification. Missing or
+nonfinal metadata and retryable request failures use the configured HTTP retry policy. The pending
+resolution blocks ordinary data for that condition until verification completes or exhausts retries.
+If verification still fails, the client keeps the watch without emitting a close. Recovery then depends
+on another resolution event, the expiration-based poll window, or a manual request. Early resolution
+can therefore remain unapplied until the scheduled end if retries exhaust and no further event arrives.
+
 These WebSocket ownership rules apply to the data subscription's token, not the independently
 configured venue-wide discovery feed. Releasing the token does not disconnect that feed. Valid
 resolutions received there still use the shared apply path for existing data and position owners.
@@ -2644,10 +2823,14 @@ resolutions received there still use the shared apply path for existing data and
 
 Resolution uses strict winner inference:
 
-- Gamma must return a closed binary market with exactly two token IDs, two outcomes, and a binary
-  `outcomePrices` shape.
-- If Gamma does not provide a strict result for the condition, the client falls back to CLOB
-  `GET /markets/{condition_id}` and uses `tokens[].winner`.
+- For `v1`, Gamma must return a closed binary market with two distinct token IDs, two distinct outcomes,
+  and binary `outcomePrices`. UMA status alone does not establish a winner.
+- For `v2`, Gamma must report `resolutionStatus="resolved"`, two valid selected position IDs, and exact
+  binary payouts in `outcomePrices`. `inactive` and `active` cannot resolve a market. V2 WebSocket
+  notifications also require matching Gamma status, payout, asset, and winner evidence.
+- If Gamma does not provide a strict CTF result, the client can fall back to CLOB
+  `GET /markets/{condition_id}` and use `tokens[].winner`. CLOB-only evidence cannot resolve a V2 market
+  or override missing, unknown, or conflicting protocol metadata.
 - Non-binary, ambiguous, malformed, or still-unresolved payloads are skipped. They remain on the
   watchlist until the poll window times out or a manual request resolves them.
 
@@ -2668,12 +2851,13 @@ without an order or fill. The first close applied is authoritative (see
 
 Settlement does not redeem tokens or claim funds on-chain. The pUSD balance includes the payout
 only after redemption, so account balances exclude unredeemed winnings until then. Deposit Wallet
-users can redeem winning tokens with [Position operations](#position-operations).
+users can redeem CTF and V2 positions with [Position operations](#position-operations).
 
 #### Closure and subscription release
 
 Gamma's positive `closed=true` evidence stops normal quote, trade, and book-delta streams for both outcome
-siblings, even when the payload cannot produce usable instruments. Closure alone does not establish a winner
+siblings, even when the payload cannot produce usable instruments. For `v2`, `resolutionStatus="resolved"`
+also stops these streams when `closed=false`. Closure alone does not establish a winner
 or emit settlement events. Existing resolution owners remain available for polling or manual recovery. An
 enabled, unpaused resolution WebSocket may remain until resolution or timeout. Later live subscriptions cannot
 reopen the closed condition.
@@ -2777,8 +2961,8 @@ startup with an unsupported-version error. A missing, malformed, or errored resp
 version-query failure.
 
 This service version is separate from the market protocol. Before submitting or modifying an order,
-the client requires instrument metadata `info["market_version"]` to be `"v1"`. Otherwise it emits
-`OrderDenied` for a submission or `OrderModifyRejected` for a modification. Reload instruments from
+the client requires instrument metadata `info["market_version"]` to be `"v1"` or `"v2"`. Otherwise it emits
+`OrderDenied` for a submission or `OrderModifyDenied` for a modification. Reload instruments from
 discovery if cached instruments lack that metadata.
 
 The execution adapter subscribes once to an account-wide `user` channel for order and trade events.
@@ -3050,11 +3234,12 @@ only `has_proxy_url`. Configuration `Debug` output and transport diagnostics red
 
 ### Instrument provider options
 
-Pass the same `PolymarketInstrumentProviderConfig` as `instrument_config` on the data client
-config and the execution client config.
+Use the same `PolymarketInstrumentProviderConfig` as `instrument_config` on both clients. Set its
+`load_ids` to the instruments the execution client trades. Provider discovery settings alone do not
+scope reconciliation: both clients can populate the shared cache.
 
-Each `load_ids` entry has the form `<condition_id>-<token_id>.POLYMARKET`: the condition ID is a
-`0x`-prefixed 32-byte hex value, and the token ID is a decimal unsigned 256-bit integer. A raw token ID,
+Each `load_ids` entry has the form `<condition_id>-<selected_id>.POLYMARKET`: the condition ID is a
+`0x`-prefixed 32-byte hex value, and the selected CTF token or V2 position ID is a decimal unsigned 256-bit integer. A raw token ID,
 condition ID, slug, or instrument ID for another venue fails validation. Copy `instrument.id` from
 loaded market metadata rather than constructing it from a display name.
 
@@ -3064,8 +3249,11 @@ is in scope.
 
 For unmapped open orders and positions inside either scope, the adapter checks the market protocol on
 CLOB after applying account ownership, instrument filters, and position dust and resolved-balance
-exclusions. It skips rows for unsupported markets with a warning. An unmapped market protocol `v1` row
+exclusions. It skips rows for unsupported markets with a warning. An unmapped supported `v1` or `v2` row
 or a failed version lookup still fails the report request.
+
+Cached open orders and positions without explicit supported protocol metadata are skipped with a warning.
+Confirmed trades on those instruments fail fill-report generation. Reload old cached instruments before trading.
 
 `event_slugs`, `market_slugs`, `series_ids`, `filters`, and `event_slug_builder` discover instruments. They do
 not classify unmapped records. A node that scopes discovery with those fields and still wants scoped
@@ -3089,7 +3277,7 @@ The adapter uses the Gamma market and event keyset endpoints. It validates filte
 the first HTTP request, follows `next_cursor`, and applies the endpoint page ceilings of 100 markets
 and 500 events.
 
-##### Market keyset fields
+**Market keyset fields**:
 
 | Class         | Fields                                                                                                                                                                                                                                                                                                                    |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3103,7 +3291,7 @@ The provider `filters` dictionary accepts only market fields. Rust callers confi
 `EventParamsFilter` and `GetGammaEventsParams`. Event-only fields such as `live` or `tag_slug` are not valid
 provider dictionary keys.
 
-##### Event keyset fields
+**Event keyset fields**:
 
 | Class         | Fields                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -3112,7 +3300,7 @@ provider dictionary keys.
 | Compatibility | `active`, `archived`                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | Client only   | `offset`, `max_events`                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
-##### Filter values and validation
+**Filter values and validation**:
 
 Repeated fields are sent as repeated query keys. `offset` is applied across returned keyset pages and is never
 sent to Gamma. `max_markets` caps markets locally, with each binary market normally producing two instruments.
@@ -3242,9 +3430,11 @@ is retained as follows:
 | Closed state               | -                      | `closed`                             |
 | Closure time               | -                      | `closedTime`                         |
 | UMA resolution status      | -                      | `umaResolutionStatus`                |
+| V2 resolution status       | -                      | `resolutionStatus`                   |
+| Market protocol            | `market_version`       | `version`                            |
 | Token outcome/winner state | -                      | `tokens` with `outcome` and `winner` |
 
-Read `resolution_metadata` after a backtest or simulation to inspect the lifecycle snapshot:
+For CTF (`v1`) loaders, inspect the CLOB lifecycle snapshot after a backtest or simulation:
 
 ```python
 metadata = loader.resolution_metadata
@@ -3253,6 +3443,9 @@ winner = next(
     None,
 )
 ```
+
+For `v2`, verify `resolutionStatus` and the selected outcomes' binary `outcomePrices` in `gamma_market`
+according to the [resolution rules](#market-resolution-events). CLOB winner flags alone do not establish a V2 winner.
 
 ### Event loading
 
@@ -3265,10 +3458,13 @@ loaders = await PolymarketDataLoader.from_event_slug(
 )
 ```
 
-A negative token index or an index outside a market's token list raises `ValueError`. Construction
-also fails clearly when Gamma has no matching slug or CLOB has not populated usable token IDs.
-Both Gamma and CLOB must identify the market as protocol `v1`. If any market in an event is
-unsupported, the event factory raises `ValueError` and returns no loaders.
+`token_index` selects an outcome in Gamma order, using `clobTokenIds` for `v1` or `positionIds` for `v2`.
+A negative index or an index outside that list raises `ValueError`. Construction also fails when Gamma
+has no matching slug, its selected IDs are missing or invalid, or CLOB has no usable matching tokens.
+Gamma and CLOB must agree on the supported protocol (`v1` or `v2`), condition ID, and each outcome's
+selected ID and label. The loader rejects conflicts instead of replacing Gamma identifiers with CLOB
+identifiers. If any market in an event is unsupported, the event factory raises `ValueError` and returns
+no loaders.
 
 ### Public discovery
 
@@ -3365,8 +3561,9 @@ not the number of requests.
 
 ### Closed market cleanup
 
-Gamma `endDate` is a scheduled end, not proof that trading stopped. The client keeps cached
-instruments while Gamma reports `closed=false` and removes live state after a positive `closed=true`.
+Gamma `endDate` is a scheduled end, not proof that trading stopped. The client removes live state
+after a positive `closed=true` or, for `v2`, `resolutionStatus="resolved"`. A V2 resolved status is terminal
+even when Gamma still reports `closed=false`.
 
 The closure check runs on every resolve-poll tick for expired cached instruments still reported
 open. It retries failed requests on the next tick, so request failures or delayed venue data can

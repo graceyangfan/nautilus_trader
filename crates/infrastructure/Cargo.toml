@@ -21,6 +21,7 @@ crate-type = ["rlib"]
 
 [features]
 default = ["redis"] # redis needed by `nautilus_trader` by default for now
+defi = ["nautilus-common/defi", "nautilus-model/defi"]
 extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
@@ -53,6 +54,7 @@ ahash = { workspace = true }
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 derive_builder = { workspace = true }
 futures = { workspace = true }
@@ -73,6 +75,7 @@ redis = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
+nautilus-execution = { workspace = true }
 nautilus-live = { workspace = true, features = ["node"] }
 nautilus-model = { workspace = true, features = ["test-support"] }
 nautilus-persistence = { workspace = true }

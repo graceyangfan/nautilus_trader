@@ -19,8 +19,8 @@
 //! - Heartbeats use text `ping`/`pong`, responding to both text and control-frame pings.
 //! - Authentication re-runs on reconnect before resubscribing and skips private channels when
 //!   credentials are unavailable.
-//! - Subscriptions cache instrument type/family/ID groupings so reconnects rebuild the same set of
-//!   channels while respecting the authentication guard described above.
+//! - Subscriptions retain channel arguments so reconnects rebuild the same set of channels while
+//!   respecting the authentication guard described above.
 
 use std::{
     fmt::Debug,
@@ -38,7 +38,7 @@ use dashmap::DashMap;
 use futures_util::Stream;
 use nautilus_common::live::dst::time;
 use nautilus_core::{
-    AtomicMap, AtomicTime, UnixNanos,
+    AtomicMap, AtomicTime, UUID4, UnixNanos,
     env::{get_env_var, get_or_env_var},
     string::secret::{REDACTED, SecretString},
     time::get_atomic_clock_realtime,
@@ -79,18 +79,18 @@ use super::{
         WsAmendOrderParamsBuilder, WsAttachAlgoOrdParams, WsCancelOrderParamsBuilder,
         WsMassCancelParams, WsPostOrderParamsBuilder,
     },
-    subscription::topic_from_subscription_arg,
+    subscription::{is_topic_subscribed, topic_from_subscription_arg},
 };
 use crate::common::{
     consts::{
         OKX_NAUTILUS_BROKER_ID, OKX_SUPPORTED_ORDER_TYPES, OKX_SUPPORTED_TIME_IN_FORCE,
-        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_reduce_only_wire_value, select_book_channel,
-        spot_trade_quote_ccy_wire_value,
+        OKX_WS_PUBLIC_URL, OKX_WS_TOPIC_DELIMITER, okx_market_target_currency,
+        okx_reduce_only_wire_value, select_book_channel, spot_trade_quote_ccy_wire_value,
     },
     credential::Credential,
     enums::{
         OKXBookChannel, OKXGreeksType, OKXInstrumentType, OKXOrderType, OKXPositionSide,
-        OKXTargetCurrency, OKXTradeMode, OKXVipLevel,
+        OKXTradeMode, OKXVipLevel,
     },
     parse::{
         bar_spec_as_okx_channel, okx_instrument_type, okx_instrument_type_from_symbol,
@@ -231,10 +231,7 @@ pub struct OKXWebSocketClient {
     handler_tasks: Arc<TaskGroup>,
     connect_lock: Arc<tokio::sync::Mutex<()>>,
     handler_abort: Arc<Mutex<CancellationToken>>,
-    subscriptions_inst_type: Arc<DashMap<OKXWsChannel, AHashSet<OKXInstrumentType>>>,
-    subscriptions_inst_family: Arc<DashMap<OKXWsChannel, AHashSet<Ustr>>>,
-    subscriptions_inst_id: Arc<DashMap<OKXWsChannel, AHashSet<Ustr>>>,
-    subscriptions_bare: Arc<DashMap<OKXWsChannel, bool>>,
+    subscriptions: Arc<DashMap<String, OKXSubscriptionArg>>,
     subscriptions_state: SubscriptionState,
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
@@ -244,6 +241,7 @@ pub struct OKXWebSocketClient {
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
+    pub(crate) pending_command_ids: Arc<DashMap<String, Vec<(ClientOrderId, UUID4)>>>,
     option_greeks_subs: Arc<AtomicMap<InstrumentId, AHashSet<OKXGreeksType>>>,
     /// Per-base-pair refcount for the `index-tickers` channel. Multiple
     /// instruments commonly share one base pair (e.g. `BTC-USDT-SWAP` and
@@ -352,10 +350,7 @@ impl OKXWebSocketClient {
         };
 
         let signal = Arc::new(AtomicBool::new(false));
-        let subscriptions_inst_type = Arc::new(DashMap::new());
-        let subscriptions_inst_family = Arc::new(DashMap::new());
-        let subscriptions_inst_id = Arc::new(DashMap::new());
-        let subscriptions_bare = Arc::new(DashMap::new());
+        let subscriptions = Arc::new(DashMap::new());
         let subscriptions_state = SubscriptionState::new(OKX_WS_TOPIC_DELIMITER);
 
         Ok(Self {
@@ -379,10 +374,7 @@ impl OKXWebSocketClient {
             handler_tasks: Arc::new(TaskGroup::new()),
             connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             handler_abort: Arc::new(Mutex::new(CancellationToken::new())),
-            subscriptions_inst_type,
-            subscriptions_inst_family,
-            subscriptions_inst_id,
-            subscriptions_bare,
+            subscriptions,
             subscriptions_state,
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
@@ -392,6 +384,7 @@ impl OKXWebSocketClient {
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
+            pending_command_ids: Arc::new(DashMap::new()),
             option_greeks_subs: Arc::new(AtomicMap::new()),
             index_pair_subscribers: Arc::new(DashMap::new()),
             index_pair_transition: Arc::new(tokio::sync::Mutex::new(())),
@@ -783,10 +776,7 @@ impl OKXWebSocketClient {
             let clock = self.clock;
             let credential = self.credential.clone();
             let cmd_tx_for_reconnect = cmd_tx.clone();
-            let subscriptions_bare = self.subscriptions_bare.clone();
-            let subscriptions_inst_type = self.subscriptions_inst_type.clone();
-            let subscriptions_inst_family = self.subscriptions_inst_family.clone();
-            let subscriptions_inst_id = self.subscriptions_inst_id.clone();
+            let subscriptions = self.subscriptions.clone();
             let ws_client = Arc::clone(&ws_client);
             let auth_timeout_secs = self.auth_timeout_secs;
             let mut reconnect_epoch = connection_epoch;
@@ -802,16 +792,15 @@ impl OKXWebSocketClient {
                     auth_tracker.clone(),
                     credential.is_some(),
                     subscriptions_state.clone(),
+                    subscriptions.clone(),
                     clock,
                 );
 
                 let resubscribe_all = || {
-                    let args = subscription_args(
-                        &subscriptions_inst_type,
-                        &subscriptions_inst_family,
-                        &subscriptions_inst_id,
-                        &subscriptions_bare,
-                    );
+                    subscriptions
+                        .retain(|topic, _| is_topic_subscribed(&subscriptions_state, topic));
+
+                    let args = subscription_args(&subscriptions, &subscriptions_state);
 
                     for chunk in subscription_arg_batches(&args) {
                         if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe {
@@ -1101,19 +1090,15 @@ impl OKXWebSocketClient {
         }
     }
 
-    /// Get active subscriptions for a specific instrument.
+    /// Returns active subscription channels for an instrument.
     pub fn get_subscriptions(&self, instrument_id: InstrumentId) -> Vec<OKXWsChannel> {
         let symbol = instrument_id.symbol.inner();
-        let mut channels = Vec::new();
-
-        for entry in self.subscriptions_inst_id.iter() {
-            let (channel, instruments) = entry.pair();
-            if instruments.contains(&symbol) {
-                channels.push(channel.clone());
-            }
-        }
-
-        channels
+        self.subscriptions
+            .iter()
+            .filter(|arg| arg.inst_id == Some(symbol))
+            .filter(|arg| is_topic_subscribed(&self.subscriptions_state, arg.key()))
+            .map(|arg| arg.channel.clone())
+            .collect()
     }
 
     fn generate_unique_request_id(&self) -> String {
@@ -1139,39 +1124,16 @@ impl OKXWebSocketClient {
     fn record_subscriptions(&self, args: &[OKXSubscriptionArg]) {
         for arg in args {
             let topic = topic_from_subscription_arg(arg);
+            let entry = self
+                .subscriptions
+                .entry(topic.clone())
+                .or_insert_with(|| arg.clone());
             self.subscriptions_state.mark_subscribe(&topic);
-
-            // Check if this is a bare channel (no inst params)
-            if arg.inst_type.is_none() && arg.inst_family.is_none() && arg.inst_id.is_none() {
-                self.subscriptions_bare.insert(arg.channel.clone(), true);
-            } else {
-                if let Some(inst_type) = &arg.inst_type {
-                    self.subscriptions_inst_type
-                        .entry(arg.channel.clone())
-                        .or_default()
-                        .insert(*inst_type);
-                }
-
-                if let Some(inst_family) = &arg.inst_family {
-                    self.subscriptions_inst_family
-                        .entry(arg.channel.clone())
-                        .or_default()
-                        .insert(*inst_family);
-                }
-
-                if let Some(inst_id) = &arg.inst_id {
-                    self.subscriptions_inst_id
-                        .entry(arg.channel.clone())
-                        .or_default()
-                        .insert(*inst_id);
-                }
-            }
+            drop(entry);
         }
     }
 
-    #[expect(clippy::collapsible_if)]
     async fn unsubscribe(&self, args: Vec<OKXSubscriptionArg>) -> Result<(), OKXWsError> {
-        // Send the command first; only update local state on success
         self.cmd_tx
             .read()
             .await
@@ -1183,40 +1145,6 @@ impl OKXWebSocketClient {
         for arg in &args {
             let topic = topic_from_subscription_arg(arg);
             self.subscriptions_state.mark_unsubscribe(&topic);
-
-            if arg.inst_type.is_none() && arg.inst_family.is_none() && arg.inst_id.is_none() {
-                self.subscriptions_bare.remove(&arg.channel);
-            } else {
-                if let Some(inst_type) = &arg.inst_type {
-                    if let Some(mut entry) = self.subscriptions_inst_type.get_mut(&arg.channel) {
-                        entry.remove(inst_type);
-                        if entry.is_empty() {
-                            drop(entry);
-                            self.subscriptions_inst_type.remove(&arg.channel);
-                        }
-                    }
-                }
-
-                if let Some(inst_family) = &arg.inst_family {
-                    if let Some(mut entry) = self.subscriptions_inst_family.get_mut(&arg.channel) {
-                        entry.remove(inst_family);
-                        if entry.is_empty() {
-                            drop(entry);
-                            self.subscriptions_inst_family.remove(&arg.channel);
-                        }
-                    }
-                }
-
-                if let Some(inst_id) = &arg.inst_id {
-                    if let Some(mut entry) = self.subscriptions_inst_id.get_mut(&arg.channel) {
-                        entry.remove(inst_id);
-                        if entry.is_empty() {
-                            drop(entry);
-                            self.subscriptions_inst_id.remove(&arg.channel);
-                        }
-                    }
-                }
-            }
         }
 
         Ok(())
@@ -1259,12 +1187,7 @@ impl OKXWebSocketClient {
     ///
     /// Returns an error if the unsubscribe request fails to send.
     pub async fn unsubscribe_all(&self) -> Result<(), OKXWsError> {
-        let all_args = subscription_args(
-            &self.subscriptions_inst_type,
-            &self.subscriptions_inst_family,
-            &self.subscriptions_inst_id,
-            &self.subscriptions_bare,
-        );
+        let all_args = subscription_args(&self.subscriptions, &self.subscriptions_state);
 
         if all_args.is_empty() {
             log::debug!("No active subscriptions to unsubscribe from");
@@ -2403,6 +2326,7 @@ impl OKXWebSocketClient {
         &self,
         args: Vec<Value>,
         client_order_ids: Vec<ClientOrderId>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
     ) -> Result<(), OKXWsError> {
         let request_id = self.generate_unique_request_id();
         let request = OKXWsRequest::<Value> {
@@ -2415,15 +2339,25 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize batch cancel: {e}")))?;
 
+        if !causation_ids.is_empty() {
+            self.pending_command_ids
+                .insert(request_id.clone(), causation_ids);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_BATCH_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids,
             op: Some(super::enums::OKXWsOperation::BatchCancelOrders),
         };
 
-        self.send_cmd(cmd).await
+        let result = self.send_cmd(cmd).await;
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
+
+        result
     }
 
     /// Amend multiple orders in a single batch via WebSocket.
@@ -2595,27 +2529,11 @@ impl OKXWebSocketClient {
             builder.attach_algo_ords(attach_algo_ords);
         }
 
-        // For SPOT market orders in Cash mode, handle tgtCcy parameter
-        // https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order
-        // OKX API default behavior for SPOT market orders:
-        // - BUY orders default to tgtCcy=quote_ccy (sz represents quote currency amount)
-        // - SELL orders default to tgtCcy=base_ccy (sz represents base currency amount)
-        // Note: tgtCcy is ONLY supported for Cash trading mode, not for margin modes (Cross/Isolated)
-        if instrument_type == OKXInstrumentType::Spot
-            && order_type == OrderType::Market
-            && td_mode == OKXTradeMode::Cash
+        if let Some(tgt_ccy) =
+            okx_market_target_currency(instrument_type, order_side, order_type, quote_quantity)
+                .map_err(|e| OKXWsError::ClientError(e.to_string()))?
         {
-            match quote_quantity {
-                Some(true) => {
-                    builder.tgt_ccy(OKXTargetCurrency::QuoteCcy);
-                }
-                // For BUY orders, must explicitly set to base_ccy to override OKX default
-                Some(false) if order_side == OrderSide::Buy => {
-                    builder.tgt_ccy(OKXTargetCurrency::BaseCcy);
-                }
-                // For SELL orders with quote_quantity=false, omit tgtCcy (OKX defaults to base_ccy correctly)
-                Some(false) | None => {}
-            }
+            builder.tgt_ccy(tgt_ccy);
         }
 
         builder.side(order_side);
@@ -2790,6 +2708,39 @@ impl OKXWebSocketClient {
         rpi_taker_access: Option<bool>,
         rpi_px_round: Option<bool>,
     ) -> Result<(), OKXWsError> {
+        self.modify_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            price,
+            quantity,
+            venue_order_id,
+            new_px_usd,
+            new_px_vol,
+            rpi_taker_access,
+            rpi_px_round,
+            None,
+        )
+        .await
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) async fn modify_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        price: Option<Price>,
+        quantity: Option<Quantity>,
+        venue_order_id: Option<VenueOrderId>,
+        new_px_usd: Option<String>,
+        new_px_vol: Option<String>,
+        rpi_taker_access: Option<bool>,
+        rpi_px_round: Option<bool>,
+        causation_id: Option<UUID4>,
+    ) -> Result<(), OKXWsError> {
         let mut builder = WsAmendOrderParamsBuilder::default();
 
         let inst_id_code = self
@@ -2855,15 +2806,24 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize amend: {e}")))?;
 
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_AMEND.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::AmendOrder),
         };
 
         let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
 
         if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
             self.pending_amends.remove(key);
@@ -2889,6 +2849,26 @@ impl OKXWebSocketClient {
         instrument_id: InstrumentId,
         client_order_id: Option<ClientOrderId>,
         venue_order_id: Option<VenueOrderId>,
+    ) -> Result<(), OKXWsError> {
+        self.cancel_order_with_causation(
+            trader_id,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            venue_order_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn cancel_order_with_causation(
+        &self,
+        trader_id: TraderId,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: Option<ClientOrderId>,
+        venue_order_id: Option<VenueOrderId>,
+        causation_id: Option<UUID4>,
     ) -> Result<(), OKXWsError> {
         let mut builder = WsCancelOrderParamsBuilder::default();
 
@@ -2934,15 +2914,24 @@ impl OKXWebSocketClient {
         let payload = serde_json::to_string(&request)
             .map_err(|e| OKXWsError::JsonError(format!("Failed to serialize cancel: {e}")))?;
 
+        if let (Some(client_order_id), Some(causation_id)) = (client_order_id, causation_id) {
+            self.pending_command_ids
+                .insert(request_id.clone(), vec![(client_order_id, causation_id)]);
+        }
+
         let cmd = HandlerCommand::Send {
             payload,
             rate_limit_keys: Some(OKX_RATE_LIMIT_KEY_CANCEL.to_vec()),
-            request_id: Some(request_id),
+            request_id: Some(request_id.clone()),
             client_order_ids: client_order_id.into_iter().collect(),
             op: Some(super::enums::OKXWsOperation::CancelOrder),
         };
 
         let result = self.send_cmd(cmd).await;
+
+        if result.is_err() {
+            self.pending_command_ids.remove(&request_id);
+        }
 
         if let (Err(_), Some(key)) = (&result, &cl_ord_key) {
             self.pending_cancels.remove(key);
@@ -3029,6 +3018,10 @@ impl OKXWebSocketClient {
 
     /// Submits multiple orders.
     ///
+    /// The quantity-unit flag follows `reduce_only` in each tuple. `Some(true)` requests quote
+    /// units and `Some(false)` requests base units for spot market orders.
+    /// `None` uses venue defaults.
+    ///
     /// # Errors
     ///
     /// Returns an error if any batch order parameters are invalid or if the
@@ -3047,6 +3040,7 @@ impl OKXWebSocketClient {
             Quantity,
             Option<Price>,
             Option<Price>,
+            Option<bool>,
             Option<bool>,
             Option<bool>,
             Option<String>,
@@ -3074,6 +3068,7 @@ impl OKXWebSocketClient {
                 tp,
                 post_only,
                 reduce_only,
+                quote_quantity,
                 outcome,
                 rpi,
                 rpi_taker_access,
@@ -3136,6 +3131,9 @@ impl OKXWebSocketClient {
 
                 builder.ord_type(okx_ord_type);
                 builder.sz(qty.to_string());
+                let tgt_ccy =
+                    okx_market_target_currency(inst_type, ord_side, ord_type, quote_quantity)
+                        .map_err(|e| OKXWsError::ClientError(e.to_string()))?;
 
                 if let Some(p) = pr {
                     builder.px(p.to_string());
@@ -3176,9 +3174,11 @@ impl OKXWebSocketClient {
 
                 builder.tag(OKX_NAUTILUS_BROKER_ID);
 
-                let params = builder.build().map_err(|e| {
+                let mut params = builder.build().map_err(|e| {
                     OKXWsError::ClientError(format!("Build order params error: {e}"))
                 })?;
+
+                params.tgt_ccy = tgt_ccy;
                 let val = serde_json::to_value(params)
                     .map_err(|e| OKXWsError::JsonError(e.to_string()))?;
                 args.push(val);
@@ -3282,6 +3282,15 @@ impl OKXWebSocketClient {
         &self,
         orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
     ) -> Result<(), OKXWsError> {
+        self.batch_cancel_orders_with_causation(orders, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn batch_cancel_orders_with_causation(
+        &self,
+        orders: Vec<(InstrumentId, Option<ClientOrderId>, Option<VenueOrderId>)>,
+        causation_ids: Vec<(ClientOrderId, UUID4)>,
+    ) -> Result<(), OKXWsError> {
         let client_order_ids: Vec<ClientOrderId> = orders
             .iter()
             .filter_map(|(_, cl_ord_id, _)| *cl_ord_id)
@@ -3318,7 +3327,8 @@ impl OKXWebSocketClient {
             args
         };
 
-        self.ws_batch_cancel_orders(args, client_order_ids).await
+        self.ws_batch_cancel_orders(args, client_order_ids, causation_ids)
+            .await
     }
 
     /// Rejects algo placement on the WebSocket transport; use the HTTP client instead.
@@ -3434,58 +3444,14 @@ fn authentication_timestamp(now: UnixNanos) -> String {
 }
 
 fn subscription_args(
-    subscriptions_inst_type: &DashMap<OKXWsChannel, AHashSet<OKXInstrumentType>>,
-    subscriptions_inst_family: &DashMap<OKXWsChannel, AHashSet<Ustr>>,
-    subscriptions_inst_id: &DashMap<OKXWsChannel, AHashSet<Ustr>>,
-    subscriptions_bare: &DashMap<OKXWsChannel, bool>,
+    subscriptions: &DashMap<String, OKXSubscriptionArg>,
+    subscriptions_state: &SubscriptionState,
 ) -> Vec<OKXSubscriptionArg> {
-    let mut args = Vec::new();
-
-    for entry in subscriptions_inst_type {
-        let (channel, inst_types) = entry.pair();
-        for inst_type in inst_types {
-            args.push(OKXSubscriptionArg {
-                channel: channel.clone(),
-                inst_type: Some(*inst_type),
-                inst_family: None,
-                inst_id: None,
-            });
-        }
-    }
-
-    for entry in subscriptions_inst_family {
-        let (channel, inst_families) = entry.pair();
-        for inst_family in inst_families {
-            args.push(OKXSubscriptionArg {
-                channel: channel.clone(),
-                inst_type: None,
-                inst_family: Some(*inst_family),
-                inst_id: None,
-            });
-        }
-    }
-
-    for entry in subscriptions_inst_id {
-        let (channel, inst_ids) = entry.pair();
-        for inst_id in inst_ids {
-            args.push(OKXSubscriptionArg {
-                channel: channel.clone(),
-                inst_type: None,
-                inst_family: None,
-                inst_id: Some(*inst_id),
-            });
-        }
-    }
-
-    for entry in subscriptions_bare {
-        args.push(OKXSubscriptionArg {
-            channel: entry.key().clone(),
-            inst_type: None,
-            inst_family: None,
-            inst_id: None,
-        });
-    }
-
+    let mut args: Vec<_> = subscriptions_state
+        .all_topics()
+        .iter()
+        .filter_map(|topic| subscriptions.get(topic).map(|arg| arg.value().clone()))
+        .collect();
     args.sort_unstable_by_key(topic_from_subscription_arg);
     args
 }
@@ -3717,32 +3683,52 @@ mod tests {
     #[rstest]
     fn test_subscription_args_are_sorted_by_topic() {
         let client = OKXWebSocketClient::default();
-        client
-            .subscriptions_inst_type
-            .entry(OKXWsChannel::Instruments)
-            .or_default()
-            .extend([OKXInstrumentType::Swap, OKXInstrumentType::Spot]);
-        client
-            .subscriptions_inst_family
-            .entry(OKXWsChannel::OpenInterest)
-            .or_default()
-            .insert(Ustr::from("BTC-USD"));
-        client
-            .subscriptions_inst_id
-            .entry(OKXWsChannel::Tickers)
-            .or_default()
-            .extend([Ustr::from("ETH-USDT"), Ustr::from("BTC-USDT")]);
-        client.subscriptions_bare.insert(OKXWsChannel::Status, true);
 
-        let topics = subscription_args(
-            &client.subscriptions_inst_type,
-            &client.subscriptions_inst_family,
-            &client.subscriptions_inst_id,
-            &client.subscriptions_bare,
-        )
-        .iter()
-        .map(topic_from_subscription_arg)
-        .collect::<Vec<_>>();
+        let args = [
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Instruments,
+                inst_type: Some(OKXInstrumentType::Swap),
+                inst_family: None,
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Instruments,
+                inst_type: Some(OKXInstrumentType::Spot),
+                inst_family: None,
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::OpenInterest,
+                inst_type: None,
+                inst_family: Some(Ustr::from("BTC-USD")),
+                inst_id: None,
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Tickers,
+                inst_type: None,
+                inst_family: None,
+                inst_id: Some(Ustr::from("ETH-USDT")),
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Tickers,
+                inst_type: None,
+                inst_family: None,
+                inst_id: Some(Ustr::from("BTC-USDT")),
+            },
+            OKXSubscriptionArg {
+                channel: OKXWsChannel::Status,
+                inst_type: None,
+                inst_family: None,
+                inst_id: None,
+            },
+        ];
+
+        client.record_subscriptions(&args);
+
+        let topics = subscription_args(&client.subscriptions, &client.subscriptions_state)
+            .iter()
+            .map(topic_from_subscription_arg)
+            .collect::<Vec<_>>();
 
         assert_eq!(
             topics,
@@ -3755,6 +3741,75 @@ mod tests {
                 "Tickers:ETH-USDT",
             ]
         );
+    }
+
+    #[rstest]
+    #[case::channel_unknown(false, true)]
+    #[case::symbol_unknown(true, false)]
+    #[case::both_unknown(false, false)]
+    fn subscription_lookup_does_not_intern_unknown_values(
+        #[case] channel_known: bool,
+        #[case] symbol_known: bool,
+    ) {
+        let state = SubscriptionState::new(OKX_WS_TOPIC_DELIMITER);
+        state.mark_subscribe("Trades:BTC-USDT");
+
+        let channel = if channel_known {
+            "Trades".to_string()
+        } else {
+            format!("unknown_okx_channel_{}", UUID4::new())
+        };
+
+        let symbol = if symbol_known {
+            "BTC-USDT".to_string()
+        } else {
+            format!("unknown_okx_symbol_{}", UUID4::new())
+        };
+
+        let topic = format!("{channel}:{symbol}");
+        let channel_before = Ustr::from_existing(&channel);
+        let symbol_before = Ustr::from_existing(&symbol);
+
+        let subscribed = is_topic_subscribed(&state, &topic);
+
+        assert!(is_topic_subscribed(&state, "Trades:BTC-USDT"));
+        assert!(!subscribed);
+        assert_eq!(channel_before.is_some(), channel_known);
+        assert_eq!(symbol_before.is_some(), symbol_known);
+        assert_eq!(Ustr::from_existing(&channel), channel_before);
+        assert_eq!(Ustr::from_existing(&symbol), symbol_before);
+        assert_eq!(state.all_topics(), vec!["Trades:BTC-USDT".to_string()]);
+    }
+
+    #[rstest]
+    fn pending_unsubscribe_is_excluded_from_replay_arguments() {
+        let client = OKXWebSocketClient::default();
+
+        let canceled = OKXSubscriptionArg {
+            channel: OKXWsChannel::Trades,
+            inst_type: None,
+            inst_family: None,
+            inst_id: Some(Ustr::from("BTC-USDT")),
+        };
+
+        let retained = OKXSubscriptionArg {
+            inst_id: Some(Ustr::from("ETH-USDT")),
+            ..canceled.clone()
+        };
+
+        client.record_subscriptions(&[canceled.clone(), retained.clone()]);
+        let topic = topic_from_subscription_arg(&canceled);
+        client.subscriptions_state.mark_unsubscribe(&topic);
+
+        client.subscriptions_state.reset_after_reconnect();
+        let args = subscription_args(&client.subscriptions, &client.subscriptions_state);
+
+        assert!(client.subscriptions.contains_key(&topic));
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0].channel, retained.channel);
+        assert_eq!(args[0].inst_id, retained.inst_id);
+        assert_eq!(args[0].inst_type, None);
+        assert_eq!(args[0].inst_family, None);
     }
 
     #[rstest]

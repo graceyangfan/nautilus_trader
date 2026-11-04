@@ -57,8 +57,9 @@ Read the Deribit documentation with this NautilusTrader integration guide.
 
 ## Product support
 
-Each client loads only the product families listed in its `product_types` configuration on connect.
-The data client then refreshes them every `update_instruments_interval_mins` and publishes the definitions,
+Each client loads the product families listed in its `product_types` configuration on connect, plus any
+`load_ids` those families did not already include. The data client then refreshes those product families
+every `update_instruments_interval_mins` and publishes the definitions,
 including new listings. A failed refresh keeps the cached definitions and retries at the next interval.
 The execution client does not refresh its instrument caches, so restart the node to trade newly listed
 instruments. On the data client, `auto_load_missing_instruments` also fetches an uncached instrument on
@@ -471,6 +472,10 @@ or `Quantity` (for example, a value beyond their range), the adapter automatical
 During resync, the strategy will not receive stale or incomplete book updates. A user-initiated
 unsubscribe while a resync is pending cancels the resubscribe instead of reopening the channel.
 
+If a recovery unsubscribe fails, returns an invalid result, or omits a channel, the adapter logs an
+error and keeps that channel pending resync. It suppresses deltas for the instrument until a valid
+snapshot clears the pending resync or the client reconnects.
+
 A grouped book channel (`book.{instrument}.{group}.{depth}.{interval}`) sends a full snapshot every interval,
 so the adapter never resyncs it. It drops a snapshot that fails conversion. The next snapshot replaces the
 book.
@@ -565,7 +570,7 @@ self.subscribe_data(
 
 ## Orders capability
 
-An order's instrument must be loaded by the execution client's configured `product_types`.
+An order's instrument must be loaded by the execution client's `product_types` or `load_ids`.
 The adapter validates order parameters and queues `OrderSubmitted` before sending an order.
 If validation or event queuing fails, the adapter returns an error without sending the order.
 The execution engine handles that error as `OrderDenied`.
@@ -661,8 +666,9 @@ Deribit offers two post-only modes:
 2. **Reject mode**: Order is immediately rejected if it would cross the spread.
 
 The Nautilus adapter uses **reject mode** (`reject_post_only=true`) for deterministic behavior.
-When Deribit returns error code `11054`, the adapter emits `OrderRejected` with `due_post_only=true`.
-Other rejection codes set this flag to `false`, including rejections forwarded from Coinbase Exchange.
+The adapter emits `OrderRejected` with `due_post_only=true` for error code `11054` or an order result
+with `order_state="rejected"` and `reject_reason="post_only_reject"`. Other rejections set this flag to
+`false`. These rules also apply to rejections forwarded from Coinbase Exchange.
 
 This allows strategies to differentiate between:
 
@@ -686,8 +692,8 @@ This provides several advantages:
 - **Same price**: Keeps queue position.
 - **Increasing quantity or changing price**: Loses queue position (treated as new order).
 
-A modify command must carry the venue order ID and a price. If either is missing, the adapter rejects the
-command locally without reaching Deribit. Quantity is optional and falls back to the cached order's current
+A modify command must carry the venue order ID and a price. If either is missing, the adapter emits
+`OrderModifyDenied` without reaching Deribit. Quantity is optional and falls back to the cached order's current
 quantity.
 
 ### Position management
@@ -982,13 +988,14 @@ for the testnet through the testnet interface at [test.deribit.com](https://test
 | `auth_timeout_secs`                | `None`     | Seconds to await the WebSocket auth result; unset means 30.        |
 | `update_instruments_interval_mins` | `60`       | Instrument refresh interval in minutes; `0` disables it.           |
 | `auto_load_missing_instruments`    | `False`    | Lazy-load uncached instruments on subscribe.                       |
+| `load_ids`                         | `None`     | Extra instruments to load on connect. Empty or unset adds none.    |
 | `transport_backend`                | `Sockudo`  | WebSocket transport backend.                                       |
 
 #### Lazy-load on subscribe
 
 `subscribe_*` commands look up the instrument in the local cache before sending the WebSocket subscribe so the
 handler can parse the inbound frames. With `auto_load_missing_instruments = False` (the default), a
-subscription returns an error if its instrument was not preloaded by the configured `product_types`. It does
+subscription returns an error if its instrument was not preloaded by `product_types` or `load_ids`. It does
 not silently succeed and then drop subsequent frames at the handler.
 
 To load missing instruments on first subscribe, set `auto_load_missing_instruments = True`. The client fetches
@@ -1012,11 +1019,22 @@ are logged and the WebSocket subscribe is skipped.
 | `retry_delay_initial_ms` | `1,000`    | Initial delay in milliseconds before retrying.                     |
 | `retry_delay_max_ms`     | `10,000`   | Maximum delay in milliseconds between retries.                     |
 | `auth_timeout_secs`      | `None`     | Seconds to await the WebSocket auth result; unset means 30.        |
+| `load_ids`               | `None`     | Reconciliation scope. Empty or unset means every instrument.       |
 | `transport_backend`      | `Sockudo`  | WebSocket transport backend.                                       |
 
 `transport_backend` selects between the `Sockudo` and `Tungstenite` WebSocket transports. The default is
 `Sockudo` when the `transport-sockudo` Cargo feature is enabled, as in published Python wheels. A Rust build
 without that feature defaults to `Tungstenite`.
+
+Set the same `load_ids` on the data and execution clients. A non-empty set is the only reconciliation
+scope: records for other instruments are omitted, including instruments `product_types` already loaded.
+With `load_ids` unset or empty, an unresolved open order or non-flat position fails the report request.
+An unresolved closed order or fill inside the request window fails a direct report request. A bounded
+mass-status query keeps the other reports and marks that history incomplete. An unbounded query does not.
+See [Bounded history safety](../concepts/execution/reconciliation.md#bounded-history-safety). Also set
+`reconciliation_instrument_ids` to the same set, or a continuous position check can treat an omitted
+position as flat. Connect loads named instruments that
+`product_types` did not already cache. Report generation does not fetch missing instruments.
 
 ### Production configuration
 

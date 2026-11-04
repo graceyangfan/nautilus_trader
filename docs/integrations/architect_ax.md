@@ -339,8 +339,9 @@ and output format.
 - Open-order, historical-order, fill, and position report requests resolve an uncached symbol
   through `GET /instrument` and cache the result. An instrument request or parse failure fails that
   entire report request instead of dropping venue state.
-- `GET /transactions` requires `start_timestamp_ns` and `end_timestamp_ns` with a range no wider
-  than 7 days. The low-level client exposes its cursor and account selectors.
+- `GET /transactions` accepts optional `start_timestamp_ns` and `end_timestamp_ns` filters. When both
+  are supplied, `end_timestamp_ns` must be greater than `start_timestamp_ns`. The low-level client
+  requires both bounds and exposes cursor and account selectors.
 - `GET /order-status` can include `reject_reason` and `reject_message` for rejected orders.
 - When an account selector is omitted, AX uses the primary account. The high-level execution client owns one
   primary account. Low-level request models expose documented account selectors.
@@ -417,6 +418,43 @@ honor.
 The adapter also rejects quote-quantity and display-quantity instructions because its AX wire path
 cannot encode those semantics. This is an adapter boundary, not a claim that AX Exchange rejects
 equivalent venue-native features.
+
+### Order parameters
+
+Strategies can pass AX-specific placement options through the `params` argument of `submit_order`.
+Unknown keys are ignored. An invalid value denies the order locally before submission.
+
+The `st` key selects self-trade prevention: `CancelIncoming` (venue default), `CancelResting`, or
+`CancelBoth`, with the venue's input aliases `xi`, `xr`, and `xb` also accepted. Pass these strings
+in `params`, not `AxSelfTradeBehavior` enum objects, which `params` cannot serialize. To produce a
+value from the enum, use `str(AxSelfTradeBehavior.CANCEL_RESTING)`; the `.name` property is not a
+valid `st` value. The AX `tag` field is always `Nautilus`; neither `params` nor Nautilus order `tags`
+changes it.
+
+```python
+order = strategy.order_factory.limit(
+    instrument_id=InstrumentId.from_str("EURUSD-PERP.AX"),
+    order_side=OrderSide.BUY,
+    quantity=Quantity.from_int(100),
+    price=Price.from_str("1.12"),
+)
+strategy.submit_order(order, params={"st": "CancelResting"})
+```
+
+The option applies to order placement; the adapter sends no `st` on replace requests. Whether a
+replacement inherits the original order's self-trade behavior is unverified. A self-crossing
+aggressive order can be rejected with `OrderRejected` carrying the venue reason
+`order would trade against your own resting order`; resting orders are canceled with `OrderCanceled`.
+
+### Price bands
+
+AX enforces a limit-price band for each symbol and publishes the current bounds on ticker
+events (`pl` lower limit, `pu` upper limit). The adapter also exposes the venue's band definition
+in `Instrument.info`: `price_bands`, `price_band_upper_deviation_pct`, and
+`price_band_lower_deviation_pct`. Orders priced outside the band are rejected with
+`PRICE_OUT_OF_BOUNDS`, which the adapter surfaces as an `OrderRejected` event. A fixed tick offset
+from top of book can cross the band on lower-priced instruments: sandbox testing rejected orders
+$5 from a ~$49.70 market.
 
 ### Time in force
 
@@ -679,9 +717,9 @@ credentials are valid and have trading permissions.
   and returns the confirmed replacement's status, including fills or cancellation. It leaves the result
   unresolved when no replacement is confirmed. A cancel before confirmation targets the parent and
   can be rejected; recovery then needs a late stream confirmation, a child fill, or an explicit query.
-  A crossing post-only replacement emits `OrderModifyRejected` with the venue reason
-  and leaves the original order working. The adapter rejects a modification locally if it carries a
-  trigger price, because AX has no field for one, or if the order has no venue order ID yet.
+  The adapter emits `OrderModifyDenied` if a modification carries a trigger price, because AX has no
+  field for one, or if the order has no venue order ID yet. A crossing post-only replacement emits
+  `OrderModifyRejected` with the venue reason and leaves the original order working.
 - **Funding rate polling**: The data client polls `GET /funding-rates` for each subscribed instrument at
   `funding_rate_poll_interval_mins`. It requests a seven-day lookback to find a rate across weekends and
   holidays. It emits the latest rate only when it differs from the last one emitted.

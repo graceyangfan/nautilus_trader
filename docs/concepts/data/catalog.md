@@ -145,6 +145,7 @@ The built-in market-data writers are:
 - `write_bars`
 - `write_mark_price_updates`
 - `write_index_price_updates`
+- `write_funding_rate_updates`
 - `write_option_greeks`
 
 Each writer accepts optional `start` and `end` overrides as UNIX nanoseconds. The data in one call
@@ -218,21 +219,24 @@ Source schemas can change sampling or trade IDs, but catalog keys do not disting
 Set `params={"update_catalog": True}` to write successful source responses back to the catalog.
 Use `"catalog_name"` to select a registered catalog explicitly.
 
-Write-back requires a client that reports completion explicitly, such as Databento or a Python adapter.
+Write-back requires a client that reports completion explicitly, such as Databento, OKX, or a Python adapter.
+OKX reports completion only for bar, trade, and funding rate windows it returned in full; see
+[OKX historical requests](../../integrations/okx.md#historical-requests).
 Other clients return data without updating the catalog and log why write-back is skipped.
 
 Write-back applies these coverage rules:
 
 - Failed and intermediate responses skip write-back. Requests split across multiple source envelopes
   also skip write-back, including parent-symbol book-delta requests that return multiple payloads.
-- Requests with a record limit skip write-back. Decoded row counts cannot prove whether the source
-  exhausted that limit.
+- Requests with a record limit, a source schema, or no registered catalog are rejected. Decoded row
+  counts cannot prove whether the source exhausted a limit.
 - Batches with instruments or bar types outside the request skip write-back because their source
   coverage intervals are unknown.
 - Successful empty responses can extend known-empty coverage when both bounds are available and the
   backend supports it.
 
-Catalog write failures are logged and do not discard the returned data.
+Catalog write failures and batches outside the request fail the request without discarding the
+returned data.
 
 ## `BacktestDataConfig`: backtest data
 

@@ -1548,6 +1548,12 @@ criteria = "safe-to-deploy"
 delta = "1.18.1 -> 1.18.2"
 notes = "Reviewed the published Rust wrapper and integration-script delta. Library changes add Eq and PartialEq to EdDSA and RSA parameter types and document that a failed AEAD open may overwrite the input buffer. The integration script only clones upstream rustls repositories for developer tests and is not part of the build. Depends on aws-lc-sys 0.46.0, audited separately. No new runtime network, process, filesystem, or credential behavior."
 
+[[audits.aws-lc-rs]]
+who = "Nautech Systems <info@nautechsystems.io>"
+criteria = "safe-to-deploy"
+delta = "1.18.2 -> 1.19.0"
+notes = "Reviewed the published Rust wrapper delta. Adds AES OFB/CFB8/CFB1 with checked IVs and bounded byte-to-bit conversion, an explicit self-test API, reference-counted signing-key clones, and configurable RSA-PSS salt lengths with checked arithmetic; existing PSS parameters retain digest-length salts. Keccak-256 is gated behind unstable and non-FIPS builds. Decryption rejects mismatched contexts before entering FFI. The HMAC and RSA PKCS#1 signing paths used here retain their behavior. The sys dependency is audited separately. No new runtime network, filesystem, process, or credential behavior. All 10 nautilus-cryptography unit tests pass."
+
 [[audits.aws-lc-sys]]
 who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
@@ -1577,6 +1583,13 @@ who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
 delta = "0.45.0 -> 0.46.0"
 notes = "Reviewed the build scripts, generated bindings, packaged sources, Windows prebuilt NASM objects, and bundled AWS-LC 5.7.0 to 5.11.0 delta. Build changes drop the cranelift and no-u1 binding variants, strip link prefixes from generated bindings, and export crate compiler selection as target CC and CXX before cc lookup. The builder diff adds no download, curl, or network fetch. Prebuilt NASM objects remain behind the existing Windows x86_64 fallback. No new credential or process behavior beyond local compiler probes."
+
+[[audits.aws-lc-sys]]
+who = "Nautech Systems <info@nautechsystems.io>"
+criteria = "safe-to-deploy"
+delta = "0.46.0 -> 0.47.0"
+importable = false
+notes = "Reviewed the build-script and generated-binding delta and bundled AWS-LC 5.11.0 to 5.12.0 libcrypto changes for this workspace's non-FIPS feature graph. Changes harden ASN.1 allocation, TLS-CBC buffer reset, RSA-PSS restrictions, fork reseeding, OCSP validation, certificate cache invalidation, and blocked SPKI checks. HPKE buffers move to a cleansed heap allocation with matching regenerated FFI layouts. Compiler probes share cc caches; system-library version floors become feature-dependent. The enabled Windows x86_64 prebuilt-NASM fallback is included: all 26 packaged COFF objects match 0.46.0 byte-for-byte after normalizing COFF timestamps and the aws_lc_0_46_0 to aws_lc_0_47_0 symbol prefix. SSL, OpenSSL-provider, and FIPS configurations are outside this audit scope. No new build download, network destination, or credential behavior; existing local compiler execution remains. All 10 nautilus-cryptography unit tests pass."
 
 [[audits.base32]]
 who = "Nautech Systems <info@nautechsystems.io>"
@@ -3653,6 +3666,12 @@ criteria = "safe-to-deploy"
 delta = "0.4.33 -> 0.4.34"
 notes = "Reviewed the published 0.4.33 -> 0.4.34 crate. Adds alloc-gated boxed logger support, with std enabling alloc; this workspace enables std. No new unsafe, build script, filesystem, network, process, credential, or data-exfiltration behavior."
 
+[[audits.log]]
+who = "Nautech Systems <info@nautechsystems.io>"
+criteria = "safe-to-deploy"
+delta = "0.4.34 -> 0.4.35"
+notes = "Reviewed the checksum-verified published delta. Removes only the stale html_root_url documentation attribute and its version-maintenance comment. Runtime source and dependencies are unchanged."
+
 [[audits.lru]]
 who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
@@ -3998,7 +4017,7 @@ who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
 delta = "0.29.3 -> 0.30.1"
 importable = false
-notes = "Reviewed the published delta for the enabled std CPython 3.13/3.14 graph, focusing on GC traversal, owned deferred references, mutex guards, array initialization cleanup, bounded integer digit conversion, argument extraction, return conversion, and raw-pointer API removals. GC retains base/type and dictionary traversal before guarded Rust state; deferred decrefs transfer owned references and drain outside the mutex. Disabled numeric integrations, experimental inspection, no-std, and Python 3.15-only APIs are outside this review."
+notes = "Reviewed the published delta for the enabled std, GIL-enabled CPython 3.13/3.14/3.15 graph, focusing on GC traversal, owned deferred references, mutex guards, array initialization cleanup, bounded integer digit conversion, argument extraction, return conversion, and raw-pointer API removals. GC retains base/type and dictionary traversal before guarded Rust state; deferred decrefs transfer owned references and drain outside the mutex. Extended the 3.15 review to PySlot class/module initialization and ABI flags, DuringGC type-data access, native bytes-writer ownership, frozen-dictionary references and iteration, and bounded 128-bit integer conversion. Checked the checksum-verified 0.30.1 published sources against the 0.29.3 delta and CPython 3.15.1 headers; focused upstream module, class, GC, integer, bytes, and frozen-dictionary tests pass on 3.15.1. Disabled numeric integrations, experimental inspection, no-std, free-threaded builds, limited-API builds, and alternate interpreters remain outside this review."
 
 [[audits.pyo3-async-runtimes]]
 who = "Nautech Systems <info@nautechsystems.io>"
@@ -4059,7 +4078,7 @@ who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
 delta = "0.29.3 -> 0.30.1"
 importable = false
-notes = "Reviewed published build checks and FFI delta for the enabled CPython 3.13 and 3.14 bindings. Removes Python 3.8 branches and adds CPython declarations and version guards; current object layouts remain consistent with their selected interpreter version. Python 3.15-only additions and alternate interpreter configurations are outside this graph."
+notes = "Reviewed published build checks and FFI delta for the enabled GIL-enabled CPython 3.13, 3.14, and 3.15 bindings. Removes Python 3.8 branches and adds CPython declarations and version guards. Extended the 3.15 review to object/reference-count and bytearray layouts, PySlot and PyABIInfo declarations, module/type initialization, DuringGC accessors, critical sections, native bytes/integer writers, frozen dictionaries, and tuple construction. Compared checksum-verified 0.30.1 published sources with 0.29.3 and CPython 3.15.1 headers. A compiled C/Rust comparison matches object, type, module, configuration, Unicode, bytearray, integer-export, critical-section, slot, and ABI-info sizes, alignments, field offsets, and slot/ABI constants on Linux x86_64; source review covers the platform guards for the supported 64-bit targets. Free-threaded builds, limited-API builds, and alternate interpreters remain outside this graph."
 
 [[audits.pyo3-macros]]
 who = "Nautech Systems <info@nautechsystems.io>"
@@ -4269,6 +4288,13 @@ criteria = "safe-to-deploy"
 delta = "1.7.1 -> 1.8.0"
 importable = false
 notes = "Reviewed published enabled Tokio, connection-manager, pubsub, Sentinel, and rustls changes. Subscription commands await all confirmations, tuple decoding checks arity, and Debug redacts secrets. Sentinel lookup tries later configured sentinels, validates ROLE before caching, and bounds concurrency. Native-TLS, cluster, and unfinished search additions are outside the enabled graph. No new unsafe code or build script."
+
+[[audits.redis]]
+who = "Nautech Systems <info@nautechsystems.io>"
+criteria = "safe-to-deploy"
+delta = "1.8.0 -> 1.8.1"
+importable = false
+notes = "Reviewed the checksum-verified published delta. Corrects XINFO radix-tree-keys decoding, skips queued RESP2 pubsub messages while unsubscribing, and excludes push messages from late-reply accounting. Cache invalidation fixes remain outside the enabled graph. No new dependencies, unsafe code, build script, endpoints, or credential behavior."
 
 [[audits.redox_syscall]]
 who = "Nautech Systems <info@nautechsystems.io>"
@@ -4768,6 +4794,13 @@ who = "Nautech Systems <info@nautechsystems.io>"
 criteria = "safe-to-deploy"
 delta = "0.39.2 -> 0.39.3"
 notes = "Two bug fixes: Unix Network::mac_addr retrieval; Linux process-info retrieval race when a process terminates mid-read."
+
+[[audits.sysinfo]]
+who = "Nautech Systems <info@nautechsystems.io>"
+criteria = "safe-to-deploy"
+delta = "0.39.6 -> 0.40.1"
+importable = false
+notes = "Reviewed the checksum-verified system-feature delta for startup CPU, memory, OS, and hostname queries on Linux, macOS, and Windows. Constructors and metadata queries return Result; existing OS-read buffers and FFI ownership remain bounded by their platform APIs. Windows PDH counters use query-owned handles; Linux removes the file-limit mutation. GPU, user, network, and disk features are disabled, and process enumeration is not called by this workspace. No build script, subprocess, network, or credential access is added to the used paths. MIT license is unchanged."
 
 [[audits.tabled]]
 who = "Nautech Systems <info@nautechsystems.io>"

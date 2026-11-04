@@ -22,6 +22,7 @@ use nautilus_common::{
     msgbus::{self, Handler, MStr, Topic, switchboard},
     timer::TimeEvent,
 };
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{OrderBookDeltas, OrderBookDepth, QuoteTick},
     enums::{BookType, InstrumentClass},
@@ -85,7 +86,9 @@ impl DataEngine {
         cmd: &SubscribeBookDeltas,
     ) -> anyhow::Result<bool> {
         let instrument_id = cmd.single_instrument_id()?;
-        if instrument_id.is_synthetic() {
+        if instrument_id.is_synthetic()
+            && !cmd.client_id.is_some_and(|id| self.is_external_client(id))
+        {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDelta` data");
         }
 
@@ -104,7 +107,9 @@ impl DataEngine {
         cmd: &SubscribeBookDepth,
     ) -> anyhow::Result<bool> {
         let instrument_id = cmd.single_instrument_id()?;
-        if instrument_id.is_synthetic() {
+        if instrument_id.is_synthetic()
+            && !cmd.client_id.is_some_and(|id| self.is_external_client(id))
+        {
             anyhow::bail!("Cannot subscribe for synthetic instrument `OrderBookDepth` data");
         }
 
@@ -316,9 +321,14 @@ impl DataEngine {
             vec![instrument_id]
         };
 
-        let client_id = self
-            .get_command_client(command.client_id(), command.venue())
-            .map(|client| client.client_id);
+        let client_id = if let Some(client_id) = command.client_id()
+            && self.is_external_client(*client_id)
+        {
+            Some(*client_id)
+        } else {
+            self.get_command_client(command.client_id(), command.venue())
+                .map(|client| client.client_id)
+        };
 
         let subscription = Rc::new(BookSubscriptionOwner {
             command,
@@ -767,9 +777,11 @@ impl DataEngine {
     ) -> anyhow::Result<()> {
         {
             let mut cache = self.cache.borrow_mut();
-
             for target_id in target_ids {
-                if !cache.has_order_book(target_id) {
+                if cache
+                    .order_book(target_id)
+                    .is_none_or(|book| book.book_type != book_type)
+                {
                     cache.add_order_book(OrderBook::new(*target_id, book_type))?;
                 }
             }
@@ -894,6 +906,8 @@ pub(crate) enum BookDeltasUnsubscribeResult {
 /// The `BookUpdater` processes incoming order book deltas and maintains
 /// the current state of an order book. It can handle both incremental
 /// updates and full snapshots for the instrument it's assigned to.
+/// When `emit_quotes_from_book` is enabled, derived quotes use the book's last
+/// event time for `ts_event` and the incoming update's `ts_init`.
 #[derive(Debug)]
 pub struct BookUpdater {
     pub id: Ustr,
@@ -934,7 +948,7 @@ impl Handler<OrderBookDeltas> for BookUpdater {
                 }
 
                 if self.emit_quotes_from_book {
-                    emit = derive_quote_from_book(book);
+                    emit = derive_quote_from_book(book, deltas.ts_init);
                 }
             }
         }
@@ -961,7 +975,7 @@ impl Handler<OrderBookDepth> for BookUpdater {
                 }
 
                 if self.emit_quotes_from_book {
-                    emit = derive_quote_from_book(book);
+                    emit = derive_quote_from_book(book, depth.ts_init);
                 }
             }
         }
@@ -972,7 +986,7 @@ impl Handler<OrderBookDepth> for BookUpdater {
     }
 }
 
-fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
+fn derive_quote_from_book(book: &OrderBook, ts_init: UnixNanos) -> Option<QuoteTick> {
     let bid_price = book.best_bid_price()?;
     let ask_price = book.best_ask_price()?;
     let bid_size = book.best_bid_size()?;
@@ -989,7 +1003,7 @@ fn derive_quote_from_book(book: &OrderBook) -> Option<QuoteTick> {
         bid_size,
         ask_size,
         book.ts_last,
-        book.ts_last,
+        ts_init,
     ))
 }
 
