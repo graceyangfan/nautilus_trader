@@ -19,9 +19,9 @@ use anyhow::Context;
 use nautilus_common::messages::{
     DataEvent, DataResponse,
     data::{
-        BookResponse, CustomDataResponse, InstrumentResponse, InstrumentsResponse,
-        RequestBookSnapshot, RequestCustomData, RequestInstrument, RequestInstruments,
-        RequestTrades, TradesResponse,
+        BookResponse, CustomDataResponse, DataRequestFailed, InstrumentResponse,
+        InstrumentsResponse, RequestBookSnapshot, RequestCustomData, RequestInstrument,
+        RequestInstruments, RequestTrades, TradesResponse,
     },
 };
 use nautilus_core::datetime::datetime_to_unix_nanos;
@@ -298,37 +298,31 @@ pub(super) fn request_instrument(
     let end = request.end;
     let params = request.params;
     let clock = client.clock;
-    let future = async move {
-        let condition_id = match extract_condition_id(&instrument_id) {
-            Ok(cid) => cid,
-            Err(e) => {
-                log::error!("Failed to extract condition_id for {instrument_id}: {e}");
-                return;
-            }
-        };
-
-        let query_params = crate::http::query::GetGammaMarketsParams {
-            condition_ids: Some(vec![condition_id]),
-            ..Default::default()
-        };
-
-        let instrument = match http.request_instruments_by_params(query_params).await {
-            Ok(instruments) => instruments.into_iter().find(|i| i.id() == instrument_id),
-            Err(e) => {
-                log::error!("Failed to fetch instrument {instrument_id} from Gamma API: {e}");
-                return;
-            }
-        };
-
-        if let Some(inst) = instrument {
-            let update_state = instrument_update_state.lock();
-            let inst = match update_state.compose_instrument(&inst) {
-                Ok(instrument) => instrument,
-                Err(e) => {
-                    log::error!("Failed to apply live tick to instrument {instrument_id}: {e}");
-                    return;
-                }
+    let tasks = client.tasks.spawner()?;
+    let cancellation = tasks.cancellation_token();
+    tasks.spawn(async move {
+        let fetch = async {
+            let condition_id = extract_condition_id(&instrument_id)?;
+            let query = crate::http::query::GetGammaMarketsParams {
+                condition_ids: Some(vec![condition_id]),
+                ..Default::default()
             };
+            http.request_instruments_by_params(query)
+                .await
+                .with_context(|| format!("Failed to fetch {instrument_id} from Gamma API"))?
+                .into_iter()
+                .find(|i| i.id() == instrument_id)
+                .with_context(|| format!("Instrument {instrument_id} not found on Polymarket"))
+        };
+        let result = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(anyhow::anyhow!("Polymarket instrument request cancelled")),
+            result = fetch => result,
+        };
+        let event = result.and_then(|inst| {
+            let update_state = instrument_update_state.lock();
+            let inst = update_state.compose_instrument(&inst)
+                .with_context(|| format!("Failed to apply live tick to {instrument_id}"))?;
 
             if crate::data::runtime::is_instrument_expired_and_not_reported_open(
                 &inst,
@@ -354,29 +348,27 @@ pub(super) fn request_instrument(
                 );
             }
 
-            let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                request_id,
-                client_id,
-                instrument_id,
-                inst,
-                datetime_to_unix_nanos(start),
-                datetime_to_unix_nanos(end),
-                clock.get_time_ns(),
-                params,
-            )));
-
-            if let Err(e) = sender.send(DataEvent::Response(response)) {
-                log::error!("Failed to send instrument response: {e}");
-            }
-        } else {
-            log::error!("Instrument {instrument_id} not found on Polymarket");
+            Ok(DataEvent::Response(DataResponse::Instrument(Box::new(
+                InstrumentResponse::new(
+                    request_id,
+                    client_id,
+                    instrument_id,
+                    inst,
+                    datetime_to_unix_nanos(start),
+                    datetime_to_unix_nanos(end),
+                    clock.get_time_ns(),
+                    params,
+                ),
+            ))))
+        }).unwrap_or_else(|error| DataEvent::RequestFailed(DataRequestFailed {
+            request_id,
+            reason: format!("{error:#}"),
+            response: None,
+        }));
+        if let Err(error) = sender.send(event) {
+            log::error!("Failed to complete Polymarket instrument request {request_id}: {error}");
         }
-    };
-
-    if let Err(e) = client.tasks.spawn(future) {
-        log::debug!("Skipping Polymarket data task after shutdown began: {e}");
-    }
-
+    })?;
     Ok(())
 }
 

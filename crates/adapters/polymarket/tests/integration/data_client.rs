@@ -1014,10 +1014,12 @@ async fn test_instrument_status_and_close_subscriptions_are_accepted_without_pos
 }
 
 #[rstest]
+#[case::missing_market(serde_json::json!([]), "not found")]
+#[case::invalid_gamma_reply(serde_json::json!({"unexpected": true}), "Gamma")]
 #[tokio::test]
-async fn test_request_instrument_not_found_emits_no_publish() {
+async fn test_request_instrument_failure_completes(#[case] reply: Value, #[case] reason: &str) {
     let state = TestServerState::default();
-    *state.gamma_response.lock().await = Some(serde_json::json!([]));
+    *state.gamma_response.lock().await = Some(reply);
     let addr = start_mock_server(state).await;
     let (client, mut rx) = create_test_data_client(addr);
 
@@ -1030,17 +1032,20 @@ async fn test_request_instrument_not_found_emits_no_publish() {
         nautilus_core::UnixNanos::default(),
         None,
     );
-    client
-        .request_instrument(request)
-        .expect("request_instrument");
+    let request_id = request.request_id;
+    client.request_instrument(request).unwrap();
 
-    // A missing instrument produces no terminal response, so this is the one deliberate bounded
-    // absence window in these tests.
-    let events = drain_data_events(&mut rx, Duration::from_millis(500)).await;
-    assert!(
-        events.is_empty(),
-        "missing instrument must not produce any DataEvents; events were: {events:?}",
-    );
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let DataEvent::RequestFailed(failure) = event else {
+        panic!("expected instrument failure, got {event:?}");
+    };
+    assert_eq!(failure.request_id, request_id);
+    assert!(failure.reason.contains(reason), "{}", failure.reason);
+    assert!(failure.response.is_none());
+    assert!(rx.try_recv().is_err());
 }
 
 #[rstest]
