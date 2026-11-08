@@ -119,6 +119,7 @@ struct TestServerState {
     // When set, the next `allPerpMetas` response is built, then held after
     // notifying `all_perp_metas_held` until `all_perp_metas_release` fires.
     hold_next_all_perp_metas: Arc<tokio::sync::Mutex<bool>>,
+    reject_info_requests: Arc<tokio::sync::Mutex<bool>>,
     all_perp_metas_held: Arc<tokio::sync::Notify>,
     all_perp_metas_release: Arc<tokio::sync::Notify>,
 }
@@ -235,6 +236,9 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
     // release the counter at once, a guard held for the whole handler would
     // serialize concurrent requests and hide ordering races between them
     *state.info_request_count.lock().await += 1;
+    if *state.reject_info_requests.lock().await {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    }
 
     let Ok(request_body): Result<Value, _> = serde_json::from_slice(&body) else {
         return (
@@ -2840,6 +2844,77 @@ async fn test_data_client_request_instruments() {
     assert_new_listing_published_before_response(&events);
 
     client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_instrument_refresh_reports_terminal_failures_and_recovers() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state.clone()).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    set_data_event_sender(tx);
+    let mut config = create_data_client_config(addr);
+    config.http_timeout_secs = 3;
+    let mut client = HyperliquidDataClient::new(*HYPERLIQUID_CLIENT_ID, config).unwrap();
+    client.connect().await.unwrap();
+    drain_initial_events(&mut rx).await;
+
+    for reason in [
+        "no metadata source loaded",
+        "no metadata source loaded",
+        "timed out",
+    ] {
+        let stall = reason == "timed out";
+        *state.reject_info_requests.lock().await = !stall;
+        *state.hold_next_all_perp_metas.lock().await = stall;
+        let request = instruments_request();
+        let id = request.request_id;
+        client.request_instruments(request).unwrap();
+        if stall {
+            tokio::time::timeout(Duration::from_secs(5), state.all_perp_metas_held.notified())
+                .await
+                .unwrap();
+        }
+        let event = tokio::time::timeout(Duration::from_secs(6), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let DataEvent::RequestFailed(failure) = event else {
+            panic!("expected request failure, got {event:?}");
+        };
+        assert_eq!(failure.request_id, id);
+        assert!(failure.reason.contains(reason), "{}", failure.reason);
+        assert!(failure.response.is_none());
+        if stall {
+            state.all_perp_metas_release.notify_one();
+        }
+    }
+
+    *state.new_perp_listed.lock().await = true;
+    let request = instruments_request();
+    let id = request.request_id;
+    client.request_instruments(request).unwrap();
+    let events = recv_until_response(&mut rx).await;
+    assert!(matches!(events.last(),
+        Some(DataEvent::Response(DataResponse::Instruments(response))) if response.correlation_id == id
+    ));
+    assert_new_listing_published_before_response(&events);
+
+    *state.hold_next_all_perp_metas.lock().await = true;
+    let request = instruments_request();
+    let id = request.request_id;
+    client.request_instruments(request).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), state.all_perp_metas_held.notified())
+        .await
+        .unwrap();
+    client.disconnect().await.unwrap();
+    let event = rx.try_recv().unwrap();
+    let DataEvent::RequestFailed(failure) = event else {
+        panic!("expected cancelled request, got {event:?}");
+    };
+    assert_eq!(failure.request_id, id);
+    assert!(failure.reason.contains("cancelled"));
+    state.all_perp_metas_release.notify_one();
 }
 
 #[rstest]
