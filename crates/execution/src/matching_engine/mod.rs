@@ -21,6 +21,7 @@ pub mod inflight;
 pub mod orders;
 
 mod settlement;
+mod spread;
 
 #[cfg(test)]
 mod tests;
@@ -80,7 +81,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use ustr::Ustr;
 
 use self::{
-    config::OrderMatchingEngineConfig,
+    config::{OrderMatchingEngineConfig, OrderPriorityResetPolicy},
     ids_generator::IdsGenerator,
     inflight::InflightOrders,
     orders::{MatchingOrders, OtoCommand},
@@ -2497,14 +2498,22 @@ impl OrderMatchingEngine {
         let original_bid = self.core.bid;
         let original_ask = self.core.ask;
 
+        // Without an L1 quote on the passive side the latest trade defines that
+        // side, so it takes the trade price instead of keeping the previous trade's
+        let is_l1 = self.book_type == BookType::L1_MBP;
+
         match aggressor_side {
             AggressorSide::Sell => {
-                if original_ask.is_some_and(|ask| trade.price < ask) {
+                if (is_l1 && self.last_quote_ask.is_none())
+                    || original_ask.is_some_and(|ask| trade.price < ask)
+                {
                     self.core.set_ask_raw(trade.price);
                 }
             }
             AggressorSide::Buy => {
-                if original_bid.is_some_and(|bid| trade.price > bid) {
+                if (is_l1 && self.last_quote_bid.is_none())
+                    || original_bid.is_some_and(|bid| trade.price > bid)
+                {
                     self.core.set_bid_raw(trade.price);
                 }
             }
@@ -2525,9 +2534,6 @@ impl OrderMatchingEngine {
                 aggressor_side,
             );
         }
-
-        self.resolve_pending_on_trade(price_raw);
-        self.decrement_queue_on_trade(price_raw, trade.size.raw(), aggressor_side);
 
         self.iterate(trade.ts_init, aggressor_side);
 
@@ -3187,7 +3193,12 @@ impl OrderMatchingEngine {
             return;
         }
 
-        self.process_order_internal(order, account_id, released);
+        self.account_ids.insert(order.trader_id(), account_id);
+        if self.reject_spread_order(order) {
+            return;
+        }
+
+        self.process_order_internal(order, released);
     }
 
     fn prepare_oto_submission(&mut self, order: &mut OrderAny, account_id: AccountId) -> bool {
@@ -3285,21 +3296,13 @@ impl OrderMatchingEngine {
         Some(parent)
     }
 
-    fn process_order_internal(
-        &mut self,
-        order: &mut OrderAny,
-        account_id: AccountId,
-        released: bool,
-    ) {
+    fn process_order_internal(&mut self, order: &mut OrderAny, released: bool) {
         // Validate inside a cache borrow scope, collecting any rejection
         // reason rather than emitting events while the borrow is held.
         // This avoids RefCell re-entrancy panics from synchronous event
         // dispatch that calls back into the execution engine.
         let reject_reason: Option<Ustr> = 'validate: {
             let cache_borrow = self.cache.as_ref().borrow();
-
-            // Index identifiers
-            self.account_ids.insert(order.trader_id(), account_id);
 
             if self.pending_resolution.is_some() {
                 break 'validate Some(
@@ -3750,6 +3753,9 @@ impl OrderMatchingEngine {
         }
 
         self.account_ids.insert(order.trader_id(), account_id);
+        if self.reject_spread_order(order) {
+            return;
+        }
 
         if let Err(e) = self.ids_generator.get_venue_order_id(order) {
             log::error!(
@@ -3800,6 +3806,31 @@ impl OrderMatchingEngine {
             return;
         }
 
+        // Matching is suspended while the market is not open, so an update that makes the
+        // order marketable would fill against the book the market left. Reject it as a
+        // submit is rejected; a cancel is still accepted
+        if self.market_status != MarketStatus::Open {
+            self.generate_order_modify_rejected(
+                command.trader_id,
+                command.strategy_id,
+                command.instrument_id,
+                command.client_order_id,
+                Ustr::from(
+                    format!(
+                        "Market {} is {}, cannot modify order {}",
+                        self.instrument.id(),
+                        self.market_status,
+                        command.client_order_id
+                    )
+                    .as_str(),
+                ),
+                command.venue_order_id,
+                Some(account_id),
+                Some(command.command_id),
+            );
+            return;
+        }
+
         let order = match self.order_snapshot(command.client_order_id) {
             Some(order) => order,
             None => {
@@ -3828,15 +3859,28 @@ impl OrderMatchingEngine {
             return;
         }
 
-        let Some(refreshed) = self.resync_core_entry(command.client_order_id) else {
+        let Some(refreshed) = self.order_snapshot(command.client_order_id) else {
             return;
         };
 
-        // Skip queue reset on rejected modifies to preserve accrued position
         let price_changed = refreshed.price() != order.price()
             || refreshed.trigger_price() != order.trigger_price();
-        if price_changed
-            && refreshed.is_open()
+
+        let reset_priority = match self.config.order_priority_reset_policy {
+            OrderPriorityResetPolicy::PriceChange => false,
+            OrderPriorityResetPolicy::PriceOrQuantityIncrease => {
+                price_changed || refreshed.quantity() > order.quantity()
+            }
+            OrderPriorityResetPolicy::AnyModify => true,
+        };
+
+        self.sync_core_entry(&refreshed, reset_priority);
+        let reset_queue = match self.config.order_priority_reset_policy {
+            OrderPriorityResetPolicy::PriceChange => price_changed && refreshed.is_open(),
+            _ => reset_priority && !refreshed.is_closed(),
+        };
+
+        if reset_queue
             && self.config.queue_position
             && let Some(new_price) = refreshed.price()
         {
@@ -3997,32 +4041,37 @@ impl OrderMatchingEngine {
 
     fn resync_core_entry(&mut self, client_order_id: ClientOrderId) -> Option<OrderAny> {
         let order = self.order_snapshot(client_order_id)?;
+        self.sync_core_entry(&order, false);
+        Some(order)
+    }
+
+    fn sync_core_entry(&mut self, order: &OrderAny, reset_priority: bool) {
+        let client_order_id = order.client_order_id();
 
         // Gate on `is_closed`, not `is_open`: cache may transiently hold the
         // order in `Submitted` (process_limit_order accepts before cache add)
         if order.is_closed() {
             self.delete_core_order(client_order_id);
             self.remove_queue_position(client_order_id);
-            return Some(order);
+            return;
         }
 
-        let new_match_info = Self::matching_core_entry(&order);
-
+        let new_match_info = Self::matching_core_entry(order);
         // Skip the delete+add when unchanged to preserve FIFO at the level
-        let unchanged = self
-            .core
-            .get_order(client_order_id)
-            .is_some_and(|existing| *existing == new_match_info);
+        let unchanged = !reset_priority
+            && self
+                .core
+                .get_order(client_order_id)
+                .is_some_and(|existing| *existing == new_match_info);
 
         if unchanged {
-            self.track_post_match_order(&order);
-            return Some(order);
+            self.track_post_match_order(order);
+            return;
         }
 
         self.delete_core_order(client_order_id);
-        self.track_post_match_order(&order);
+        self.track_post_match_order(order);
         self.core.add_order(new_match_info);
-        Some(order)
     }
 
     fn order_snapshot(&self, client_order_id: ClientOrderId) -> Option<OrderAny> {
@@ -4489,6 +4538,9 @@ impl OrderMatchingEngine {
         self.purge_applied_rejections();
         self.purge_applied_oto_terminals();
 
+        self.expire_gtd_orders(timestamp_ns);
+        self.process_trade_queue(aggressor_side);
+
         // Only reset bid/ask from book when not processing trade execution
         // (preserves transient trade price override for L2/L3 books). The
         // `last_trade_size` gate covers the no-aggressor trade-tick path
@@ -4590,9 +4642,7 @@ impl OrderMatchingEngine {
                     continue;
                 }
                 PostMatchOrderAction::Expire(order) => {
-                    self.delete_core_order(client_order_id);
                     self.expire_order(&order);
-                    self.purge_cached_filled_qty_if_closed(client_order_id);
                     continue;
                 }
                 PostMatchOrderAction::UpdateTrailing(mut order) => {
@@ -4659,6 +4709,49 @@ impl OrderMatchingEngine {
         self.purge_applied_fills();
         self.purge_applied_rejections();
         self.purge_applied_oto_terminals();
+    }
+
+    fn expire_gtd_orders(&mut self, timestamp_ns: UnixNanos) {
+        if !self.config.support_gtd_orders || self.post_match_order_ids.is_empty() {
+            return;
+        }
+
+        // Orders remain eligible to match at their exact expiry timestamp
+        let expired_order_ids: Vec<ClientOrderId> = {
+            let cache = self.cache.borrow();
+            self.post_match_order_ids
+                .iter()
+                .filter_map(|id| {
+                    let order = cache.order_ref(id)?;
+                    (!order.is_closed()
+                        && order
+                            .expire_time()
+                            .is_some_and(|expiry| timestamp_ns > expiry))
+                    .then_some(*id)
+                })
+                .collect()
+        };
+
+        for client_order_id in expired_order_ids {
+            if !self.core.order_exists(client_order_id) {
+                continue;
+            }
+
+            let Some(order) = self.order_snapshot(client_order_id) else {
+                continue;
+            };
+
+            self.expire_order(&order);
+        }
+    }
+
+    fn process_trade_queue(&mut self, aggressor_side: AggressorSide) {
+        let (Some(size), Some(price)) = (self.last_trade_size, self.core.last) else {
+            return;
+        };
+
+        self.resolve_pending_on_trade(price.raw());
+        self.decrement_queue_on_trade(price.raw(), size.raw(), aggressor_side);
     }
 
     fn fill_resting_limit_order(&mut self, client_order_id: ClientOrderId) {
@@ -5583,6 +5676,43 @@ impl OrderMatchingEngine {
         protection_price: Option<Price>,
         from_synthetic: bool,
     ) -> anyhow::Result<()> {
+        if self.instrument.is_spread() {
+            return self.apply_spread_fills(
+                order,
+                fills,
+                liquidity_side,
+                venue_position_id,
+                position,
+                protection_price,
+                from_synthetic,
+            );
+        }
+
+        self.apply_order_fills(
+            order,
+            fills,
+            liquidity_side,
+            venue_position_id,
+            position,
+            protection_price,
+            from_synthetic,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fill application needs order, position, pricing, and liquidity-source context"
+    )]
+    fn apply_order_fills(
+        &mut self,
+        order: &OrderAny,
+        fills: &[(Price, Quantity)],
+        liquidity_side: LiquiditySide,
+        venue_position_id: Option<PositionId>,
+        position: Option<&Position>,
+        protection_price: Option<Price>,
+        from_synthetic: bool,
+    ) -> anyhow::Result<()> {
         let mut reduce_only_remaining = self.reduce_only_remaining(order, position)?;
         let required_qty = reduce_only_remaining.map_or(order.leaves_qty(), |remaining| {
             order.leaves_qty().min(remaining)
@@ -6096,7 +6226,7 @@ impl OrderMatchingEngine {
             commission_order.set_liquidity_side(liquidity_side);
         }
 
-        let underlying_px = self.fee_underlying_price()?;
+        let underlying_px = self.fee_underlying_price(&self.instrument)?;
         let commission = self.fee_model.get_commission_with_context(
             &commission_order,
             last_qty,
@@ -6106,7 +6236,7 @@ impl OrderMatchingEngine {
         )?;
 
         // Resolve implicit membership before dispatch can close the cached position
-        let mut reduce_only_order_ids = position
+        let reduce_only_order_ids = position
             .map(|position| self.reduce_only_order_ids(position.id))
             .unwrap_or_default();
 
@@ -6127,6 +6257,16 @@ impl OrderMatchingEngine {
             liquidity_side,
         );
 
+        self.complete_order_fill(order, venue_position_id, position, reduce_only_order_ids)
+    }
+
+    fn complete_order_fill(
+        &mut self,
+        order: &OrderAny,
+        venue_position_id: Option<PositionId>,
+        position: Option<&Position>,
+        mut reduce_only_order_ids: Vec<ClientOrderId>,
+    ) -> anyhow::Result<()> {
         let post_fill_filled_qty = self.engine_filled_qty(order);
 
         let post_fill_quantity = self
@@ -6633,20 +6773,20 @@ impl OrderMatchingEngine {
         true
     }
 
-    fn fee_underlying_price(&self) -> CorrectnessResult<Option<Price>> {
+    fn fee_underlying_price(&self, instrument: &InstrumentAny) -> CorrectnessResult<Option<Price>> {
         if !matches!(
-            self.instrument,
+            instrument,
             InstrumentAny::CryptoOption(_) | InstrumentAny::OptionContract(_)
         ) {
             return Ok(None);
         }
 
-        let Some(underlying) = self.instrument.underlying() else {
+        let Some(underlying) = instrument.underlying() else {
             return Ok(None);
         };
 
         let underlying_id = InstrumentId::from(format!("{underlying}.{}", self.venue).as_str());
-        let instrument_id = self.instrument.id();
+        let instrument_id = instrument.id();
 
         let cache = self.cache.borrow();
         if let Some(price) = cache
@@ -7110,12 +7250,14 @@ impl OrderMatchingEngine {
     }
 
     fn expire_order(&mut self, order: &OrderAny) {
+        self.delete_core_order(order.client_order_id());
         self.remove_queue_position(order.client_order_id());
         if self.config.support_contingent_orders && order.contingency_type().is_some() {
             self.cancel_contingent_orders(order, &[]);
         }
 
         self.generate_order_expired(order);
+        self.purge_cached_filled_qty_if_closed(order.client_order_id());
     }
 
     fn cancel_order(&mut self, order: &OrderAny, cancel_contingencies: Option<bool>) {
@@ -7555,6 +7697,11 @@ impl OrderMatchingEngine {
 
         if let Some(mut cached_order) = self.cache.borrow_mut().order_mut(&client_order_id) {
             cached_order.set_liquidity_side(liquidity_side);
+        }
+
+        if matches!(order.time_in_force(), TimeInForce::Fok | TimeInForce::Ioc) {
+            self.cancel_order(&order, None);
+            return;
         }
 
         self.resync_core_entry(client_order_id);

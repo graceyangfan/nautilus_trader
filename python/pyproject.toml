@@ -196,7 +196,15 @@ exclude = [
 preview = true
 explicit-preview-rules = true
 select = ["ALL"]
-extend-select = ["PLW1514"]
+extend-select = [
+  "E301", # Blank lines between methods
+  "E302", # Blank lines before top-level definitions
+  "E303", # Consecutive blank lines
+  "E304", # Decorators stay attached to definitions
+  "E305", # Blank lines after top-level definitions
+  "E306", # Blank lines before nested definitions
+  "PLW1514",
+]
 
 ignore = [
   "COM812", # Ruff formatter controls trailing commas
@@ -334,16 +342,10 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
   "T20",
   "TC003",
 ] # TODO: Remove legacy exemptions as these tutorials are updated
-"docs/tutorials/backtest_orderbook_coinapi.py" = [
+"docs/tutorials/{backtest_orderbook_coinapi.py,backtest_orderbook_finfeed.py}" = [
   "S101",
   "T201",
 ] # Snapshot assertions and visible reports are part of the lesson
-"docs/tutorials/orderbook_imbalance.py" = [
-  "D101",
-  "D102",
-  "D107",
-  "PLR0913",
-] # Tutorial prose documents the strategy; its config exposes the signal controls
 "docs/how_to/**/*.py" = [
   "B018",
   "CPY001",

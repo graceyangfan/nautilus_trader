@@ -1110,7 +1110,10 @@ fn test_stopped_engine_blocks_new_physical_subscriptions(
         data_engine.stop();
     }
 
-    futures::executor::block_on(data_engine.connect());
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(data_engine.connect());
 
     let subscribe = || {
         SubscribeCommand::Quotes(SubscribeQuotes::new(
@@ -4842,16 +4845,19 @@ fn non_streamable_subscribe_cases(
         ),
         (
             "option chain",
-            SubscribeCommand::OptionChain(SubscribeOptionChain::new(
-                series_id,
-                StrikeRange::Fixed(vec![Price::from("50000")]),
-                Some(1_000),
-                UUID4::new(),
-                UnixNanos::default(),
-                Some(client_id),
-                Some(venue),
-                None,
-            )),
+            SubscribeCommand::OptionChain(
+                SubscribeOptionChain::new(
+                    series_id,
+                    StrikeRange::Fixed(vec![Price::from("50000")]),
+                    Some(1_000),
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    Some(client_id),
+                    Some(venue),
+                    None,
+                )
+                .unwrap(),
+            ),
         ),
     ]
 }

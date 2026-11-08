@@ -18,7 +18,6 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -26,6 +25,7 @@ use std::{
     time::Duration,
 };
 
+use ahash::AHashSet;
 use axum::{
     Router,
     extract::{
@@ -45,18 +45,19 @@ use nautilus_common::{
 use nautilus_core::UnixNanos;
 use nautilus_live::{SocketControl, SocketReconnectRegistry, SocketReconnectRequestOutcome};
 use nautilus_model::{
+    data::BarType,
     enums::{OrderSide, OrderType, PositionSide, TimeInForce},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
     },
-    instruments::InstrumentAny,
+    instruments::{Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt},
     types::{Price, Quantity},
 };
 use nautilus_network::{mode::ReconnectRequestOutcome, websocket::TransportBackend};
 use nautilus_okx::{
     common::{
         consts::OKX_NAUTILUS_BROKER_ID,
-        enums::{OKXInstrumentType, OKXTradeMode},
+        enums::{OKXGreeksType, OKXInstrumentType, OKXTradeMode},
         models::OKXInstrument,
         parse::parse_instrument_any,
     },
@@ -64,6 +65,7 @@ use nautilus_okx::{
     websocket::{
         client::OKXWebSocketClient,
         enums::{OKXWsChannel, OKXWsOperation},
+        error::OKXWsError,
         messages::OKXWsMessage,
     },
 };
@@ -107,14 +109,8 @@ struct TestServerState {
     upgrade_delay: Duration,
 }
 
-fn data_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data")
-}
-
 fn load_json(filename: &str) -> Value {
-    let content = std::fs::read_to_string(data_path().join(filename))
-        .unwrap_or_else(|_| panic!("failed to read {filename}"));
-    serde_json::from_str(&content).expect("invalid json")
+    crate::common::load_test_json(filename)
 }
 
 fn load_margin_instruments() -> Vec<InstrumentAny> {
@@ -404,12 +400,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<TestServerState>) {
                         }
 
                         if state.fail_next_login.swap(false, Ordering::Relaxed) {
-                            let response = json!({
-                                "event": "login",
-                                "code": "60015",
-                                "msg": "Invalid signature",
-                                "connId": "test-conn",
-                            });
+                            let fixture = load_json("ws_reconnect_queued_frames.json");
+                            let response = fixture["api_key_error"].clone();
                             let _result = socket
                                 .send(Message::Text(response.to_string().into()))
                                 .await;
@@ -749,6 +741,92 @@ async fn test_submit_event_order_omits_speed_bump() {
     assert!(arg.get("ccy").is_none());
 
     client.close().await.expect("close failed");
+}
+
+#[rstest]
+#[case::option("http_get_instruments_option.json", OKXTradeMode::Cross)]
+#[case::spot("http_get_instruments_spot.json", OKXTradeMode::Cash)]
+#[case::swap("http_get_instruments_swap.json", OKXTradeMode::Cross)]
+#[tokio::test]
+async fn test_submit_limit_fok_order_uses_fok_on_wire(
+    #[case] fixture: &str,
+    #[case] td_mode: OKXTradeMode,
+) {
+    let payload = load_json(fixture);
+    let response: OKXResponse<OKXInstrument> = serde_json::from_value(payload).unwrap();
+    let instrument = parse_instrument_any(&response.data[0], None, None, UnixNanos::default())
+        .unwrap()
+        .unwrap();
+    let instrument_id = instrument.id();
+    let quote_currency = instrument.quote_currency();
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+    let mut client = connect_client(&ws_url);
+    client.cache_instruments(&[instrument]);
+    client.cache_inst_id_code(instrument_id.symbol.inner(), 1_000_000_287);
+    client.connect().await.unwrap();
+    client.wait_until_active(5.0).await.unwrap();
+
+    client
+        .submit_order(
+            TraderId::from("TRADER-001"),
+            StrategyId::from("STRATEGY-001"),
+            instrument_id,
+            td_mode,
+            ClientOrderId::from("Ofokwire001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("3"),
+            Some(TimeInForce::Fok),
+            Some(Price::from("0.0002")),
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.order_messages.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let messages = state.order_messages().await;
+    let mut expected = json!({
+        "instIdCode": 1_000_000_287,
+        "tdMode": td_mode,
+        "ccy": quote_currency.to_string(),
+        "clOrdId": "Ofokwire001",
+        "tag": OKX_NAUTILUS_BROKER_ID,
+        "side": "buy",
+        "ordType": "fok",
+        "sz": "3",
+        "px": "0.0002",
+    });
+
+    if td_mode == OKXTradeMode::Cross {
+        expected["posSide"] = json!("net");
+    }
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["op"], "order");
+    assert_eq!(messages[0]["args"], json!([expected]));
+
+    client.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2560,42 +2638,40 @@ async fn test_reconnect_authentication_failure_opens_new_connection(#[case] supp
     assert_eq!(logins, vec![0, 1, 2]);
 }
 
+#[rstest]
+#[case(TransportBackend::Sockudo)]
+#[case(TransportBackend::Tungstenite)]
 #[tokio::test]
-async fn test_login_failure_emits_error() {
+async fn test_login_failure_emits_error(#[case] backend: TransportBackend) {
     let state = Arc::new(TestServerState::default());
     state.fail_next_login.store(true, Ordering::Relaxed);
-
     let addr = start_ws_server(state.clone()).await;
-    let ws_url = format!("ws://{addr}/ws");
+    let mut client = OKXWebSocketClient::new(
+        Some(format!("ws://{addr}/ws")),
+        Some("key".into()),
+        Some("secret".into()),
+        Some("passphrase".into()),
+        None,
+        None,
+        Some(5),
+        backend,
+        None,
+    )
+    .unwrap();
 
-    let instruments = load_instruments();
-
-    let mut client = connect_client(&ws_url);
-    client.cache_instruments(&instruments);
-
-    let connect_result = tokio::time::timeout(Duration::from_secs(1), client.connect()).await;
-
-    match connect_result {
-        Ok(Ok(())) => panic!("connect unexpectedly succeeded"),
-        Ok(Err(e)) => assert!(format!("{e}").contains("Authentication")),
-        Err(_) => {
-            tokio::time::timeout(Duration::from_secs(1), async {
-                loop {
-                    if *state.login_count.lock().await >= 1 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            })
-            .await
-            .expect("login error did not arrive in time");
-        }
-    }
-
+    let error = tokio::time::timeout(Duration::from_secs(1), client.connect())
+        .await
+        .expect("explicit login denial must settle before the auth timeout")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("OKX authentication error 60005: Invalid apiKey")
+    );
     assert_eq!(*state.login_count.lock().await, 1);
     assert!(!state.authenticated.load(Ordering::Relaxed));
-
-    client.close().await.expect("close failed");
+    assert!(!client.is_active());
+    client.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -3633,6 +3709,67 @@ async fn test_reconnection_race_condition() {
 }
 
 #[tokio::test]
+async fn test_bar_subscription_flow() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let ws_url = format!("ws://{addr}/ws");
+
+    let instruments = load_instruments();
+
+    let mut client = connect_client(&ws_url);
+    client.cache_instruments(&instruments);
+    client.connect().await.expect("connect failed");
+    client.wait_until_active(5.0).await.expect("wait failed");
+
+    let bar_type = BarType::from("BTC-USD.OKX-1-MINUTE-LAST-EXTERNAL");
+    client
+        .subscribe_bars(bar_type)
+        .await
+        .expect("subscribe bars failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.subscription_events().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    assert_eq!(
+        state.subscription_events().await,
+        vec![(
+            "candle1m:BTC-USD".to_string(),
+            Some("BTC-USD".to_string()),
+            true,
+        )],
+    );
+
+    client
+        .unsubscribe_bars(bar_type)
+        .await
+        .expect("unsubscribe bars failed");
+
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { !state.unsubscriptions.lock().await.is_empty() }
+        },
+        Duration::from_secs(1),
+    )
+    .await;
+
+    let unsubscriptions = state.unsubscriptions.lock().await;
+    assert_eq!(
+        unsubscriptions.as_slice(),
+        &[json!({"channel": "candle1m", "instId": "BTC-USD"})],
+    );
+    drop(unsubscriptions);
+
+    client.close().await.expect("close failed");
+}
+
+#[tokio::test]
 async fn test_subscribe_after_stream_call() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -3729,47 +3866,7 @@ async fn test_is_active_lifecycle() {
         !client.is_active(),
         "Client should not be active after close"
     );
-}
-
-#[tokio::test]
-async fn test_is_active_false_after_close() {
-    let state = Arc::new(TestServerState::default());
-    let addr = start_ws_server(state.clone()).await;
-    let ws_url = format!("ws://{addr}/ws");
-
-    let instruments = load_instruments();
-
-    let mut client = connect_client(&ws_url);
-    client.cache_instruments(&instruments);
-
-    client.connect().await.expect("connect failed");
-    client
-        .wait_until_active(5.0)
-        .await
-        .expect("wait until active failed");
-
-    assert!(
-        client.is_active(),
-        "Expected is_active() to be true after connect"
-    );
-
-    client.close().await.expect("close failed");
-
-    let client_ref = &client;
-    wait_until_async(
-        || async move { !client_ref.is_active() },
-        Duration::from_secs(2),
-    )
-    .await;
-
-    assert!(
-        !client.is_active(),
-        "Expected is_active() to be false after close"
-    );
-    assert!(
-        client.is_closed(),
-        "Expected is_closed() to be true after close"
-    );
+    assert!(client.is_closed(), "Client should be closed after close");
 }
 
 #[tokio::test]
@@ -4585,4 +4682,222 @@ async fn test_usdc_subscription_resubscribes_same_inst_id_after_reconnect() {
     );
 
     client.close().await.expect("close failed");
+}
+
+#[rstest]
+fn test_new_without_credentials() {
+    let client = OKXWebSocketClient::default();
+    assert_eq!(client.api_key(), None);
+    assert!(client.is_closed());
+    assert!(!client.is_active());
+}
+
+#[rstest]
+fn test_new_with_credentials() {
+    let client = OKXWebSocketClient::new(
+        None,
+        Some("test_key".to_string()),
+        Some("test_secret".to_string()),
+        Some("test_passphrase".to_string()),
+        None,
+        None,
+        None,
+        TransportBackend::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(client.api_key(), Some("test_key"));
+}
+
+#[rstest]
+fn test_new_partial_credentials_fails() {
+    let result = OKXWebSocketClient::new(
+        None,
+        Some("test_key".to_string()),
+        None,
+        Some("test_passphrase".to_string()),
+        None,
+        None,
+        None,
+        TransportBackend::default(),
+        None,
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "`api_key`, `api_secret`, `api_passphrase` credentials must be provided together"
+    );
+}
+
+#[rstest]
+fn test_instruments_cache_arc_observes_post_clone_writes() {
+    let client = OKXWebSocketClient::default();
+    let cache = client.instruments_cache_arc();
+    assert!(cache.load().is_empty());
+
+    let instrument = InstrumentAny::CryptoPerpetual(crypto_perpetual_ethusdt());
+    let symbol = instrument.symbol().inner();
+    client.cache_instruments(std::slice::from_ref(&instrument));
+
+    let loaded = cache.load();
+    assert_eq!(loaded.len(), 1);
+    let stored = loaded.get(&symbol).expect("instrument not refreshed");
+    assert_eq!(stored.id(), instrument.id());
+}
+
+#[rstest]
+fn test_add_option_greeks_sub_defaults_to_both_conventions() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
+
+    client.add_option_greeks_sub(instrument_id);
+
+    let subs = client.option_greeks_subs().load();
+    let stored = subs.get(&instrument_id).expect("instrument not registered");
+    assert_eq!(stored.len(), 2);
+    assert!(stored.contains(&OKXGreeksType::Bs));
+    assert!(stored.contains(&OKXGreeksType::Pa));
+}
+
+#[rstest]
+#[case::bs_only(vec![OKXGreeksType::Bs])]
+#[case::pa_only(vec![OKXGreeksType::Pa])]
+#[case::both(vec![OKXGreeksType::Bs, OKXGreeksType::Pa])]
+fn test_add_option_greeks_sub_with_conventions_stores_requested_set(
+    #[case] conventions: Vec<OKXGreeksType>,
+) {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
+    let set: AHashSet<OKXGreeksType> = conventions.iter().copied().collect();
+
+    client.add_option_greeks_sub_with_conventions(instrument_id, set.clone());
+
+    let subs = client.option_greeks_subs().load();
+    let stored = subs.get(&instrument_id).expect("instrument not registered");
+    assert_eq!(stored, &set);
+}
+
+#[rstest]
+fn test_add_option_greeks_sub_with_empty_conventions_falls_back_to_both() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
+
+    client.add_option_greeks_sub_with_conventions(instrument_id, AHashSet::new());
+
+    let subs = client.option_greeks_subs().load();
+    let stored = subs.get(&instrument_id).expect("instrument not registered");
+    assert_eq!(
+        stored,
+        &AHashSet::from_iter([OKXGreeksType::Bs, OKXGreeksType::Pa])
+    );
+}
+
+#[rstest]
+fn test_remove_option_greeks_sub_clears_entry() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USD-250328-92000-C.OKX");
+
+    client.add_option_greeks_sub(instrument_id);
+    client.remove_option_greeks_sub(&instrument_id);
+
+    let subs = client.option_greeks_subs().load();
+    assert!(!subs.contains_key(&instrument_id));
+}
+
+#[tokio::test]
+async fn test_cancel_order_fails_without_inst_id_code() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+
+    let result = client
+        .cancel_order(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            Some(ClientOrderId::new("O-001")),
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(OKXWsError::ClientError(message))
+            if message == "No instIdCode cached for BTC-USDT-SWAP.OKX, cannot cancel order"
+    ));
+}
+
+#[tokio::test]
+async fn test_submit_order_fails_without_inst_id_code() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("ETH-USDT-SWAP.OKX");
+
+    let result = client
+        .submit_order(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            OKXTradeMode::Cross,
+            ClientOrderId::new("O-001"),
+            OrderSide::Buy,
+            OrderType::Limit,
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(OKXWsError::ClientError(message))
+            if message == "No instIdCode cached for ETH-USDT-SWAP.OKX, cannot submit order"
+    ));
+}
+
+#[tokio::test]
+async fn test_cancel_order_passes_inst_id_code_lookup_when_cached() {
+    let client = OKXWebSocketClient::default();
+    let instrument_id = InstrumentId::from("BTC-USDT-SWAP.OKX");
+
+    client.cache_inst_id_code(Ustr::from("BTC-USDT-SWAP"), 10459);
+
+    let result = client
+        .cancel_order(
+            TraderId::from("TESTER-001"),
+            StrategyId::from("S-001"),
+            instrument_id,
+            Some(ClientOrderId::new("O-001")),
+            None,
+        )
+        .await;
+
+    assert!(matches!(result, Err(OKXWsError::HandlerUnavailable(_))));
+}
+
+#[rstest]
+fn test_inst_id_code_cache_keeps_usd_and_usdc_instruments_distinct() {
+    let client = OKXWebSocketClient::default();
+    client.cache_inst_id_code(Ustr::from("BTC-USD"), 10401);
+    client.cache_inst_id_code(Ustr::from("BTC-USDC"), 20459);
+
+    assert_eq!(client.get_inst_id_code(&Ustr::from("BTC-USD")), Some(10401));
+    assert_eq!(
+        client.get_inst_id_code(&Ustr::from("BTC-USDC")),
+        Some(20459)
+    );
+    assert_ne!(
+        client.get_inst_id_code(&Ustr::from("BTC-USD")),
+        client.get_inst_id_code(&Ustr::from("BTC-USDC"))
+    );
 }

@@ -145,13 +145,14 @@ An origin is recorded:
 An origin may be absent for:
 
 - Cache data written before resolved origins were persisted.
+- Orders restored after an origin write failed or the process exited before it committed.
 - External orders whose runtime report does not identify exactly one registered client by account
   and instrument venue.
 - Synthetic reconciliation orders.
 
-The built-in cache backends enqueue a resolved origin for persistence before transport. Their writes stay
-asynchronous, so enqueue order does not guarantee that the origin is durable before the order reaches the
-client.
+The built-in cache backends attempt to enqueue a resolved origin for persistence before transport.
+Enqueue failures are logged without blocking transport. These writes are asynchronous, so enqueue order
+does not guarantee that the origin is durable before the order reaches the client.
 
 At startup, each client's mass status is checked against the cached origins. An order the client reports is
 expected to be bound to that same client.
@@ -179,6 +180,10 @@ history can instead use [order-only fill projection](#order-only-fill-projection
 | `OrderWithFills`       | Order state plus fills.  | Creates an order, applies fills, and infers residue. |
 | `PositionStatusReport` | Venue position snapshot. | Logs the report. Positions stay fill-derived.        |
 
+Clients that require authoritative fills, such as OKX, do not infer executions from order status.
+Missing fills and dependent status transitions wait for venue fill reports or private fill events.
+An uncached runtime order status creates and accepts the order while its executions remain pending.
+
 #### When to use each variant
 
 Adapters choose the variant that matches the venue event:
@@ -189,6 +194,9 @@ Adapters choose the variant that matches the venue event:
   Hyperliquid liquidations follow this pattern.
 - Use `OrderWithFills` when one venue event contains both an order status and its fills. Binance
   Futures uses this for exchange-generated ADL, liquidation, and settlement orders.
+
+Streamed `OrderWithFills` reports can infer fill voids from a lower cumulative filled quantity only
+when their status is `VOIDED`. Use mass status for authoritative snapshot corrections.
 
 ### Snapshot freshness and fill corrections
 
@@ -538,7 +546,7 @@ does not prevent recovery from an explicit position report.
 
 ### Fill reconciliation
 
-- Infers `OrderFilled` events for missing trade reports.
+- Infers `OrderFilled` events for missing trade reports unless the client requires authoritative fills.
 - Verifies fill report data consistency with tolerance-based price and commission comparisons.
 - Drops a fill group that has neither an order report nor a cached order. Logs one aggregated warning per mass
   status for the dropped groups. A group whose fills carry a `venue_position_id` is handled separately. The
@@ -588,24 +596,39 @@ validation still checks the remaining difference against the account's quantity 
 
 #### Replayed fills
 
-Reconciliation can open a position from a venue position report. While that position stays open, a fill report
-for the same instrument and account with an earlier `ts_event` updates its order but no position. The report
-already includes those executions. Thus, a venue that resends them after a restart (such as Interactive
-Brokers TWS) does not double the position. Earlier fills still apply when no such position is open for the
-instrument and account.
+Reconciliation can open, adjust, or close a position from a venue position report. A late execution can
+already be included in that report.
 
-The protection has these known gaps:
+Reconciliation fills that predate a cached synthetic correction **update the order only**, within the
+scope below. This avoids duplicate exposure or reopening a reconciled closure, including after startup.
+Ordinary private fills and price restatement events retain normal position handling.
 
-- **Reconciliation window**: the synthetic opening fill carries the reconciliation time rather than the report
+Coverage for the same instrument and account:
+
+| Fill source                              | NETTING scope  | HEDGING scope        |
+| ---------------------------------------- | -------------- | -------------------- |
+| Runtime standalone report                | All strategies | All strategies       |
+| Bundled or inferred from an order report | All strategies | Routed position only |
+
+Continuous position checks also keep earlier fill reports off cached positions already covered by
+synthetic corrections for the same instrument and account.
+
+**Known gaps**:
+
+- **Reconciliation window**: the synthetic correction fill carries the reconciliation time rather than the report
   time. Thus, a real fill that lands between the position report query and reconciliation also stays off the
   position. Continuous position checks align it only when they run with `generate_missing_orders` enabled.
-- **Opening order purge**: the protection needs the synthetic opening order in the cache. When
+- **Position cycles**: reopening a NETTING position archives the prior cycle; this check does not read
+  archived snapshots. Closed-position purging also removes its correction history. Late reconciliation
+  fills can then apply to a new cycle. Recover missing executions before reopening or purging the position.
+- **Correction order purge**: the protection needs the synthetic correction order in the cache. When
   closed-order purging is enabled, a `purge_closed_orders_buffer_mins` shorter than the venue's
   replay delay can remove it first.
-- **Bundled fills**: fills that arrive bundled with an order status report bypass the protection.
+- **Inferred timestamps**: inferred fills use the order report's last-update time. If the venue supplies
+  creation time instead of execution time, a fill executed after the snapshot can appear older and stay off
+  the position. Position checks with `generate_missing_orders` enabled can correct the difference.
 
-A fill kept off the position stays on its order only, as in
-[order-only fill projection](#order-only-fill-projection), with these effects:
+**Order-only effects** (see [order-only fill projection](#order-only-fill-projection)):
 
 - **Event store restore**: restoring the cache from the event store applies the fill to a
   position, so the restored position can overstate the venue quantity.
@@ -860,7 +883,8 @@ processing.
 A response ready exactly at the deadline is discarded. Accepted results stay under node ownership until
 reconciliation, including after fill timeout, fill error, cancellation, or normal shutdown. Slow processing
 cannot discard accepted results. A canceled or expired status with unaccounted fills stays deferred until
-those fills arrive. A timed out or canceled task does not resolve orders as missing. Fatal callback failure
+those fills arrive. Clients requiring authoritative fills defer any status with unaccounted fills.
+A timed out or canceled task does not resolve orders as missing. Fatal callback failure
 stops further dispatch and discards the retained results.
 
 The table below applies when cache state differs from venue state. A missing open-order report does not by

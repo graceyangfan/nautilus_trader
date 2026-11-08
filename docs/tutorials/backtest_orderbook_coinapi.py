@@ -26,10 +26,6 @@
 # - A CoinAPI key with Flat Files access and sufficient usage credits for
 #   the first download. Listing and downloading files incur charges; see
 #   [Flat Files access](https://www.coinapi.io/products/flat-files/docs?ref=nautilus).
-# - The sibling
-#   [`orderbook_imbalance.py`](https://github.com/nautechsystems/nautilus_trader/blob/develop/docs/tutorials/orderbook_imbalance.py)
-#   file. Keep it beside this tutorial when downloading or converting it
-#   with Jupytext.
 #
 # From a source checkout, run the tutorial from the repository root after
 # building the Python extension:
@@ -61,7 +57,6 @@ from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
 from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.config import DataEngineConfig
-from nautilus_trader.config import ImportableStrategyConfig
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
@@ -81,6 +76,7 @@ from nautilus_trader.model import StandardMarginModel
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import Venue
 from nautilus_trader.persistence import ParquetDataCatalog
+from nautilus_trader.trading import OrderBookImbalanceConfig
 
 
 # %% [markdown]
@@ -160,6 +156,7 @@ print(f"Data file: {filepath}")
 
 # %%
 USDC = Currency.from_str("USDC")
+
 instrument = CryptoPerpetual(
     instrument_id=InstrumentId.from_str("ANTHROPIC-PERP.LIGHTER"),
     raw_symbol=Symbol("ANTHROPIC"),
@@ -178,6 +175,7 @@ instrument = CryptoPerpetual(
     ts_event=0,
     ts_init=0,
 )
+
 book_type = BookType.L2_MBP
 
 # %% [markdown]
@@ -280,8 +278,8 @@ print(f"Spread range: {top_of_book['spread'].min()} to {top_of_book['spread'].ma
 # price the strategy's market exit. Without them, it denies the closing
 # order with `MARKET_PRICE_UNAVAILABLE` and leaves the position open.
 #
-# Reuse `OrderBookImbalance` from the Binance and Bybit tutorials. When one
-# best-quote size is less than 20% of the other and the larger exceeds
+# Use the built-in Rust `OrderBookImbalance` through Python, as in the Binance and Bybit tutorials.
+# When one best-quote size is less than 20% of the other and the larger exceeds
 # one contract unit, the strategy submits a fill-or-kill limit order
 # against the thinner side. Each order is at most 0.01 contract units,
 # with at least one second between triggers. The strategy closes its
@@ -326,17 +324,13 @@ config = BacktestRunConfig(
     dispose_on_completion=False,
 )
 
-strategy_config = ImportableStrategyConfig(
-    strategy_path="orderbook_imbalance:OrderBookImbalance",
-    config_path="orderbook_imbalance:OrderBookImbalanceConfig",
-    config={
-        "instrument_id": str(instrument.id),
-        "book_type": book_type.name,
-        "max_trade_size": "0.01000",
-        "trigger_min_size": 1.0,
-        "trigger_imbalance_ratio": 0.20,
-        "min_seconds_between_triggers": 1.0,
-    },
+strategy_config = OrderBookImbalanceConfig(
+    instrument_id=instrument.id,
+    book_type=book_type,
+    max_trade_size=Quantity.from_str("0.01000"),
+    trigger_min_size=Decimal("1.0"),
+    trigger_imbalance_ratio=Decimal("0.20"),
+    min_seconds_between_triggers=1.0,
 )
 
 # %% [markdown]
@@ -361,7 +355,7 @@ strategy_config = ImportableStrategyConfig(
 # %%
 node = BacktestNode(configs=[config])
 node.build()
-node.add_strategy_from_config(config.id, strategy_config)
+node.add_builtin_strategy(config.id, "OrderBookImbalance", strategy_config)
 results = node.run()
 
 print(results)
@@ -398,7 +392,8 @@ node.dispose()
 # and native reports as the backtest above. Lines show successive states
 # as steps; fill markers show individual executions.
 #
-# ![ANTHROPIC best bid and ask with FOK and closing market fills][panel_book]
+# ![ANTHROPIC best bid and ask with FOK and closing market fills](
+# ./assets/backtest_orderbook_coinapi/panel_a_top_book.png)
 #
 # **Figure 1.** The FOK sells build the short position. One FOK buy reduces
 # it, and the final market buy closes it through six fills at the same
@@ -407,7 +402,8 @@ node.dispose()
 # include intermediate states lasting microseconds between recorded level
 # updates. This zero-latency strategy can fill at these prices.
 #
-# ![Full-hour spread and best-quote sizes on a logarithmic depth axis][panel_liquidity]
+# ![Full-hour spread and best-quote sizes on a logarithmic depth axis](
+# ./assets/backtest_orderbook_coinapi/panel_b_liquidity.png)
 #
 # **Figure 2.** Across all states, the spread is in `[0.1, 2.1]` USDC.
 # For states lasting at least one millisecond, it is in `[0.1, 0.9]` USDC.
@@ -416,12 +412,14 @@ node.dispose()
 # sizes vary across several orders of magnitude, so depth uses a
 # logarithmic axis. Sizes are contract units, not company shares.
 #
-# ![Net short position reaching 2.30689 units before closing flat][panel_position]
+# ![Net short position reaching 2.30689 units before closing flat](
+# ./assets/backtest_orderbook_coinapi/panel_c_position.png)
 #
 # **Figure 3.** Cumulative signed execution quantities show the short
 # reaching 2.30689 units. The final market order returns exposure to zero.
 #
-# ![Realized loss of 1.157298 USDC and final account balance][panel_pnl]
+# ![Realized loss of 1.157298 USDC and final account balance](
+# ./assets/backtest_orderbook_coinapi/panel_d_pnl.png)
 #
 # **Figure 4.** The account's total balance change gives realized PnL for
 # this zero-fee run. The final drop books the loss accumulated while
@@ -435,7 +433,8 @@ node.dispose()
 #
 # ```bash
 # uv run --project python --no-sync --with boto3 --with pandas \
-#     --with plotly --with kaleido python docs/tutorials/render_coinapi_panels.py
+#     --with plotly --with kaleido \
+#     python docs/tutorials/assets/backtest_orderbook_coinapi/render_panels.py
 # ```
 #
 # If Kaleido reports that Chrome is missing, install its browser once with:
@@ -447,11 +446,6 @@ node.dispose()
 # The renderer runs this tutorial and writes PNGs to
 # `docs/tutorials/assets/backtest_orderbook_coinapi/`. It reuses the cached
 # export or follows the first-download procedure above.
-#
-# [panel_book]: ./assets/backtest_orderbook_coinapi/panel_a_top_book.png
-# [panel_liquidity]: ./assets/backtest_orderbook_coinapi/panel_b_liquidity.png
-# [panel_position]: ./assets/backtest_orderbook_coinapi/panel_c_position.png
-# [panel_pnl]: ./assets/backtest_orderbook_coinapi/panel_d_pnl.png
 
 # %% [markdown]
 # To test another hour, list its available objects and select the ANTHROPIC file

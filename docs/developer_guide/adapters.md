@@ -1009,10 +1009,15 @@ snapshot parsing. The shared types describe the result of validation and monitor
   reconnects. Advancing empty snapshots count as updates. Replacement uses an unsubscribe/subscribe pair on
   the existing socket. See [Derive order book recovery](../integrations/derive.md#order-book-recovery) for
   timer defaults and the notification correlation limit.
+- **Deribit**: sequences non-grouped channels by `change_id`/`prev_change_id` per instrument and
+  tracks grouped channels as snapshot-only books by exact channel. Replacement uses an
+  unsubscribe/subscribe pair on the existing socket. See
+  [Deribit sequence gap recovery](../integrations/deribit.md#sequence-gap-recovery) for timer
+  defaults and live validation.
 
 Adapters fall into two recovery families, which determine the oracle a stress harness can use:
 
-- Push (OKX, Polymarket, Lighter, Hyperliquid, Bybit, Betfair, AX Exchange, Derive): a replacement
+- Push (OKX, Polymarket, Lighter, Hyperliquid, Bybit, Betfair, AX Exchange, Derive, Deribit): a replacement
   resubscribes, and the venue stream delivers the snapshot.
 - Pull (Binance): diff streams stay subscribed. A replacement fetches a REST snapshot, and the
   adapter accepts it only when the buffered diffs continue from its `lastUpdateId` without a gap.
@@ -1259,10 +1264,15 @@ unapplied. Periodic and targeted reconciliation defer the affected work until a 
 
 #### Inferred fills
 
-Call the hook for every adapter-backed inferred fill: external and cached orders, continuous
-reconciliation, and targeted order recovery. If commission calculation fails, the engine may apply
-valid explicit fills, but it leaves the residual inferred quantity and dependent terminal
-transition pending.
+Adapters that require venue trade IDs and fees for every order execution return `true` from
+`ExecutionClient::requires_authoritative_fills`. Order statuses then leave missing fills and dependent
+status transitions pending until private updates or reconciliation supply venue fills. The default is
+`false`. Position-only synthetic corrections are unaffected.
+
+Call `ExecutionClient::calculate_commission` for every adapter-backed inferred fill: external and cached
+orders, continuous reconciliation, and targeted order recovery. If commission calculation fails, the
+engine may apply valid explicit fills, but it leaves the residual inferred quantity and dependent
+terminal transition pending.
 
 For an external order, calculate commission before a cache or event transition could prevent a retry. If the
 responsible execution client is unavailable, defer the inferred fill. Do not treat that missing client as an
