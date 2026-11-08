@@ -111,6 +111,7 @@ struct TestServerState {
     // When set, `allPerpMetas` responds with HTTP 500 so the client falls back to
     // the standard-dex-only `meta` endpoint.
     all_perp_metas_unavailable: Arc<tokio::sync::Mutex<bool>>,
+    spot_meta_unavailable: Arc<tokio::sync::Mutex<bool>>,
     // When set, the standard perp dex lists BTC with a coarser size precision to
     // emulate the venue changing a definition between two fetches.
     btc_size_decimals_changed: Arc<tokio::sync::Mutex<bool>>,
@@ -289,6 +290,9 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
         "metaAndAssetCtxs" => {
             let meta = load_json("http_meta_perp_sample.json");
             Json(json!([meta, []])).into_response()
+        }
+        "spotMeta" if *state.spot_meta_unavailable.lock().await => {
+            axum::http::StatusCode::BAD_REQUEST.into_response()
         }
         "spotMeta" => Json(spot_meta_fixture()).into_response(),
         "spotMetaAndAssetCtxs" => Json(json!([spot_meta_fixture(), []])).into_response(),
@@ -2859,11 +2863,7 @@ async fn test_instrument_refresh_reports_terminal_failures_and_recovers() {
     client.connect().await.unwrap();
     drain_initial_events(&mut rx).await;
 
-    for reason in [
-        "no metadata source loaded",
-        "no metadata source loaded",
-        "timed out",
-    ] {
+    for reason in ["no usable metadata", "no usable metadata", "timed out"] {
         let stall = reason == "timed out";
         *state.reject_info_requests.lock().await = !stall;
         *state.hold_next_all_perp_metas.lock().await = stall;
@@ -3140,8 +3140,12 @@ async fn test_data_client_periodic_instrument_refresh_survives_reconnect(#[case]
 }
 
 #[rstest]
+#[case::with_spot_metadata(false)]
+#[case::fallback_only(true)]
 #[tokio::test(flavor = "multi_thread")]
-async fn test_data_client_instrument_refresh_keeps_status_on_partial_perp_load() {
+async fn test_data_client_instrument_refresh_keeps_status_on_partial_perp_load(
+    #[case] spot_meta_unavailable: bool,
+) {
     let state = TestServerState::default();
     let addr = start_mock_server(state.clone()).await;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
@@ -3169,9 +3173,19 @@ async fn test_data_client_instrument_refresh_keeps_status_on_partial_perp_load()
 
     // the `meta` fallback only returns the standard dex, so perps are not fully loaded
     *state.all_perp_metas_unavailable.lock().await = true;
+    *state.spot_meta_unavailable.lock().await = spot_meta_unavailable;
     *state.btc_delisted.lock().await = true;
-    client.request_instruments(instruments_request()).unwrap();
+    let request = instruments_request();
+    let request_id = request.request_id;
+    client.request_instruments(request).unwrap();
     let events = recv_until_response(&mut rx).await;
+    assert!(matches!(
+        events.last(),
+        Some(DataEvent::Response(DataResponse::Instruments(response)))
+            if response.correlation_id == request_id
+                && response.data.iter().any(|instrument| instrument.id() == btc_id)
+                && response.data.iter().all(|instrument| instrument.id() != tsla_id)
+    ));
     let statuses = instrument_statuses(&events);
     assert_eq!(statuses.len(), 1, "events: {events:?}");
     assert_eq!(statuses[0].instrument_id, btc_id);

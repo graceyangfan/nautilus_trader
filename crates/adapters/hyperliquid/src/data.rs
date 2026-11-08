@@ -1795,9 +1795,10 @@ async fn refresh_instruments(
         .request_instruments_with_statuses()
         .await
         .context("failed to fetch Hyperliquid instruments")?;
+    // The standard perp fallback can supply definitions without full product coverage.
     anyhow::ensure!(
-        !snapshot.loaded.is_empty(),
-        "failed to fetch Hyperliquid instruments: no metadata source loaded"
+        !snapshot.instruments.is_empty() || !snapshot.loaded.is_empty(),
+        "failed to fetch Hyperliquid instruments: no usable metadata"
     );
 
     // emit statuses after definitions, so a subscriber never sees a status for an
